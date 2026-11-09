@@ -877,8 +877,9 @@ final class NodeStore implements Closeable {
 	 * Raft made its group directory. A recorded digest is kept only while the files are those it was taken from, or
 	 * those the start-up check left, or, when the check was stopped during its open ({@value #OPENING}, written by
 	 * {@link #noteSeedOpening} before it), files that only that open can have changed: every table or blob file the
-	 * marker listed is still there and is the same file (same inode and change time, same size; the open runs without
-	 * automatic compactions, so it deletes none, R43-2), the marker listed one at least (a seed without table files
+	 * marker listed is still there and is the same file (same inode, size and change time, or only the change time and
+	 * link count new, the birth time known: another hard link came or went, R45-1; see {@link #sameTable}; the open runs
+	 * without automatic compactions, so it deletes none, R43-2), the marker listed one at least (a seed without table files
 	 * cannot be compared, and is not kept), and IDENTITY, if the seed had one, is the same file with the same content
 	 * (Review of R41, 1: another database copied over {@code db/} without deleting it first leaves the seed's table files
 	 * next to its own, with other numbers, but brings its IDENTITY). Otherwise the database was replaced since (the
@@ -1052,29 +1053,76 @@ final class NodeStore implements Closeable {
 	}
 
 	/**
-	 * The inode number of {@code file} and its status change time, without spaces; {@code -} if the file system has
-	 * neither. Not the device number ({@code fileKey()} on Linux is device and inode): on btrfs subvolumes, NFS, overlayfs
-	 * and some LVM or md setups it is assigned at mount time and can change across the reboot after a power loss during
-	 * the start-up check's open, which would make every listed file look like another one (Review of R41, 2). An inode number is reused once its file is deleted, so a copy made again
-	 * after {@code rm -r} can get the inode of the file it replaces, with its size and (rsync) its modification time; its
-	 * change time is the moment it was made, which no copy tool sets. Opening a database neither links nor rewrites a
-	 * table file, so the identity of one it keeps does not change.
+	 * {@code <inode>@<ctime>,<links>,<mtime>,<birth time>} of {@code file}, without spaces: its inode number, status
+	 * change time, link count, modification time and birth time ({@code -} where the file system keeps none, or where
+	 * {@code birthTimeDevice}, see {@link #birthTimeDevice}, is not the file's device); {@code -} if the file system has no
+	 * inode number or change time. Not the device number ({@code fileKey()} on Linux is device and inode): on btrfs
+	 * subvolumes, NFS, overlayfs and some LVM or md setups it is assigned at mount time and can change across the reboot
+	 * after a power loss during the start-up check's open, which would make every listed file look like another one
+	 * (Review of R41, 2). An inode number is reused once its file is deleted, so a copy made again after {@code rm -r} can
+	 * get the inode of the file it replaces, with its size and (rsync, {@code cp -p}) its modification time; its change
+	 * time and birth time are the moment it was made, which no copy tool sets. Opening a database neither links nor
+	 * rewrites a table file. But the change time also moves when any other hard link to the same inode is created or
+	 * removed (Linux updates it on {@code link()} and {@code unlink()}), and {@code db/} shares inodes with a backup copy
+	 * restore-backup linked on the same file system, with the source of export-seed and with seeds spread by
+	 * {@code cp -al}: deleting such a copy after a killed check must not make a kept file look like another one (R45-1).
+	 * So the link count, modification time and birth time are listed too, and {@link #sameTable} takes a new change time
+	 * for the same file only when the link count is all that changed.
 	 */
-	private static String fileIdentity(Path file, BasicFileAttributes attributes) {
+	private static String fileIdentity(Path file, BasicFileAttributes attributes, @Nullable Object birthTimeDevice) {
 		Object inode;
 		Object changed;
+		Object links;
+		Object device;
 		try {
-			var unix = Files.readAttributes(file, "unix:ino,ctime", LinkOption.NOFOLLOW_LINKS);
+			var unix = Files.readAttributes(file, "unix:ino,ctime,nlink,dev", LinkOption.NOFOLLOW_LINKS);
 			inode = unix.get("ino");
 			changed = unix.get("ctime");
+			links = unix.get("nlink");
+			device = unix.get("dev");
 		} catch (IOException | UnsupportedOperationException | IllegalArgumentException e) {
 			inode = null;
 			changed = null;
+			links = null;
+			device = null;
 		}
 		if (inode == null && changed == null) {
 			return "-";
 		}
-		return (inode + "@" + changed).replaceAll("\\s", "");
+		var born = attributes.creationTime();
+		boolean birthTime = birthTimeDevice != null && birthTimeDevice.equals(device) && born.toMillis() != 0;
+		return (inode + "@" + changed + "," + (links == null ? "-" : links) + "," + attributes.lastModifiedTime() + ","
+				+ (birthTime ? born : "-")).replaceAll("\\s", "");
+	}
+
+	/**
+	 * The device of {@code dbDir} if files there have a birth time, null otherwise. Java gives the modification time, or
+	 * the epoch, as the creation time of a file whose file system keeps no birth time: a probe file next to
+	 * {@code dbDir} (the directory of the seed digest, not {@code dbDir}, whose every file is digested) whose modification
+	 * time is set to the epoch tells. Null too when that directory is on another device than {@code dbDir}, and
+	 * {@link #fileIdentity} lists a birth time only for files on this device (a column volume can be a mount point).
+	 */
+	private static @Nullable Object birthTimeDevice(Path dbDir) {
+		Path probe = seedDigestFile(dbDir).resolveSibling(seedDigestFile(dbDir).getFileName() + ".probe");
+		try {
+			Object device = Files.getAttribute(dbDir, "unix:dev", LinkOption.NOFOLLOW_LINKS);
+			if (device == null || !device.equals(Files.getAttribute(probe.getParent(), "unix:dev"))) {
+				return null;
+			}
+			Files.deleteIfExists(probe);
+			Files.createFile(probe);
+			Files.setLastModifiedTime(probe, java.nio.file.attribute.FileTime.fromMillis(0));
+			var created = Files.readAttributes(probe, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS).creationTime();
+			return created.toMillis() != 0 ? device : null;
+		} catch (IOException | UnsupportedOperationException | IllegalArgumentException e) {
+			return null;
+		} finally {
+			try {
+				Files.deleteIfExists(probe);
+			} catch (IOException ignored) {
+				// A leftover probe is deleted by the next one, and is outside db/.
+			}
+		}
 	}
 
 	/**
@@ -1082,6 +1130,10 @@ final class NodeStore implements Closeable {
 	 * {@code none} if there is none.
 	 */
 	private static String identityFile(Path dbDir) throws IOException {
+		return identityFile(dbDir, birthTimeDevice(dbDir));
+	}
+
+	private static String identityFile(Path dbDir, @Nullable Object birthTimeDevice) throws IOException {
 		Path file = dbDir.resolve("IDENTITY");
 		BasicFileAttributes attributes;
 		byte[] content;
@@ -1093,18 +1145,44 @@ final class NodeStore implements Closeable {
 		}
 		try {
 			var sha = java.security.MessageDigest.getInstance("SHA-256").digest(content);
-			return attributes.size() + " " + fileIdentity(file, attributes) + " " + java.util.HexFormat.of().formatHex(sha);
+			return attributes.size() + " " + fileIdentity(file, attributes, birthTimeDevice) + " " + java.util.HexFormat.of().formatHex(sha);
 		} catch (java.security.NoSuchAlgorithmException e) {
 			throw new IllegalStateException(e);
 		}
 	}
 
-	/** Two {@code <size> <identity>} values: same size, and same identity unless one of them is unknown ({@code -}). */
+	/**
+	 * Two {@code <size> <identity>} values (see {@link #fileIdentity}) of one file: the same file if the size is the same
+	 * and the identity is too, or one of them is unknown ({@code -}), or only the change time and the link count differ,
+	 * with the birth time known (R45-1: another hard link to the inode was created or removed, as when the backup copy
+	 * that restore-backup linked is deleted). A copy made again is still another file: renamed over the old one
+	 * ({@code rsync}) or made after {@code rm -r}, it is another inode, or the old inode number reused with a new birth
+	 * time (and a new link count often); written in place ({@code cp}, {@code cp -p}), it keeps the inode, birth time and
+	 * link count but gets a new change time, and without {@code -p} a new modification time. Not told apart: a file
+	 * written again in place with its modification time set back while another link to it comes or goes (the outside
+	 * copy then holds the new content too); a link removed and another added to the same file, the count back where it
+	 * was, is taken for another file (fails safe). An identity of a marker written before R45-1 ({@code <inode>@<ctime>})
+	 * is compared on those two only.
+	 */
 	static boolean sameTable(String before, String now) {
 		var a = before.split(" ", 2);
 		var b = now.split(" ", 2);
-		return a[0].equals(b[0]) && (a.length < 2 || b.length < 2 || a[1].equals("-") || b[1].equals("-")
-				|| a[1].equals(b[1]));
+		if (!a[0].equals(b[0])) {
+			return false;
+		}
+		if (a.length < 2 || b.length < 2 || a[1].equals("-") || b[1].equals("-") || a[1].equals(b[1])) {
+			return true;
+		}
+		// <inode>@<ctime>,<links>,<mtime>,<birth time>
+		var x = a[1].split(",", -1);
+		var y = b[1].split(",", -1);
+		if (x.length != 4 || y.length != 4) {
+			return x[0].equals(y[0]);
+		}
+		String inodeBefore = x[0].substring(0, Math.max(0, x[0].indexOf('@')));
+		String inodeNow = y[0].substring(0, Math.max(0, y[0].indexOf('@')));
+		return !inodeBefore.isEmpty() && inodeBefore.equals(inodeNow) && !x[1].equals(y[1]) && !x[1].equals("-")
+				&& !y[1].equals("-") && x[2].equals(y[2]) && !x[3].equals("-") && x[3].equals(y[3]);
 	}
 
 	/**
@@ -1113,6 +1191,7 @@ final class NodeStore implements Closeable {
 	 */
 	private static Map<String, String> tableFiles(Path dbDir) throws IOException {
 		Path root = dbDir.toAbsolutePath().normalize();
+		Object birthTimeDevice = birthTimeDevice(dbDir);
 		var tables = new java.util.TreeMap<String, String>();
 		try (Stream<Path> walk = Files.walk(root)) {
 			for (Path file : walk.toList()) {
@@ -1130,7 +1209,7 @@ final class NodeStore implements Closeable {
 					continue;
 				}
 				tables.put(root.relativize(file).toString().replace('\\', '/'),
-						attributes.size() + " " + fileIdentity(file, attributes));
+						attributes.size() + " " + fileIdentity(file, attributes, birthTimeDevice));
 			}
 		}
 		return tables;
