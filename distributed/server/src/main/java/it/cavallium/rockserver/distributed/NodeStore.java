@@ -1492,6 +1492,10 @@ final class NodeStore implements Closeable {
 			// A no-op when restoreSnapshotIfAhead failed after closing it.
 			store.close();
 		}
+		var opening = exportCopyOpeningForTesting;
+		if (opening != null) {
+			opening.accept(target);
+		}
 		try (var copy = new EmbeddedConnection(target, "export-target", config)) {
 			var db = copy.getEmbeddedDB();
 			if (db.getAllColumnDefinitions().containsKey(META_COLUMN)) {
@@ -1560,6 +1564,12 @@ final class NodeStore implements Closeable {
 
 	/** Tests only: see {@link CheckpointHook}; null in production. */
 	static volatile @Nullable CheckpointHook checkpointBuiltForTesting;
+
+	/**
+	 * Tests only: called with the directory in which {@code export-seed} opens its copy to drop the meta column, before
+	 * the open; null in production.
+	 */
+	static volatile java.util.function.@Nullable Consumer<Path> exportCopyOpeningForTesting;
 
 	/**
 	 * Writes a consistent checkpoint of the live database to {@code target} (must not exist): memtables are

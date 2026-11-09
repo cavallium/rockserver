@@ -1666,6 +1666,54 @@ class NodeStoreTest {
 	}
 
 	/**
+	 * R44-2: {@code export-seed} drops the old cluster's meta column (cluster id, applied position, sessions) before the
+	 * copy gets the target's name. Before, it renamed the checkpoint to the target first and dropped the meta column in
+	 * place: a kill (OOM, SIGKILL, power loss) in between left a complete-looking target that every node of the new
+	 * cluster refused, and a rerun said only that the target exists. The test copies the directories as a kill at the
+	 * copy's open would leave them: no target, only {@code <target>.tmp}, which a rerun refuses by name.
+	 */
+	@Test
+	void anExportKilledWhileDroppingTheMetaColumnLeavesNoTarget() throws IOException {
+		Path source = tempDir.resolve("source");
+		try (var store = NodeStore.open(source, null, "source")) {
+			long column = store.db().createColumn(DATA_COLUMN, DATA_SCHEMA);
+			put(store, column, 7, "v");
+			setApplied(store, TermIndex.valueOf(1, 5));
+			setClusterId(store, "old-cluster");
+		}
+		Path target = tempDir.resolve("seed");
+		Path building = tempDir.resolve("seed.tmp");
+		Path crash = tempDir.resolve("crash");
+		NodeStore.exportCopyOpeningForTesting = copy -> {
+			try {
+				for (Path dir : List.of(target, building)) {
+					if (Files.exists(dir)) {
+						copyTree(dir, crash.resolve(dir.getFileName().toString()));
+					}
+				}
+			} catch (IOException e) {
+				throw new java.io.UncheckedIOException(e);
+			}
+		};
+		try {
+			NodeStore.exportSeed(source, null, target);
+		} finally {
+			NodeStore.exportCopyOpeningForTesting = null;
+		}
+		assertFalse(Files.exists(crash.resolve("seed")),
+				"a kill while the copy still held the old cluster's meta column leaves a complete-looking target");
+		assertTrue(Files.isRegularFile(crash.resolve("seed.tmp/CURRENT")));
+		var refused = assertThrows(IOException.class, () -> NodeStore.exportSeed(source, null, crash.resolve("seed")));
+		assertTrue(refused.getMessage().contains("seed.tmp already exists"), refused.getMessage());
+
+		// The export that ran on: the target, without the meta column.
+		try (var store = NodeStore.open(target, null, "seed")) {
+			assertNull(store.clusterId());
+			assertEquals(TermIndex.INITIAL_VALUE, store.applied());
+		}
+	}
+
+	/**
 	 * R29-2: the config file a replica opens its database with is deleted once the database opened, but a process killed
 	 * during the open (WAL replay, a large MANIFEST) left it in DATA-DIR for good, one per killed start. The next open
 	 * removes what earlier opens of that database left.

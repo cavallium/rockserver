@@ -13,9 +13,11 @@ import it.cavallium.rockserver.core.common.RequestType;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Comparator;
 import java.util.List;
@@ -26,8 +28,16 @@ import java.util.stream.Stream;
 import org.apache.ratis.server.protocol.TermIndex;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.rocksdb.ColumnFamilyDescriptor;
+import org.rocksdb.ColumnFamilyHandle;
+import org.rocksdb.ConfigOptions;
+import org.rocksdb.DBOptions;
+import org.rocksdb.DbPath;
+import org.rocksdb.FlushOptions;
 import org.rocksdb.Options;
+import org.rocksdb.OptionsUtil;
 import org.rocksdb.RocksDB;
+import org.rocksdb.RocksDBException;
 
 /** Checks a node makes on its own files before and while it starts: see "Disk layout" and "Heap" in the design. */
 class StartupChecksTest {
@@ -403,6 +413,104 @@ class StartupChecksTest {
 		var gone = seedTables.stream().filter(name -> !fileNamesUnchecked(node, ".sst").contains(name)).toList();
 		assertTrue(gone.isEmpty(), "the start-up check's open deleted " + gone + " of " + seedTables);
 		assertEquals(digest, NodeStore.recordSeedDigest(node));
+	}
+
+	/**
+	 * R44-1: the start-up check's open deletes no table file of Rockserver's internal columns either. They open with
+	 * options of their own ({@code RocksDBLoader.getCompatibilityColumnOptions}), which read no column config: before,
+	 * they kept RocksDB's automatic compactions (L0 trigger 4) whatever the check's config said. Here the seed's
+	 * {@code _column_schemas_} holds five L0 files (each clean run that creates a column flushes one), which the open
+	 * folded into one, deleting the files the marker listed. The OPTIONS file of the check's open shows every column
+	 * without automatic compactions.
+	 */
+	@Test
+	void theStartupCheckOpenDeletesNoTableFileOfAnInternalColumn() throws Exception {
+		var seed = tempDir.resolve("seed");
+		try (var store = NodeStore.open(seed, null, "seed")) {
+			long column = store.db().createColumn(NodeStoreTest.DATA_COLUMN, NodeStoreTest.DATA_SCHEMA);
+			for (int i = 0; i < 100; i++) {
+				NodeStoreTest.put(store, column, i, "v" + i);
+			}
+		}
+		var schemaTables = addL0Files(seed, "_column_schemas_", 4);
+		assertTrue(schemaTables.size() >= 4, schemaTables.toString());
+		var node = tempDir.resolve("node/db");
+		copy(seed, node);
+		var digest = NodeStore.recordSeedDigest(node);
+		NodeStore.noteSeedOpening(node);
+		// Killed while open, after its compaction (if any) had the time to run.
+		Path options;
+		String optionsText;
+		try (var store = startupCheckStore(node)) {
+			long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(3);
+			while (fileNames(node, ".sst").containsAll(schemaTables) && System.nanoTime() < deadline) {
+				Thread.sleep(20);
+			}
+			options = newestOptionsFile(node);
+			optionsText = Files.readString(options);
+		}
+		var gone = schemaTables.stream().filter(name -> !fileNamesUnchecked(node, ".sst").contains(name)).toList();
+		assertTrue(gone.isEmpty(), "the start-up check's open deleted " + gone + " of " + schemaTables);
+		for (var section : optionsText.split("\\n(?=\\[)")) {
+			if (section.startsWith("[CFOptions ")) {
+				assertTrue(section.contains("\n  disable_auto_compactions=true\n"),
+						options + ": " + section.lines().findFirst().orElseThrow() + " compacts automatically");
+			}
+		}
+		assertEquals(digest, NodeStore.recordSeedDigest(node));
+	}
+
+	/**
+	 * Writes every entry of the column {@code columnName} of the closed replica database {@code dbDir} again and
+	 * flushes it, {@code times} times, through RocksDB itself with automatic compactions off: one more L0 file each
+	 * time, the entries unchanged. Returns the names of that column's table files.
+	 */
+	private static List<String> addL0Files(Path dbDir, String columnName, int times) throws RocksDBException {
+		RocksDB.loadLibrary();
+		// The options the database was written with, its column volume (which the OPTIONS file does not record) and
+		// automatic compactions off.
+		try (var configOptions = new ConfigOptions().setIgnoreUnknownOptions(true);
+				var dbOptions = new DBOptions();
+				var flushOptions = new FlushOptions().setWaitForFlush(true)) {
+			var descriptors = new ArrayList<ColumnFamilyDescriptor>();
+			OptionsUtil.loadLatestOptions(configOptions, dbDir.toString(), dbOptions, descriptors);
+			for (var descriptor : descriptors) {
+				descriptor.getOptions().setDisableAutoCompactions(true)
+						.setCfPaths(List.of(new DbPath(dbDir.resolve("volume"), Long.MAX_VALUE)));
+			}
+			var handles = new ArrayList<ColumnFamilyHandle>();
+			try (var db = RocksDB.open(dbOptions, dbDir.toString(), descriptors, handles)) {
+				try {
+					var handle = handles.get(descriptors.stream()
+							.map(descriptor -> new String(descriptor.getName(), StandardCharsets.UTF_8)).toList()
+							.indexOf(columnName));
+					for (int round = 0; round < times; round++) {
+						try (var iterator = db.newIterator(handle)) {
+							for (iterator.seekToFirst(); iterator.isValid(); iterator.next()) {
+								db.put(handle, iterator.key(), iterator.value());
+							}
+						}
+						db.flush(flushOptions, List.of(handle));
+					}
+					return db.getLiveFilesMetaData().stream()
+							.filter(table -> new String(table.columnFamilyName(), StandardCharsets.UTF_8).equals(columnName))
+							.map(table -> Path.of(table.fileName()).getFileName().toString()).toList();
+				} finally {
+					handles.forEach(ColumnFamilyHandle::close);
+				}
+			} finally {
+				descriptors.forEach(descriptor -> descriptor.getOptions().close());
+			}
+		}
+	}
+
+	/** The OPTIONS file RocksDB wrote last in {@code dbDir}. */
+	private static Path newestOptionsFile(Path dbDir) throws IOException {
+		try (var files = Files.list(dbDir)) {
+			return files.filter(path -> path.getFileName().toString().matches("OPTIONS-[0-9]+"))
+					.max(Comparator.comparingLong(path -> Long.parseLong(path.getFileName().toString().substring(8))))
+					.orElseThrow();
+		}
 	}
 
 	/** The start-up check's open and close of {@code dbDir}, as {@code ReplicatedNode} makes it. */
