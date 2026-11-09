@@ -266,7 +266,7 @@ final class NodeStore implements Closeable {
 			}
 			config = withReplicaWriteBuffers(config.resolve());
 			if (sourceDbDir != null) {
-				config = withRelativeVolumes(config, sourceDbDir);
+				config = withRelativePaths(config, sourceDbDir);
 			}
 		} catch (ConfigException | IllegalArgumentException e) {
 			throw new IOException("Failed to read the Rockserver config " + rockserverConfig, e);
@@ -387,12 +387,24 @@ final class NodeStore implements Closeable {
 
 	/**
 	 * Rewrites every absolute {@code volume-path} (of {@code fallback-column-options} and of the entries of
-	 * {@code column-options}) that lies under {@code dbDir} into the same path relative to the database directory.
+	 * {@code column-options}), and an absolute {@code wal-path} or {@code log-path}, that lies under {@code dbDir} into
+	 * the same path relative to the database directory.
 	 */
-	static Config withRelativeVolumes(Config config, Path dbDir) {
+	static Config withRelativePaths(Config config, Path dbDir) {
 		Path root = dbDir.toAbsolutePath().normalize();
 		String fallbackPath = "database.global.fallback-column-options.volumes";
 		Config result = config;
+		// The WAL and the info log as well (R36 review 1): RocksDB resolves an absolute wal-path or log-path as is, so a
+		// copy, or a database built aside to be renamed to dbDir, would write them into dbDir itself.
+		for (String pathKey : List.of("database.global.wal-path", "database.global.log-path")) {
+			if (config.hasPath(pathKey)) {
+				Path path = Path.of(config.getString(pathKey));
+				if (path.isAbsolute() && path.normalize().startsWith(root)) {
+					String relative = root.relativize(path.normalize()).toString();
+					result = result.withValue(pathKey, ConfigValueFactory.fromAnyRef(relative.isEmpty() ? "." : relative));
+				}
+			}
+		}
 		if (config.hasPath(fallbackPath)) {
 			result = result.withValue(fallbackPath, relativeVolumes(config.getObjectList(fallbackPath), root));
 		}

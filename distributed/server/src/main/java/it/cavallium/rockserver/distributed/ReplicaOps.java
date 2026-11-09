@@ -613,16 +613,18 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 		// would resolve /x/link/.. elsewhere, and the backup would be restored into a directory that is not the one
 		// opened here and by the node's start (R35-1).
 		dataDir = dataDir.toAbsolutePath().normalize();
+		Path db = dataDir.resolve("db");
+		Path raft = dataDir.resolve("raft");
+		// Before the backup is read (R36 review 2): a repeat of a restore that succeeded is refused for its database, not
+		// sent to the backup that run moved, which would be refused for the same database.
+		if (Files.exists(db) || (Files.isDirectory(raft) && !isEmpty(raft))) {
+			throw new IOException(dataDir + " holds a database or a Raft log: restore into an empty data directory");
+		}
 		Properties properties;
 		try {
 			properties = readBackupProperties(backupDir);
 		} catch (NoSuchFileException missing) {
 			throw movedByAnEarlierRun(backupDir, dataDir, missing);
-		}
-		Path db = dataDir.resolve("db");
-		Path raft = dataDir.resolve("raft");
-		if (Files.exists(db) || (Files.isDirectory(raft) && !isEmpty(raft))) {
-			throw new IOException(dataDir + " holds a database or a Raft log: restore into an empty data directory");
 		}
 		Files.createDirectories(dataDir);
 		Path staging = dataDir.resolve(RESTORE_STAGING_DIR);
@@ -665,9 +667,10 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 
 	/**
 	 * The failure for a {@code backupDir} without {@link #BACKUP_PROPERTIES}: when it names {@code DATA-DIR/backups/<x>}
-	 * and an earlier restore-backup that stopped after its renames moved it to
-	 * {@code DATA-DIR/backups.before-restore-<time>/<x>}, a message that gives that path (R36-1); otherwise
-	 * {@code missing}.
+	 * and an earlier restore-backup moved it to {@code DATA-DIR/backups.before-restore-<time>/<x>}, a message that gives
+	 * that path (R36-1); otherwise {@code missing}. Only called when the data directory holds no database (R36 review
+	 * 2), so the earlier run stopped after its renames, or its {@code db/} was deleted since: either way the rerun
+	 * with that path can restore.
 	 */
 	private static IOException movedByAnEarlierRun(Path backupDir, Path dataDir, NoSuchFileException missing)
 			throws IOException {
@@ -690,7 +693,7 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 			return missing;
 		}
 		var moved = new NoSuchFileException(missing.getFile(), null, "an earlier restore-backup into " + dataDir
-				+ " that stopped renamed " + backups + " with the old cluster's results; the backup is now in "
+				+ " renamed " + backups + " with the old cluster's results; the backup is now in "
 				+ candidates.getFirst() + ": run again with --backup " + candidates.getFirst());
 		moved.initCause(missing);
 		return moved;
