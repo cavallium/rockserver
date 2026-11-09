@@ -182,7 +182,10 @@ final class LeaderHintRouter implements AutoCloseable {
 	 * does nothing. Guarded by {@link #lock}.
 	 */
 	private final Set<Hint> retiredOpen = new HashSet<>();
-	/** Written under {@link #lock}; read without it by a failed leader call, which must not replay after the close. */
+	/**
+	 * Set by {@link #stopRouting} or {@link #close}. Written under {@link #lock}; read without it by a failed leader
+	 * call, which must not replay after the close began.
+	 */
 	private volatile boolean closed;
 
 	/**
@@ -611,6 +614,28 @@ final class LeaderHintRouter implements AutoCloseable {
 	private void keepUntilClose(Hint retiring) {
 		retiredOpen.removeIf(retired -> retired.channel().isTerminated());
 		retiredOpen.add(retiring);
+	}
+
+	/**
+	 * The connection starts to close (review of R51, 1): from now on no call goes to a leader channel and no hint is
+	 * taken. The current hint is retired, as by a new leader: its channel shuts down gracefully once the calls handed
+	 * out on it have started (R46-1; those not started yet go to the ordinary channel, which the close shuts down at the
+	 * same time), so it refuses new calls but keeps those in flight, the numbered writes that
+	 * {@code GrpcConnection.close()} waits for among them, until {@link #close} forces it.
+	 */
+	void stopRouting() {
+		Hint hint;
+		synchronized (lock) {
+			closed = true;
+			hint = current;
+			current = null;
+			if (hint != null) {
+				keepUntilClose(hint);
+			}
+		}
+		if (hint != null) {
+			hint.retire();
+		}
 	}
 
 	/**
