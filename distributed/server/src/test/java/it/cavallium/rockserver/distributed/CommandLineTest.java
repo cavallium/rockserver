@@ -771,6 +771,103 @@ class CommandLineTest {
 	}
 
 	/**
+	 * A member that answers the capabilities question, takes the first proposal and then breaks the call without
+	 * answering it (R40-1, review 1). With {@code reset}, the member sits behind a TCP proxy that then resets every
+	 * client connection (SO_LINGER 0) and refuses new ones, as a member that is killed or whose host drops the
+	 * connection mid-call: the client sees the transport close under the open call, which grpc-java answers with
+	 * UNAVAILABLE. Without it, the member's server shuts down with {@code shutdownNow}, which resets its open streams
+	 * with RST_STREAM(CANCEL): the client sees CANCELLED.
+	 */
+	private static final class DroppingMember implements AutoCloseable {
+		final java.util.concurrent.atomic.AtomicInteger taken = new java.util.concurrent.atomic.AtomicInteger();
+		final Server server;
+		final java.net.@Nullable ServerSocket proxy;
+		final List<java.net.Socket> clients = new CopyOnWriteArrayList<>();
+
+		DroppingMember(boolean reset) throws IOException {
+			var self = new java.util.concurrent.atomic.AtomicReference<Server>();
+			ServerCalls.UnaryMethod<byte[], byte[]> ops = (request, response) -> {
+				var rest = java.util.Arrays.copyOfRange(request, 16, request.length);
+				if (rest.length > 0 && rest[0] == ReplicaOps.OP_CAPABILITIES) {
+					response.onNext(ByteBuffer.allocate(2 * Long.BYTES).putLong(Capabilities.SUPPORTED)
+							.putLong(Capabilities.SUPPORTED).array());
+					response.onCompleted();
+				} else if (taken.getAndIncrement() == 0) {
+					Thread.ofPlatform().start(reset ? this::resetClients : () -> self.get().shutdownNow());
+				}
+			};
+			server = NettyServerBuilder.forAddress(new java.net.InetSocketAddress("127.0.0.1", 0))
+					.addService(ServerServiceDefinition.builder(TermService.SERVICE_NAME)
+							.addMethod(TermService.OPS, ServerCalls.asyncUnaryCall(ops)).build())
+					.build()
+					.start();
+			self.set(server);
+			if (reset) {
+				var loopback = java.net.InetAddress.getByName("127.0.0.1");
+				var listener = new java.net.ServerSocket(0, 50, loopback);
+				proxy = listener;
+				Thread.ofPlatform().daemon().start(() -> {
+					while (true) {
+						try {
+							var client = listener.accept();
+							var backend = new java.net.Socket(loopback, server.getPort());
+							clients.add(client);
+							pump(client, backend);
+							pump(backend, client);
+						} catch (IOException ex) {
+							return;
+						}
+					}
+				});
+			} else {
+				proxy = null;
+			}
+		}
+
+		private static void pump(java.net.Socket from, java.net.Socket to) {
+			Thread.ofPlatform().daemon().start(() -> {
+				try (from; to) {
+					from.getInputStream().transferTo(to.getOutputStream());
+				} catch (IOException ignored) {
+					// The other side closed or was reset.
+				}
+			});
+		}
+
+		private void resetClients() {
+			try {
+				proxy.close();
+			} catch (IOException ignored) {
+				// Closing it only refuses new connections.
+			}
+			for (var client : clients) {
+				try {
+					client.setSoLinger(true, 0);
+					client.close();
+				} catch (IOException ignored) {
+					// Closed already.
+				}
+			}
+		}
+
+		String address() {
+			return "127.0.0.1:" + (proxy != null ? proxy.getLocalPort() : server.getPort());
+		}
+
+		String peer(String id) {
+			return id + "=" + address() + "/" + address();
+		}
+
+		@Override
+		public void close() throws InterruptedException {
+			if (proxy != null) {
+				resetClients();
+			}
+			server.shutdownNow().awaitTermination(5, TimeUnit.SECONDS);
+		}
+	}
+
+	/**
 	 * A member that answers the capabilities question after {@code delay} (so that the real members take the
 	 * proposal) and answers every other question with a byte that names no result state, as a member of another or
 	 * mismatched version might.
@@ -949,6 +1046,101 @@ class CommandLineTest {
 		assertTrue(none.out().contains("Nothing was proposed: run the command again"), none.toString());
 		assertTrue(!none.out().contains("may have been proposed"), none.toString());
 		assertTrue(!none.out().contains("last answer null"), none.toString());
+	}
+
+	/**
+	 * R40-1 to R40-3: grpc-java answers UNAVAILABLE also when the transport breaks after the member received the call
+	 * (a kill, a restart, a reset, a GOAWAY), when its Proposer may have sent the entry already. Such a bare
+	 * UNAVAILABLE on the proposal call does not tell whether the operation was proposed: {@code checksum}, which is not
+	 * idempotent, ends with 4 ("does not tell") without proposing it again through the next member, which would start a
+	 * second full-database digest on every replica. Before, every UNAVAILABLE counted as nothing proposed.
+	 */
+	@Test
+	void aChecksumWhoseCallBrokeAfterTheMemberTookItIsNotProposedAgain() throws Exception {
+		try (var dropped = new RefusingMember(Duration.ZERO,
+				Status.UNAVAILABLE.withDescription("Network closed for unknown reason"));
+				var next = new RefusingMember(Duration.ofMillis(500),
+						Status.FAILED_PRECONDITION.withDescription("asked the next member"))) {
+			var result = run("admin", "--peer", dropped.peer("m1"), "--peer", next.peer("m2"), "--timeout-ms", "10000",
+					"checksum");
+			assertEquals(ReplicatedServerMain.EXIT_INCOMPLETE, result.code(), result.toString());
+			assertEquals(1, dropped.count(ReplicaOps.OP_PROPOSE_CHECKSUM), result.toString());
+			assertEquals(0, next.count(ReplicaOps.OP_PROPOSE_CHECKSUM), result.toString());
+			assertTrue(result.out().contains("the answer of m1"), result.toString());
+			assertTrue(result.out().contains("does not tell whether the operation was proposed"), result.toString());
+		}
+	}
+
+	/**
+	 * R40-1 to R40-3: a {@code backup} that a member took before its call broke with a bare UNAVAILABLE (here answered
+	 * so, and then by a member whose connection is reset under the open call) may have been proposed: at the deadline
+	 * the command says so and names the member, not "Nothing was proposed: run the command again", whose rerun would be
+	 * refused with "A backup named ... exists already" once the first one is written. A member whose server shuts down
+	 * with {@code shutdownNow} mid-call is CANCELLED (RST_STREAM CANCEL), not UNAVAILABLE, and counts as took too
+	 * (review 1 of R40: that half alone was green before R40; the reset half was red then, "Nothing was proposed").
+	 */
+	@Test
+	void aBackupWhoseCallBrokeAfterTheMemberTookItMayHaveBeenProposed() throws Exception {
+		try (var dropped = new RefusingMember(Duration.ZERO,
+				Status.UNAVAILABLE.withDescription("Network closed for unknown reason"))) {
+			var result = run("admin", "--peer", dropped.peer("m1"), "--timeout-ms", "3000", "backup", "b9");
+			assertEquals(ReplicatedServerMain.EXIT_INCOMPLETE, result.code(), result.toString());
+			assertTrue(dropped.count(ReplicaOps.OP_PROPOSE_BACKUP) >= 1, result.toString());
+			assertTrue(!result.out().contains("Nothing was proposed"), result.toString());
+			assertTrue(result.out().contains("m1 took the request"), result.toString());
+			assertTrue(result.out().contains("may have been proposed"), result.toString());
+		}
+		// Review 1 of R40: each kind of break, first with the status that a direct call sees, so that the half tests
+		// what it claims: a connection reset under the open call is the bare UNAVAILABLE of R40-1; a server
+		// shutdownNow resets the stream and is CANCELLED, which never counted as nothing proposed.
+		var groupId = org.apache.ratis.protocol.RaftGroupId.valueOf(java.util.UUID.fromString(NodeConfig.DEFAULT_GROUP_ID));
+		for (var reset : List.of(true, false)) {
+			var expected = reset ? Status.Code.UNAVAILABLE : Status.Code.CANCELLED;
+			try (var probe = new DroppingMember(reset)) {
+				var ex = org.junit.jupiter.api.Assertions.assertThrows(java.util.concurrent.CompletionException.class,
+						() -> ReplicaOps.call(probe.address(), groupId, ReplicaOps.OP_PROPOSE_BACKUP, new byte[0],
+								Duration.ofSeconds(10)).join());
+				assertEquals(expected, Status.fromThrowable(ex.getCause()).getCode(), "reset " + reset + ": " + ex);
+			}
+			try (var dropping = new DroppingMember(reset)) {
+				var result = run("admin", "--peer", dropping.peer("m1"), "--timeout-ms", "3000", "backup", "b9");
+				assertEquals(ReplicatedServerMain.EXIT_INCOMPLETE, result.code(), result.toString());
+				assertEquals(1, dropping.taken.get(), result.toString());
+				assertTrue(!result.out().contains("Nothing was proposed"), result.toString());
+				assertTrue(result.out().contains("m1 took the request"), result.toString());
+				assertTrue(result.out().contains("may have been proposed"), result.toString());
+			}
+		}
+	}
+
+	/**
+	 * R40-1 to R40-3: a member's own refusal that proves nothing was proposed (its Proposer did not apply it, or the
+	 * node is starting, also in the words of an older member) is UNAVAILABLE with a description that says so: a
+	 * {@code checksum} still moves to the next member, and a {@code backup} that every member refused so still says
+	 * "Nothing was proposed".
+	 */
+	@Test
+	void aMarkedNotProposedRefusalStillMovesToTheNextMember() throws Exception {
+		for (var refusal : List.of("Not proposed: no leader accepted the request in time", "The node is starting",
+				"Not proposed: the node is starting")) {
+			try (var first = new RefusingMember(Duration.ZERO, Status.UNAVAILABLE.withDescription(refusal));
+					var next = new RefusingMember(Duration.ofMillis(500),
+							Status.FAILED_PRECONDITION.withDescription("asked the next member"))) {
+				var result = run("admin", "--peer", first.peer("m1"), "--peer", next.peer("m2"), "--timeout-ms", "10000",
+						"checksum");
+				assertEquals(1, result.code(), result.toString());
+				assertEquals(1, first.count(ReplicaOps.OP_PROPOSE_CHECKSUM), result.toString());
+				assertEquals(1, next.count(ReplicaOps.OP_PROPOSE_CHECKSUM), result.toString());
+				assertTrue(result.out().contains("m2 refused: asked the next member"), result.toString());
+			}
+		}
+		try (var refusing = new RefusingMember(Duration.ZERO,
+				Status.UNAVAILABLE.withDescription("Not proposed: no leader accepted the request in time"))) {
+			var result = run("admin", "--peer", refusing.peer("m1"), "--timeout-ms", "2000", "backup", "b9");
+			assertEquals(ReplicatedServerMain.EXIT_INCOMPLETE, result.code(), result.toString());
+			assertTrue(result.out().contains("Nothing was proposed: run the command again"), result.toString());
+			assertTrue(!result.out().contains("may have been proposed"), result.toString());
+		}
 	}
 
 	/**
