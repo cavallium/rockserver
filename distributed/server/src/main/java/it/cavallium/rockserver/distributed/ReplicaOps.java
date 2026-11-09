@@ -583,7 +583,9 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 	}
 
 	/**
-	 * Prepares {@code dataDir}, which must hold no database and no Raft state, to seed a new cluster from the backup in
+	 * Prepares {@code dataDir}, which must hold no database, no restore directory of one ({@code db.restore-tmp},
+	 * {@code -ready}, {@code -old}: the first start would swap the ready one over the restored database, or delete them;
+	 * R38-RESTORE-STALE-RESTORE-READY) and no Raft state, to seed a new cluster from the backup in
 	 * {@code backupDir}: restores its database ({@link NodeStore#restore}) and deletes its replication metadata, so that
 	 * the database belongs to no cluster. Every node of the new cluster is prepared from a copy of the same backup and
 	 * started without {@code --join}: the cluster starts seeded, see "Migrating from a single node" in the design
@@ -619,6 +621,22 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 		// sent to the backup that run moved, which would be refused for the same database.
 		if (Files.exists(db) || (Files.isDirectory(raft) && !isEmpty(raft))) {
 			throw new IOException(dataDir + " holds a database or a Raft log: restore into an empty data directory");
+		}
+		// The restore directories of db/ too (R38-RESTORE-STALE-RESTORE-READY): the database is built aside, so nothing
+		// here rolls them in, and the first start's open would swap an old db.restore-ready (a snapshot install that a
+		// crash interrupted between its renames, R33-1) over the restored db/ and delete it.
+		var leftovers = new ArrayList<Path>();
+		for (Path dir : NodeStore.restoreDirectories(db)) {
+			if (Files.exists(dir, LinkOption.NOFOLLOW_LINKS)) {
+				leftovers.add(dir);
+			}
+		}
+		if (!leftovers.isEmpty()) {
+			throw new IOException(dataDir + " holds " + leftovers.stream().map(Path::toString)
+					.collect(java.util.stream.Collectors.joining(", ")) + ", left by an interrupted restore of the old"
+					+ " cluster's database: the first start would swap it in over the restored database or delete it."
+					+ " Copy it aside if it may be needed, then delete it (or empty the data directory) and run again;"
+					+ " restore into an empty data directory");
 		}
 		Properties properties;
 		try {

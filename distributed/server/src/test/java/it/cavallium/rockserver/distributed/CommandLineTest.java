@@ -1028,9 +1028,8 @@ class CommandLineTest {
 		var refused = run("restore-backup", "--backup", backup.toString(), "--data-dir", dataDir.toString());
 
 		assertEquals(1, refused.code(), refused.toString());
-		assertInstanceOf(IOException.class, refused.thrown());
-		assertTrue(refused.thrown().getMessage().contains(dataDir.resolve("db.restore-ready").toString()),
-				refused.thrown().getMessage());
+		assertTrue(refused.out().startsWith("FAILED: "), refused.out());
+		assertTrue(refused.out().contains(dataDir.resolve("db.restore-ready").toString()), refused.out());
 		assertTrue(Files.notExists(dataDir.resolve("db")));
 		assertTrue(Files.notExists(dataDir.resolve(ReplicaOps.RESTORE_STAGING_DIR)));
 		assertTrue(Files.isRegularFile(dataDir.resolve("db.restore-ready").resolve("CURRENT")));

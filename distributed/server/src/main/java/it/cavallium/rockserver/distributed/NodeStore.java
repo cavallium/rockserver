@@ -1551,6 +1551,17 @@ final class NodeStore implements Closeable {
 		}
 	}
 
+	/**
+	 * The sibling directories a {@link #restore} into {@code dbDir} builds ({@code <db>.restore-tmp}, {@code -ready},
+	 * {@code -old}), normalized as the open normalizes {@code dbDir}: the next open of {@code dbDir} deletes the first
+	 * and the last, and swaps the ready one in (over {@code dbDir} if there is one). {@code restore-backup} refuses a
+	 * data directory that holds any of them (R38-RESTORE-STALE-RESTORE-READY).
+	 */
+	static List<Path> restoreDirectories(Path dbDir) {
+		var dirs = RestoreDirs.of(dbDir);
+		return List.of(dirs.building, dirs.ready, dirs.old);
+	}
+
 	/** Sibling directories used by {@link #restore}. */
 	private record RestoreDirs(Path dbDir, Path parent, Path building, Path ready, Path old) {
 
