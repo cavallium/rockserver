@@ -1100,7 +1100,7 @@ final class NodeStore implements Closeable {
 	}
 
 	/** Two {@code <size> <identity>} values: same size, and same identity unless one of them is unknown ({@code -}). */
-	private static boolean sameTable(String before, String now) {
+	static boolean sameTable(String before, String now) {
 		var a = before.split(" ", 2);
 		var b = now.split(" ", 2);
 		return a[0].equals(b[0]) && (a.length < 2 || b.length < 2 || a[1].equals("-") || b[1].equals("-")
