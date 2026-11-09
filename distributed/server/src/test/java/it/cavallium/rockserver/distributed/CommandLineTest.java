@@ -1080,6 +1080,39 @@ class CommandLineTest {
 	}
 
 	/**
+	 * R33-1: {@code export-seed} of a stopped node whose snapshot installation a crash interrupted between the restore's
+	 * two renames (no {@code db/}; {@code db.restore-ready} holds the complete newer database, {@code db.restore-old}
+	 * the old one) exports the newer database with 0, as a start of the node would swap it in, and leaves it in
+	 * {@code db/}. While the node holds its Raft lock, it is refused with the lock's message and nothing is touched
+	 * (R32-5). Before, it failed at once with "No database in", and the operator would seed from another replica.
+	 */
+	@Test
+	void exportSeedFinishesARestoreInterruptedBetweenItsRenames() throws IOException {
+		Path dataDir = temp.resolve("node");
+		NodeStoreTest.writeRestoreInterruptedDuringTheSwap(dataDir, true);
+		Path groupDir = Files.createDirectories(dataDir.resolve("raft").resolve(NodeConfig.DEFAULT_GROUP_ID));
+		Path lockFile = groupDir.resolve("in_use.lock");
+		Path seed = temp.resolve("seed");
+		try (var channel = java.nio.channels.FileChannel.open(lockFile, java.nio.file.StandardOpenOption.CREATE,
+				java.nio.file.StandardOpenOption.WRITE); var lock = channel.lock()) {
+			var refused = run("export-seed", "--data-dir", dataDir.toString(), "--target", seed.toString());
+			assertEquals(1, refused.code(), refused.toString());
+			assertTrue(refused.err().contains(lockFile + " is locked: stop the node first"), refused.err());
+			assertTrue(Files.notExists(seed));
+			assertTrue(Files.notExists(dataDir.resolve("db")));
+			assertTrue(Files.isRegularFile(dataDir.resolve("db.restore-ready").resolve("CURRENT")));
+			assertTrue(Files.isRegularFile(dataDir.resolve("db.restore-old").resolve("CURRENT")));
+		}
+		var exported = run("export-seed", "--data-dir", dataDir.toString(), "--target", seed.toString());
+		assertEquals(0, exported.code(), exported.toString());
+		assertTrue(exported.out().contains("applied up to index 40 of term 4"), exported.out());
+		assertTrue(Files.isRegularFile(seed.resolve("CURRENT")));
+		assertTrue(Files.isRegularFile(dataDir.resolve("db").resolve("CURRENT")));
+		assertTrue(Files.notExists(dataDir.resolve("db.restore-ready")));
+		assertTrue(Files.notExists(dataDir.resolve("db.restore-old")));
+	}
+
+	/**
 	 * A stopped node in {@code dataDir}: {@code db/} at 1:5, and in raft/{@code group} a snapshot at 4:40 as the node
 	 * takes one (a checkpoint and its position, fsynced before the rename: no digest to verify).
 	 */

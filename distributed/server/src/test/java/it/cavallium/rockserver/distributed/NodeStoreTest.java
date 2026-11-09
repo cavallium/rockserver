@@ -665,6 +665,83 @@ class NodeStoreTest {
 		assertMatchesCheckpoint(dbDir, checkpointed);
 	}
 
+	/**
+	 * R33-1: {@code export-seed} of a replica whose restore a crash interrupted during the swap ({@link NodeStore#restore}
+	 * renames {@code db/} to {@code db.restore-old}, then {@code db.restore-ready} to {@code db/}, and fsyncs the parent
+	 * after both) exports the complete newer database in {@code db.restore-ready}, as a start of the node would, and
+	 * leaves it swapped into {@code db/}. Both layouts: no {@code db/} (a crash between the renames, or a power loss
+	 * before the fsync), and {@code db/} next to {@code db.restore-ready} (a crash before the swap). Before, the first
+	 * was refused with "No database in", before the open that finishes the swap.
+	 */
+	@Test
+	void exportSeedFinishesARestoreInterruptedDuringTheSwap() throws IOException {
+		for (boolean betweenTheRenames : List.of(true, false)) {
+			Path dataDir = Files.createDirectories(tempDir.resolve("node-" + betweenTheRenames));
+			writeRestoreInterruptedDuringTheSwap(dataDir, betweenTheRenames);
+			Path dbDir = dataDir.resolve("db");
+			Path target = tempDir.resolve("seed-" + betweenTheRenames);
+
+			var exported = NodeStore.exportSeed(dbDir, null, target);
+
+			assertEquals(TermIndex.valueOf(4, 40), exported.applied(), "between the renames: " + betweenTheRenames);
+			try (var seed = NodeStore.open(target, null, "seed")) {
+				assertEquals(Map.of(7, "new"), contents(seed, seed.db().getColumnId(DATA_COLUMN)));
+			}
+			assertFalse(Files.exists(dataDir.resolve("db.restore-ready")));
+			assertFalse(Files.exists(dataDir.resolve("db.restore-old")));
+			try (var store = NodeStore.open(dbDir, null, "node")) {
+				assertEquals(TermIndex.valueOf(4, 40), store.applied());
+				assertEquals(Map.of(7, "new"), contents(store, store.db().getColumnId(DATA_COLUMN)));
+			}
+		}
+	}
+
+	/**
+	 * R33-1 guard: with neither {@code db/CURRENT} nor {@code db.restore-ready}, {@code export-seed} still refuses with
+	 * "No database in", writes nothing and touches nothing: a {@code db.restore-old} or {@code db.restore-tmp} alone
+	 * is left as it was.
+	 */
+	@Test
+	void exportSeedOfAMissingDatabaseStillRefusesAndTouchesNothing() throws IOException {
+		Path dataDir = Files.createDirectories(tempDir.resolve("node"));
+		Path old = Files.createDirectories(dataDir.resolve("db.restore-old"));
+		Files.writeString(old.resolve("CURRENT"), "kept");
+		Path building = Files.createDirectories(dataDir.resolve("db.restore-tmp"));
+		Files.writeString(building.resolve("000001.sst"), "kept");
+		Path target = tempDir.resolve("seed");
+
+		var refused = assertThrows(IOException.class,
+				() -> NodeStore.exportSeed(dataDir.resolve("db"), null, target));
+
+		assertTrue(refused.getMessage().startsWith("No database in "), refused.getMessage());
+		assertFalse(Files.exists(target));
+		assertFalse(Files.exists(dataDir.resolve("db")));
+		assertEquals("kept", Files.readString(old.resolve("CURRENT")));
+		assertEquals("kept", Files.readString(building.resolve("000001.sst")));
+	}
+
+	/**
+	 * The layout a crash during {@link NodeStore#restore}'s swap leaves in {@code dataDir}: {@code db.restore-ready}
+	 * holds the new database (key 7 = "new", applied 4:40), the old one (key 7 = "old", applied 1:5) is
+	 * {@code db.restore-old} when {@code betweenTheRenames}, else still {@code db/}.
+	 */
+	static void writeRestoreInterruptedDuringTheSwap(Path dataDir, boolean betweenTheRenames) throws IOException {
+		// The old database first: an open of db/ next to db.restore-ready would finish the swap.
+		writeDatabase(dataDir.resolve("db"), "old", TermIndex.valueOf(1, 5));
+		writeDatabase(dataDir.resolve("db.restore-ready"), "new", TermIndex.valueOf(4, 40));
+		if (betweenTheRenames) {
+			Files.move(dataDir.resolve("db"), dataDir.resolve("db.restore-old"));
+		}
+	}
+
+	private static void writeDatabase(Path dbDir, String value, TermIndex applied) throws IOException {
+		try (var store = NodeStore.open(dbDir, null, "written")) {
+			long column = store.db().createColumn(DATA_COLUMN, DATA_SCHEMA);
+			put(store, column, 7, value);
+			setApplied(store, applied);
+		}
+	}
+
 	/** What a database held when it was checkpointed. */
 	record Expected(Map<Integer, String> contents, TermIndex applied, @Nullable String clusterId) {
 
