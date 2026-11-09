@@ -721,6 +721,35 @@ class NodeStoreTest {
 	}
 
 	/**
+	 * R33 review guard: a {@code db.restore-ready} without {@code CURRENT} (not a database: only storage that lost
+	 * fsynced data leaves one, as {@link NodeStore#restore} fsyncs its tree before the rename to ready) next to a
+	 * complete {@code db.restore-old} and no {@code db/} is refused with "No database in", with nothing touched. Before,
+	 * the directory alone was accepted, and the open swapped it into {@code db/}, deleted {@code db.restore-old} (the
+	 * only complete copy), created an empty database and exported it at index 0.
+	 */
+	@Test
+	void exportSeedRefusesARestoreReadyWithoutCurrentAndTouchesNothing() throws IOException {
+		Path dataDir = Files.createDirectories(tempDir.resolve("node"));
+		writeDatabase(dataDir.resolve("db.restore-old"), "old", TermIndex.valueOf(1, 5));
+		Path ready = Files.createDirectories(dataDir.resolve("db.restore-ready"));
+		Files.writeString(ready.resolve("000001.sst"), "kept");
+		Path target = tempDir.resolve("seed");
+
+		var refused = assertThrows(IOException.class,
+				() -> NodeStore.exportSeed(dataDir.resolve("db"), null, target));
+
+		assertTrue(refused.getMessage().startsWith("No database in "), refused.getMessage());
+		assertFalse(Files.exists(target));
+		assertFalse(Files.exists(dataDir.resolve("db")));
+		assertEquals("kept", Files.readString(ready.resolve("000001.sst")));
+		assertTrue(Files.isRegularFile(dataDir.resolve("db.restore-old").resolve("CURRENT")));
+		try (var store = NodeStore.open(dataDir.resolve("db.restore-old"), null, "old")) {
+			assertEquals(TermIndex.valueOf(1, 5), store.applied());
+			assertEquals(Map.of(7, "old"), contents(store, store.db().getColumnId(DATA_COLUMN)));
+		}
+	}
+
+	/**
 	 * The layout a crash during {@link NodeStore#restore}'s swap leaves in {@code dataDir}: {@code db.restore-ready}
 	 * holds the new database (key 7 = "new", applied 4:40), the old one (key 7 = "old", applied 1:5) is
 	 * {@code db.restore-old} when {@code betweenTheRenames}, else still {@code db/}.
