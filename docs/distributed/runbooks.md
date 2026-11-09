@@ -299,7 +299,7 @@ itself holds a wrong address of a member that stays (written by an `admin` witho
 right one: it prints `--change-addresses: this change also moves ...` and writes the `--peer` addresses. That fixes
 the record only (for `--join` nodes and `admin`); the running nodes already use the address of their `--peer`. Ratis
 writes nothing for a configuration whose voters do not change, so `admin` refuses `--change-addresses` on a call
-that adds and removes no voter (a re-run of a `remove-peer`, say) with exit code 1: `FAILED: refused:
+that adds and removes no voter (a re-run of a `remove-peer`, or an `add-peer` of a voter already) with exit code 1: `FAILED: refused:
 --change-addresses on a call that adds and removes no voter ... Nothing was written.` Wait for the next replacement
 to write it.
 

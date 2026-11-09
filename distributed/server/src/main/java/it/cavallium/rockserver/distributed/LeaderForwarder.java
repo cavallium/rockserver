@@ -41,11 +41,15 @@ import org.slf4j.LoggerFactory;
  * Raft address, which the Raft configuration carries.</p>
  *
  * <p>For a member in the peer list, its Raft address there is used even when the Raft configuration records another
- * (R52-4): it is the address that this node's Ratis server uses for that id too, since Ratis 3.3.1 makes its connection
- * to a peer from the start's group (the peer list) first and never replaces it for the same id while it runs (R52-2).
- * Preferring the configuration's address here would forward to an address that Raft itself does not use. A member id
- * therefore keeps its address: a member moves under a new id, which is not in the list and is asked at the
- * configuration's address (runbooks, "One voter per change").</p>
+ * (R52-4). On a node started without {@code --join} it is the address that this node's Ratis server uses for that id
+ * too, since Ratis 3.3.1 makes its connection to a peer from the start's group (the peer list) first and never
+ * replaces it for the same id while it runs (R52-2); preferring the configuration's address would forward to an address
+ * that Raft itself does not use. A node started with {@code --join} gives Ratis an empty group, so its Ratis server
+ * takes every address from the Raft configuration (review of R52, 2). The two differ only when the configuration
+ * holds a wrong address for a listed member, the case {@code --change-addresses} exists to fix: such a node's Raft
+ * traffic then goes to the configuration's address, and the listed one, which the operator gave for that member, is
+ * still the better one to forward to. A member id keeps its address: a member moves under a new id, which is not in
+ * the list and is asked at the configuration's address (runbooks, "One voter per change").</p>
  *
  * <p>A request that finds no leader waits for one: {@link #leaderChanged()}, called on every leader change and when
  * this node becomes a ready leader, wakes it at once. A slow poll stays behind as a safety net.</p>
