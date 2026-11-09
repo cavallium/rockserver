@@ -626,19 +626,24 @@ final class Proposer implements Closeable {
 				callerDeadline ? Math.min(MIN_TIME_LEFT_NANOS, callerTimeLeftNanos / 4) : MIN_TIME_LEFT_NANOS,
 				entry instanceof LogEntry.Guarded guarded ? guarded.leaderEpoch() : -1);
 		live.add(pending);
-		pending.result.whenComplete((_, _) -> {
-			live.remove(pending);
-			synchronized (numbering) {
-				inFlight.remove(sequence);
-			}
-			// An abandoned request is still in its queue: its overhead is given back when it leaves it (see take()).
-			admission.release(pending.isAbandoned() ? weight - REQUEST_OVERHEAD_BYTES : weight);
-		});
 		// The answer comes on the control plane: the caller's continuations run on a virtual thread instead. Made
 		// before the request is queued: the thread that queues it may also take it into a batch, sent at once.
 		var copy = new CallerCopy(pending);
 		pending.callerCopy = copy;
-		pending.result.whenCompleteAsync(copy::answer, CALLERS);
+		// One callback, so that the caller is answered only after the request's bytes were given back (R39-2): as two,
+		// the answer could come first, since a future runs its dependents in no promised order (LIFO in practice).
+		pending.result.whenComplete((value, error) -> {
+			try {
+				live.remove(pending);
+				synchronized (numbering) {
+					inFlight.remove(sequence);
+				}
+				// An abandoned request is still in its queue: its overhead is given back when it leaves it (see take()).
+				admission.release(pending.isAbandoned() ? weight - REQUEST_OVERHEAD_BYTES : weight);
+			} finally {
+				CALLERS.execute(() -> copy.answer(value, error));
+			}
+		});
 		lane.enqueue(pending);
 		if (closed) {
 			// close() may have swept the queues before this request was added. If a batch took it meanwhile, close()
