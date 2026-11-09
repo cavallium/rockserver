@@ -187,7 +187,8 @@ public final class ReplicatedNode implements AutoCloseable {
 				new MembershipGuard(this::raftServer)));
 		boolean existing = Files.isDirectory(config.raftDir().resolve(groupId.getUuid().toString()));
 		if (!existing) {
-			// Before anything opens the database: copies of a seed are the same only until then.
+			// Before anything opens the database: copies of a seed are the same only until then. It fsyncs the seed's
+			// files first, which an operator copied into place and nothing fsynced (R34-1).
 			NodeStore.recordSeedDigest(config.dbDir());
 			requireNoClusterData(config);
 			NodeStore.noteSeedOpened(config.dbDir());

@@ -30,6 +30,7 @@ import java.nio.file.FileStore;
 import java.nio.file.FileSystemException;
 import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.nio.file.SimpleFileVisitor;
@@ -753,6 +754,8 @@ final class NodeStore implements Closeable {
 	 * those the start-up check left: otherwise the database was replaced since (the operator copied the seed again) and
 	 * the digest is taken again. Once Raft has its group directory the node no longer calls this.</p>
 	 *
+	 * <p>The seed's files are fsynced first ({@link #syncSeed}, R34-1).</p>
+	 *
 	 * @return the recorded digest, null if {@code dbDir} holds no database
 	 */
 	static @Nullable String recordSeedDigest(Path dbDir) throws IOException {
@@ -761,6 +764,7 @@ final class NodeStore implements Closeable {
 		if (!Files.isRegularFile(dbDir.resolve("CURRENT"))) {
 			return recorded;
 		}
+		syncSeed(dbDir);
 		String digest = databaseFilesDigest(dbDir);
 		if (recorded != null) {
 			String opened = lines.size() > 1 && lines.get(1).startsWith("opened ")
@@ -773,6 +777,22 @@ final class NodeStore implements Closeable {
 		}
 		writeSeedDigestFile(dbDir, digest + "\n");
 		return digest;
+	}
+
+	/**
+	 * Fsyncs every file and directory under {@code dbDir} (its volumes and WAL directory included, hard-linked files
+	 * too) and its parent, the data directory (R34-1). An operator copied the seed into place ({@code rsync},
+	 * {@code cp}, {@code restore-backup} from a copy) and nothing fsynced it; once the seeded genesis commits, the Raft
+	 * log assumes the seed is in every replica's database, and no entry holds it. The seed snapshot taken after genesis
+	 * hard-links the same inodes, which {@link #syncTree(Path)} skips. Runs at every first start (no Raft group
+	 * directory yet, see {@link #recordSeedDigest}), so once per node unless a first start fails: one fsync per file of
+	 * the seed, which forces out what writeback has not flushed yet and is cheap for what it has. Volumes or a WAL
+	 * directory configured outside {@code dbDir} are not reached: the runbooks' {@code sync} after the copy covers them.
+	 */
+	static void syncSeed(Path dbDir) throws IOException {
+		Path absolute = dbDir.toAbsolutePath().normalize();
+		syncTree(absolute, true);
+		syncDirectory(absolute.getParent());
 	}
 
 	/**
@@ -928,13 +948,32 @@ final class NodeStore implements Closeable {
 	 * the lock, swaps it in as the node's start would. With neither {@code dbDir/CURRENT} nor
 	 * {@code <db>.restore-ready/CURRENT}, it throws "No database in" before anything is touched.</p>
 	 *
+	 * <p>A {@code target} that is, contains or is inside {@code dbDir}, one of its restore directories or the node's Raft
+	 * directory (also through a symbolic link, a dangling one too) is refused before anything is touched, and so is a
+	 * symbolic link to nothing and an existing {@code <target>.tmp}, which the checkpoint builds in; on a failure, only
+	 * what this call's checkpoint created is deleted (R34-2 and its review). {@code dbDir}, {@code stateMachineDir} and
+	 * {@code target} are normalized once, as {@link #open} normalizes {@code dbDir}, and every step uses that form.</p>
+	 *
 	 * @throws NodeRunningException if the node holds its group's lock: nothing of the node is touched, nothing written
 	 */
 	static ExportedSeed exportSeed(Path dbDir, @Nullable Path stateMachineDir, @Nullable Path rockserverConfig,
 			Path target, boolean withoutDamagedSnapshot) throws IOException {
+		// One form of every path for every step below (R34 review 2): the normalized one, which open() uses for dbDir.
+		// The OS would resolve /x/link/.. to the link's parent's parent instead, and the "No database in" check, the
+		// lock, the refusal and the open would then look at different directories.
+		dbDir = dbDir.toAbsolutePath().normalize();
+		stateMachineDir = stateMachineDir == null ? null : stateMachineDir.toAbsolutePath().normalize();
 		target = target.toAbsolutePath().normalize();
-		if (Files.exists(target)) {
+		refuseTargetAmongNodeDirectories(dbDir, stateMachineDir, target);
+		// NOFOLLOW_LINKS: a symbolic link to nothing is refused too, as the copy would be written where it points (R34-2).
+		if (Files.exists(target, LinkOption.NOFOLLOW_LINKS)) {
 			throw new IOException("The target " + target + " already exists");
+		}
+		// The checkpoint builds in <target>.tmp: one that exists is not this run's, and stays (R34 review 3).
+		Path building = target.resolveSibling(target.getFileName() + ".tmp");
+		if (Files.exists(building, LinkOption.NOFOLLOW_LINKS)) {
+			throw new IOException("The target's temporary directory " + building + " already exists: remove it or choose"
+					+ " another target");
 		}
 		// R33-1: a restore that a crash interrupted during its swap may have left no db/ (between its two renames, or
 		// before the parent's fsync), with the complete newer database in <db>.restore-ready: the open below finishes
@@ -945,7 +984,7 @@ final class NodeStore implements Closeable {
 				&& !Files.isRegularFile(RestoreDirs.of(dbDir).ready.resolve("CURRENT"))) {
 			throw new IOException("No database in " + dbDir);
 		}
-		Path groupDir = stateMachineDir == null ? null : stateMachineDir.toAbsolutePath().normalize().getParent();
+		Path groupDir = stateMachineDir == null ? null : stateMachineDir.getParent();
 		if (groupDir == null || !Files.isDirectory(groupDir)) {
 			return exportSeedStopped(dbDir, stateMachineDir, rockserverConfig, target, withoutDamagedSnapshot);
 		}
@@ -963,6 +1002,91 @@ final class NodeStore implements Closeable {
 		}
 	}
 
+	/**
+	 * Refuses, before anything is touched, a {@code target} whose copy (or the checkpoint's {@code <target>.tmp}, which it
+	 * deletes first) would be, contain or lie inside a directory of the node being exported: {@code dbDir}, its restore
+	 * directories ({@code <db>.restore-tmp}, {@code -ready}, {@code -old}) and, when {@code stateMachineDir} is given,
+	 * the node's Raft directory ({@code raft/}, the parent of its group directory). Paths are compared by their real
+	 * paths, so a symbolic link to one of them is refused too, also a dangling one (R34 review 1: every link to a
+	 * missing {@code db/} is); the part of a path that does not exist is compared as it is written (R34-2). The
+	 * caller passes the normalized paths that every later step uses (R34 review 2). Before, with no {@code db/} and a complete
+	 * {@code <db>.restore-ready} (R33-1), {@code --target DATA-DIR/db} passed every check: the open swapped the ready
+	 * database into {@code db/} and deleted {@code <db>.restore-old}, the checkpoint failed as its target existed, and
+	 * the failure cleanup deleted {@code db/}, the node's only complete database.
+	 */
+	private static void refuseTargetAmongNodeDirectories(Path dbDir, @Nullable Path stateMachineDir, Path target)
+			throws IOException {
+		var dirs = RestoreDirs.of(dbDir);
+		var nodeDirs = new ArrayList<>(List.of(dirs.dbDir, dirs.building, dirs.ready, dirs.old));
+		if (stateMachineDir != null) {
+			Path groupDir = stateMachineDir.getParent();
+			if (groupDir != null) {
+				nodeDirs.add(groupDir.getParent() != null ? groupDir.getParent() : groupDir);
+			}
+		}
+		Path building = target.resolveSibling(target.getFileName() + ".tmp");
+		for (Path written : List.of(target, building)) {
+			Path real = realPathOf(written);
+			for (Path nodeDir : nodeDirs) {
+				Path realNodeDir = realPathOf(nodeDir);
+				if (real.startsWith(realNodeDir) || realNodeDir.startsWith(real)) {
+					throw new IOException("The target " + target + (written.equals(target) ? "" : " (its " + written + ")")
+							+ " is, contains or is inside " + nodeDir + ", a directory of the node being exported: write"
+							+ " the seed outside the node's database, restore and Raft directories");
+				}
+			}
+		}
+	}
+
+	/**
+	 * The path the OS would reach for {@code path}, with every symbolic link resolved, dangling ones too (R34 review 1:
+	 * {@code toRealPath} of the nearest existing ancestor kept a link to a missing directory as a plain name, and
+	 * {@code /srv/link/seed}, with {@code link} pointing to the missing {@code DATA-DIR/db}, passed the refusal). It
+	 * walks the path a name at a time: a link is replaced by its target (relative to the link's directory), {@code ..}
+	 * goes to the parent of the resolved directory, as the OS does; names that do not exist are kept as they are.
+	 */
+	static Path realPathOf(Path path) throws IOException {
+		Path absolute = path.toAbsolutePath();
+		Path real = absolute.getRoot();
+		var rest = new java.util.ArrayDeque<String>();
+		for (Path name : absolute) {
+			rest.addLast(name.toString());
+		}
+		int links = 0;
+		while (!rest.isEmpty()) {
+			String name = rest.removeFirst();
+			if (name.isEmpty() || name.equals(".")) {
+				continue;
+			}
+			if (name.equals("..")) {
+				if (real.getParent() != null) {
+					real = real.getParent();
+				}
+				continue;
+			}
+			Path next = real.resolve(name);
+			if (Files.isSymbolicLink(next)) {
+				if (++links > 40) {
+					throw new IOException("Too many levels of symbolic links in " + path);
+				}
+				Path linked = Files.readSymbolicLink(next);
+				var names = new ArrayList<String>();
+				for (Path linkedName : linked) {
+					names.add(linkedName.toString());
+				}
+				for (int i = names.size() - 1; i >= 0; i--) {
+					rest.addFirst(names.get(i));
+				}
+				if (linked.isAbsolute()) {
+					real = linked.getRoot();
+				}
+				continue;
+			}
+			real = next;
+		}
+		return real;
+	}
+
 	/** The lock on {@code channel}'s file, or null when another process or a channel of this one holds it. */
 	private static java.nio.channels.@Nullable FileLock tryLock(FileChannel channel) throws IOException {
 		try {
@@ -977,15 +1101,20 @@ final class NodeStore implements Closeable {
 			@Nullable Path rockserverConfig, Path target, boolean withoutDamagedSnapshot) throws IOException {
 		// The copy's config first: when it is refused, nothing has been written yet.
 		Path config = replicaConfig(rockserverConfig, target, dbDir, "export-target");
+		var created = new AtomicBoolean();
 		try {
-			return exportSeedInto(dbDir, stateMachineDir, rockserverConfig, target, config, withoutDamagedSnapshot);
+			return exportSeedInto(dbDir, stateMachineDir, rockserverConfig, target, config, withoutDamagedSnapshot,
+					created);
 		} catch (IOException | RuntimeException | Error failure) {
-			// Nothing half-made stays (R29-1): the target did not exist before, and a checkpoint that failed removed its
-			// own temporary copy.
-			try {
-				deleteRecursively(target);
-			} catch (IOException | RuntimeException cleanupFailure) {
-				failure.addSuppressed(cleanupFailure);
+			// Nothing half-made stays (R29-1), and only what this run made goes (R34-2): the target once the checkpoint
+			// moved it into place. A checkpoint that failed removed its own temporary copy (and the target, if it failed
+			// after the move); a target that something else made meanwhile stays.
+			if (created.get()) {
+				try {
+					deleteRecursively(target);
+				} catch (IOException | RuntimeException cleanupFailure) {
+					failure.addSuppressed(cleanupFailure);
+				}
 			}
 			throw failure;
 		} finally {
@@ -994,8 +1123,8 @@ final class NodeStore implements Closeable {
 	}
 
 	private static ExportedSeed exportSeedInto(Path dbDir, @Nullable Path stateMachineDir,
-			@Nullable Path rockserverConfig, Path target, Path config, boolean withoutDamagedSnapshot)
-			throws IOException {
+			@Nullable Path rockserverConfig, Path target, Path config, boolean withoutDamagedSnapshot,
+			AtomicBoolean created) throws IOException {
 		TermIndex applied;
 		String clusterId;
 		TermIndex restoredSnapshot = null;
@@ -1043,7 +1172,8 @@ final class NodeStore implements Closeable {
 				throw ReplicatedNode.NewerVersionException.of(version, unknown);
 			}
 			clusterId = store.clusterId();
-			applied = store.checkpoint(target);
+			applied = store.checkpoint(target, false);
+			created.set(true);
 		} finally {
 			// A no-op when restoreSnapshotIfAhead failed after closing it.
 			store.close();
@@ -1136,13 +1266,30 @@ final class NodeStore implements Closeable {
 	 * that goes through the WAL could make the file list and the WAL copy disagree.</p>
 	 */
 	TermIndex checkpoint(Path target) throws IOException {
+		return checkpoint(target, true);
+	}
+
+	/**
+	 * {@link #checkpoint(Path)}; with {@code replaceLeftover} false, a {@code <target>.tmp} that exists is not deleted
+	 * but fails the call ({@link java.nio.file.FileAlreadyExistsException}), as this call creates it atomically before
+	 * building in it: the export of a seed into an operator's directory deletes only what it made (R34 review 3). The
+	 * snapshot and backup callers pass true: they build inside a directory of their own, where a leftover is theirs.
+	 */
+	TermIndex checkpoint(Path target, boolean replaceLeftover) throws IOException {
 		target = target.toAbsolutePath();
 		if (Files.exists(target)) {
 			throw new IOException("Checkpoint target already exists: " + target);
 		}
 		Path building = target.resolveSibling(target.getFileName() + ".tmp");
-		deleteRecursively(building);
+		if (replaceLeftover) {
+			deleteRecursively(building);
+		}
 		TermIndex applied = applied();
+		if (!replaceLeftover) {
+			Files.createDirectories(building.getParent());
+			// Before the try: one that exists is not this call's, and the cleanup below must not delete it.
+			Files.createDirectory(building);
+		}
 		try {
 			Files.createDirectories(building);
 			RocksDB rocksDB = db().getDb().get();
@@ -1162,6 +1309,18 @@ final class NodeStore implements Closeable {
 			}
 			syncTree(building);
 			Files.move(building, target);
+			try {
+				syncDirectory(target.getParent());
+			} catch (IOException | RuntimeException | Error failure) {
+				// Moved into place by this call: nothing half-made stays (R34-2: the export's cleanup deletes only a target
+				// that a checkpoint returned).
+				try {
+					deleteRecursively(target);
+				} catch (IOException | RuntimeException cleanupFailure) {
+					failure.addSuppressed(cleanupFailure);
+				}
+				throw failure;
+			}
 		} catch (IOException | RuntimeException | Error failure) {
 			// What was built hard-links every live table and blob file of the moment: left behind, it would keep them on
 			// disk after compactions replace them, on a node that may be short of space already (R29-1).
@@ -1172,7 +1331,6 @@ final class NodeStore implements Closeable {
 			}
 			throw failure;
 		}
-		syncDirectory(target.getParent());
 		return applied;
 	}
 
@@ -1308,10 +1466,23 @@ final class NodeStore implements Closeable {
 	}
 
 	/**
+	 * {@link #restore(Path, Path, boolean)} of a checkpoint whose files are durable: a Raft snapshot, which was fsynced
+	 * when it was made or verified when it was installed. The table and blob files it hard-links are not fsynced again
+	 * (thousands of them would stall the apply thread).
+	 */
+	static void restore(Path checkpointDir, Path dbDir) throws IOException {
+		restore(checkpointDir, dbDir, true);
+	}
+
+	/**
 	 * Replaces the contents of {@code dbDir} (which must not be open) with the checkpoint in {@code checkpointDir}.
 	 * Immutable files ({@code *.sst}, {@code *.blob}) are hard-linked when both are on the same file system, the
-	 * rest copied, so the checkpoint itself stays intact. Crash-safe: the new contents are prepared next to
-	 * {@code dbDir} and swapped in by rename.
+	 * rest copied, so the checkpoint itself stays intact. Crash-safe in the sense that the swap is atomic: the new
+	 * contents are prepared next to {@code dbDir}, fsynced, and swapped in by rename, so a crash leaves either the old
+	 * database or the complete new one. The new one survives a power loss only if the files it hard-links are durable:
+	 * with {@code sourceDurable} false (a backup that an operator copied with {@code cp}, {@code rsync} or {@code scp},
+	 * which do not fsync), every linked file is fsynced too, which costs one fsync per table file, most of them cheap
+	 * once writeback has flushed the copy; with true (a Raft snapshot), linked files are not fsynced again (R34-1).
 	 *
 	 * <p>Subdirectories (column volumes) are kept. Ratis' digest side files ({@code *.md5}, written next to every
 	 * file of an installed snapshot) are skipped. Steps: build {@code <db>.restore-tmp}, fsync it, rename it to
@@ -1319,7 +1490,7 @@ final class NodeStore implements Closeable {
 	 * {@code dbDir} and delete the old one. {@link #open} and the next restore roll an interrupted swap forward once
 	 * the ready directory exists.</p>
 	 */
-	static void restore(Path checkpointDir, Path dbDir) throws IOException {
+	static void restore(Path checkpointDir, Path dbDir, boolean sourceDurable) throws IOException {
 		var dirs = RestoreDirs.of(dbDir);
 		checkSingleFileSystem(dirs.dbDir);
 		dirs.recover();
@@ -1345,7 +1516,7 @@ final class NodeStore implements Closeable {
 			LOG.warn("Restoring {} copies the table files of {}: hard links between them are not possible", dbDir,
 					checkpointDir);
 		}
-		syncTree(dirs.building);
+		syncTree(dirs.building, !sourceDurable);
 		Files.move(dirs.building, dirs.ready);
 		syncDirectory(dirs.parent);
 		dirs.recover();
@@ -1465,18 +1636,32 @@ final class NodeStore implements Closeable {
 		return TermIndex.valueOf(buffer.getLong(), buffer.getLong());
 	}
 
-	/** Fsyncs every file and directory under {@code root}, including {@code root} itself. */
+	/**
+	 * Fsyncs every file and directory under {@code root}, including {@code root} itself, except files with more than
+	 * one hard link: see {@link #syncTree(Path, boolean)}.
+	 */
 	static void syncTree(Path root) throws IOException {
+		syncTree(root, false);
+	}
+
+	/**
+	 * Fsyncs every file and directory under {@code root}, including {@code root} itself; files with more than one hard
+	 * link only when {@code linkedToo}.
+	 */
+	static void syncTree(Path root, boolean linkedToo) throws IOException {
 		List<Path> paths;
 		try (Stream<Path> walk = Files.walk(root)) {
 			// Deepest first, so each directory is synced after its entries.
 			paths = walk.sorted(Comparator.reverseOrder()).toList();
 		}
 		for (Path path : paths) {
-			// A file with another hard link was linked from a file that is already durable (an SST that RocksDB
-			// synced, a checkpoint or snapshot file synced when it was made): its directory entry is synced below. A
-			// large database has thousands of such files, and fsyncing each one would stall the apply thread.
-			if (!Files.isDirectory(path) && hardLinks(path) > 1) {
+			// Without linkedToo, a file with another hard link is skipped (its directory entry is synced below): the
+			// callers that pass false link only from files that are already durable, an SST that RocksDB synced, a
+			// checkpoint or snapshot file synced when it was made or verified when it was installed. A large database has
+			// thousands of such files, and fsyncing each one would stall the apply thread. The link count says nothing
+			// about the source's durability: a file an operator copied (a backup copy, a seed rsynced into place) and
+			// then linked is not durable, and those paths pass true (restore-backup, the first start of a seed, R34-1).
+			if (!linkedToo && !Files.isDirectory(path) && hardLinks(path) > 1) {
 				continue;
 			}
 			syncFile(path);
@@ -1491,8 +1676,15 @@ final class NodeStore implements Closeable {
 		}
 	}
 
+	/** Tests only: called with the absolute, normalized path of every file and directory {@link #syncFile} fsyncs. */
+	static volatile java.util.function.@Nullable Consumer<Path> syncedForTesting;
+
 	/** Fsyncs a file, or a directory's entries (Linux allows opening a directory for reading). */
 	static void syncFile(Path file) throws IOException {
+		var hook = syncedForTesting;
+		if (hook != null) {
+			hook.accept(file.toAbsolutePath().normalize());
+		}
 		try (var channel = FileChannel.open(file, StandardOpenOption.READ)) {
 			channel.force(true);
 		}

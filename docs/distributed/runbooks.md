@@ -68,7 +68,10 @@ the check of step 3 finds.
 
 1. Stop the single node (a clean stop: its database must be closed).
 2. Copy its database directory to every node, as `<data-dir>/db` (for example `rsync -a --delete old-db/
-   n1:/srv/rockserver/data/db/`). The data directories must hold nothing else: no `raft/`.
+   n1:/srv/rockserver/data/db/`). The data directories must hold nothing else: no `raft/`. Then run `sync` on every
+   node (or `sync -f <data-dir>/db`): `rsync`, `cp` and `scp` do not fsync, and a power loss before writeback can
+   leave copied table files empty or with holes. The first start fsyncs `db/` too, before it records the digest
+   (R34-1), but not volumes or a WAL directory configured outside `db/`, and not before the start.
 3. Check that the copies are equal, for example `find db -type f -exec sha256sum {} + | sort -k2 | sha256sum` on
    each node, the same result everywhere. Do not skip it: the digest of the first start compares table files by size
    only.
@@ -137,7 +140,11 @@ Failure branches:
   installing a snapshot with `db/` closed, before it touches anything of the node. A node that crashed while installing a snapshot can have
   no `db/` at all, its complete new database in `db.restore-ready` (a crash in the middle of swapping it in):
   `export-seed` finishes the swap, as a start of the node would, and exports that database; it prints `No database in
-  .../db` only when neither `db/` nor `db.restore-ready` holds one. It can also have `db/` behind that snapshot: `export-seed` verifies the snapshot and restores it into `db/` first, as a start of the
+  .../db` only when neither `db/` nor `db.restore-ready` holds one. `--target` must be a new path outside the node's
+  `db/`, its `db.restore-*` directories and `raft/`: `export-seed` refuses one inside them (also through a symbolic
+  link, a dangling one too, and `DATA-DIR/db` itself when it is missing) with `a directory of the node being exported`,
+  before it touches anything (R34-2). It builds the copy in `NEW.tmp` and refuses a `NEW.tmp` that already exists
+  (`The target's temporary directory ... already exists`) rather than delete it: remove it, or choose another target. It can also have `db/` behind that snapshot: `export-seed` verifies the snapshot and restores it into `db/` first, as a start of the
   node would, and its output then says `its database was behind its snapshot at index N, restored first`. If the
   crash damaged that snapshot, `export-seed` exits 1 with `Not exported: The replica's latest snapshot ... (at index N)
   is damaged`, the database's index, and writes nothing: that replica may have applied entries up to N that its `db/`
@@ -273,6 +280,10 @@ over (clients open new ones by themselves).
    and the restored `db/` (opened once by the restore) digests to another value, so a node that gets `db/` alone
    records that other value at its first start and the nodes stop at genesis with exit 3. Either copy both to every
    node, or delete `db.seed-digest` on every node, the one that ran the restore included, before the first start.
+   Run `sync` after copying the backup (and after copying a restored `db/`): the copy tools do not fsync. On the
+   same file system `restore-backup` hard-links the backup copy's table files and fsyncs each one (R34-1), so a power
+   loss right after it cannot damage both `db/` and the copy, but a sync right after the copy keeps that from
+   depending on the command.
 3. Start every node as for a new cluster, without `--join`; the nodes of the old cluster stay stopped. The first leader proposes
    a seeded genesis, as in "Seeding a cluster".
 4. Check: `status`, then `checksum` prints `OK`, then a few known keys read back.

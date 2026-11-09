@@ -750,6 +750,269 @@ class NodeStoreTest {
 	}
 
 	/**
+	 * R34-2: {@code export-seed} refuses, before anything is touched, a target that is the node's own {@code db/} (missing
+	 * in the R33-1 layout: a crash between the restore's renames), inside it, one of its restore directories, inside the
+	 * node's Raft directory, or any of these reached through a symbolic link. Before, every pre-check passed for
+	 * {@code --target DATA-DIR/db}: the open swapped {@code db.restore-ready} into {@code db/} and deleted
+	 * {@code db.restore-old}, the checkpoint failed as its target existed, and the failure cleanup deleted {@code db/},
+	 * the node's only complete database; the other targets were written into the node's own directories.
+	 */
+	@Test
+	void exportSeedRefusesATargetAmongTheNodesOwnDirectoriesAndTouchesNothing() throws IOException {
+		var targets = new java.util.LinkedHashMap<String, java.util.function.Function<Path, Path>>();
+		targets.put("db", dataDir -> dataDir.resolve("db"));
+		targets.put("inside db", dataDir -> dataDir.resolve("db").resolve("seed"));
+		targets.put("db.restore-tmp", dataDir -> dataDir.resolve("db.restore-tmp"));
+		targets.put("inside db.restore-old", dataDir -> dataDir.resolve("db.restore-old").resolve("seed"));
+		targets.put("inside raft", dataDir -> dataDir.resolve("raft").resolve("seed"));
+		targets.put("db through a link", dataDir -> dataDir.resolveSibling(dataDir.getFileName() + "-alias")
+				.resolve("db"));
+		// R34 review 1: a link to the missing db/ is dangling, and must be followed all the same.
+		targets.put("inside db through a dangling link", dataDir -> dataDir.resolveSibling(dataDir.getFileName()
+				+ "-dangling").resolve("seed"));
+		int n = 0;
+		for (var entry : targets.entrySet()) {
+			Path dataDir = Files.createDirectories(tempDir.resolve("node" + n++));
+			writeRestoreInterruptedDuringTheSwap(dataDir, true);
+			Path stateMachineDir = Files.createDirectories(dataDir.resolve("raft").resolve(NodeConfig.DEFAULT_GROUP_ID))
+					.resolve("sm");
+			Files.createSymbolicLink(dataDir.resolveSibling(dataDir.getFileName() + "-alias"), dataDir);
+			Files.createSymbolicLink(dataDir.resolveSibling(dataDir.getFileName() + "-dangling"), dataDir.resolve("db"));
+			Path target = entry.getValue().apply(dataDir);
+
+			var refused = assertThrows(IOException.class,
+					() -> NodeStore.exportSeed(dataDir.resolve("db"), stateMachineDir, null, target, false),
+					entry.getKey());
+
+			assertTrue(refused.getMessage().contains("a directory of the node being exported"),
+					entry.getKey() + ": " + refused.getMessage());
+			assertFalse(Files.exists(dataDir.resolve("db")), entry.getKey());
+			assertFalse(Files.exists(dataDir.resolve("db.restore-tmp")), entry.getKey());
+			assertFalse(Files.exists(dataDir.resolve("raft").resolve("seed")), entry.getKey());
+			assertTrue(Files.isRegularFile(dataDir.resolve("db.restore-old").resolve("CURRENT")), entry.getKey());
+			assertFalse(Files.exists(dataDir.resolve("db.restore-old").resolve("seed")), entry.getKey());
+			try (var ready = NodeStore.open(dataDir.resolve("db.restore-ready"), null, "ready")) {
+				assertEquals(TermIndex.valueOf(4, 40), ready.applied(), entry.getKey());
+				assertEquals(Map.of(7, "new"), contents(ready, ready.db().getColumnId(DATA_COLUMN)), entry.getKey());
+			}
+		}
+	}
+
+	/**
+	 * R34 review 2: the data directory {@code /x/link/..}, with {@code link} pointing to {@code /real/a/b}, is resolved
+	 * by the OS to {@code /real/a} but by {@link NodeStore#open} (which normalizes) to {@code /x}. The export uses one
+	 * form, the normalized one the open uses, for every step: here {@code /x/db} holds no database, so it refuses with
+	 * "No database in" and touches nothing. Before, the "No database in" check found {@code /real/a/db.restore-ready}
+	 * through the OS, the refusal compared the target with {@code /x}'s directories, and the open created an empty
+	 * database in {@code /x/db} and exported it into {@code /real/a/db/seed}, inside the node's (missing) {@code db/}.
+	 */
+	@Test
+	void exportSeedUsesTheDirectoriesTheOpenUsesWhenTheDataDirHasDotDotAfterALink() throws IOException {
+		Path realDataDir = Files.createDirectories(tempDir.resolve("real").resolve("a"));
+		writeRestoreInterruptedDuringTheSwap(realDataDir, true);
+		Files.createDirectories(realDataDir.resolve("b"));
+		Files.createDirectories(realDataDir.resolve("raft").resolve(NodeConfig.DEFAULT_GROUP_ID));
+		Path x = Files.createDirectories(tempDir.resolve("x"));
+		Files.createSymbolicLink(x.resolve("link"), realDataDir.resolve("b"));
+		Path dataDir = x.resolve("link").resolve("..");
+		Path target = realDataDir.resolve("db").resolve("seed");
+
+		var refused = assertThrows(IOException.class, () -> NodeStore.exportSeed(dataDir.resolve("db"),
+				dataDir.resolve("raft").resolve(NodeConfig.DEFAULT_GROUP_ID).resolve("sm"), null, target, false));
+
+		assertTrue(refused.getMessage().startsWith("No database in " + x.resolve("db")), refused.getMessage());
+		assertFalse(Files.exists(x.resolve("db")));
+		assertFalse(Files.exists(realDataDir.resolve("db")));
+		assertTrue(Files.isRegularFile(realDataDir.resolve("db.restore-old").resolve("CURRENT")));
+		try (var ready = NodeStore.open(realDataDir.resolve("db.restore-ready"), null, "ready")) {
+			assertEquals(TermIndex.valueOf(4, 40), ready.applied());
+		}
+	}
+
+	/**
+	 * R34 review 3: an existing {@code <target>.tmp}, which the checkpoint would build in, is refused before anything is
+	 * touched, as an existing target is, and stays as it was. Before, the checkpoint deleted it first, whoever had made
+	 * it (an operator's {@code /backups/seed.tmp} for {@code --target /backups/seed}).
+	 */
+	@Test
+	void exportSeedRefusesAnExistingTemporaryDirectoryAndLeavesIt() throws IOException {
+		Path source = tempDir.resolve("source");
+		writeDatabase(source, "v", TermIndex.valueOf(1, 5));
+		Path target = tempDir.resolve("seed");
+		Path foreign = Files.createDirectories(tempDir.resolve("seed.tmp"));
+		Files.writeString(foreign.resolve("operator"), "not the export's");
+
+		var refused = assertThrows(IOException.class, () -> NodeStore.exportSeed(source, null, target));
+
+		assertTrue(refused.getMessage().contains("already exists"), refused.getMessage());
+		assertEquals("not the export's", Files.readString(foreign.resolve("operator")));
+		assertFalse(Files.exists(target));
+	}
+
+	/**
+	 * R34 review 3: the checkpoint of an export creates its {@code <target>.tmp} itself, atomically, and never deletes
+	 * one it did not create: one that appears between the export's checks and the checkpoint fails the export and
+	 * stays. The snapshot and backup callers still replace a leftover (they build inside a directory of their own).
+	 */
+	@Test
+	void anExportCheckpointNeverDeletesATemporaryDirectoryItDidNotCreate() throws IOException {
+		Path source = tempDir.resolve("source");
+		writeDatabase(source, "v", TermIndex.valueOf(1, 5));
+		Path target = tempDir.resolve("seed");
+		Path foreign = tempDir.resolve("seed.tmp");
+		try (var store = NodeStore.open(source, null, "source")) {
+			Files.createDirectories(foreign);
+			Files.writeString(foreign.resolve("operator"), "not the export's");
+			assertThrows(java.nio.file.FileAlreadyExistsException.class, () -> store.checkpoint(target, false));
+			assertEquals("not the export's", Files.readString(foreign.resolve("operator")));
+			assertFalse(Files.exists(target));
+
+			store.checkpoint(target, true);
+			assertFalse(Files.exists(foreign));
+			assertTrue(Files.isRegularFile(target.resolve("CURRENT")));
+		}
+	}
+
+	/**
+	 * R34-2: a failed export deletes only what it created. Here another process creates the target while the export
+	 * runs (a test hook, once the checkpoint's live files are in place): the export fails, and the target it did not
+	 * create stays as that process left it. Before, the cleanup deleted the target whatever had made it.
+	 */
+	@Test
+	void aFailedExportDeletesOnlyWhatItCreated() throws IOException {
+		Path source = tempDir.resolve("source");
+		writeDatabase(source, "v", TermIndex.valueOf(1, 5));
+		Path target = tempDir.resolve("seed");
+		NodeStore.checkpointBuiltForTesting = building -> {
+			Files.createDirectories(target);
+			Files.writeString(target.resolve("foreign"), "not the export's");
+		};
+		try {
+			assertThrows(IOException.class, () -> NodeStore.exportSeed(source, null, target));
+		} finally {
+			NodeStore.checkpointBuiltForTesting = null;
+		}
+		assertEquals("not the export's", Files.readString(target.resolve("foreign")));
+		assertFalse(Files.exists(tempDir.resolve("seed.tmp")));
+		try (var store = NodeStore.open(source, null, "source")) {
+			assertEquals(TermIndex.valueOf(1, 5), store.applied());
+		}
+	}
+
+	/**
+	 * R34-1: {@code restore-backup} fsyncs every table and blob file it hard-links from the backup copy, whose files an
+	 * operator copied with {@code cp}, {@code rsync} or {@code scp} and nobody fsynced. Before, {@code syncTree} skipped
+	 * every file with a second link, on the assumption that its source was durable, and a power loss soon after the
+	 * restore could damage both {@code db/} and the backup copy (the same inodes).
+	 */
+	@Test
+	void restoreBackupFsyncsTheTableFilesItLinksFromTheBackupCopy() throws IOException {
+		Path backupDir = tempDir.resolve("backup");
+		checkpointWithData(backupDir.resolve(ReplicaOps.BACKUP_DB_DIR), 200, TermIndex.valueOf(1, 200));
+		Files.writeString(backupDir.resolve(ReplicaOps.BACKUP_PROPERTIES), "name=b\nindex=200\ncluster=c\n");
+		Path copy = tempDir.resolve("copy");
+		copyTree(backupDir, copy);
+		Set<String> tables = tableFileNames(copy.resolve(ReplicaOps.BACKUP_DB_DIR));
+		assertFalse(tables.isEmpty());
+		Path dataDir = tempDir.resolve("data");
+		Set<String> synced = syncedNamesUnder(dataDir, () -> ReplicaOps.restore(copy, dataDir, null));
+		Assumptions.assumeTrue(maxLinkCount(dataDir.resolve("db"), tables) > 1, "the restore copied instead of linking");
+		assertTrue(synced.containsAll(tables), "synced " + synced + ", table files " + tables);
+	}
+
+	/**
+	 * R34-1 guard: the restore of a Raft snapshot (installation, a start behind its snapshot) still skips the linked
+	 * files, whose sources were fsynced when the snapshot was made: fsyncing thousands of them would stall the apply.
+	 */
+	@Test
+	void aSnapshotRestoreDoesNotFsyncTheTableFilesItLinks() throws IOException {
+		Path checkpointDir = tempDir.resolve("checkpoint");
+		checkpointWithData(checkpointDir, 200, TermIndex.valueOf(1, 200));
+		Set<String> tables = tableFileNames(checkpointDir);
+		assertFalse(tables.isEmpty());
+		Path dbDir = tempDir.resolve("db");
+		Set<String> synced = syncedNamesUnder(tempDir, () -> NodeStore.restore(checkpointDir, dbDir));
+		Assumptions.assumeTrue(maxLinkCount(dbDir, tables) > 1, "the restore copied instead of linking");
+		assertTrue(synced.stream().noneMatch(tables::contains), "synced " + synced);
+		assertTrue(synced.contains("CURRENT"), "synced " + synced);
+	}
+
+	/**
+	 * R34-1: the first start of a seeded node (no Raft group directory yet) fsyncs the seed's files, its directories and
+	 * the data directory before it records the seed digest: the operator rsynced {@code db/} into place, nobody fsynced
+	 * it, and the seed snapshot taken after genesis hard-links the same inodes. Here the seed's table files already have
+	 * a second link (as after {@code cp -al}), which {@code syncTree} would skip. Before, nothing fsynced them.
+	 */
+	@Test
+	void theFirstStartOfASeedFsyncsItsFiles() throws IOException {
+		Path dataDir = Files.createDirectories(tempDir.resolve("node"));
+		Path db = dataDir.resolve("db");
+		checkpointWithData(db, 200, TermIndex.valueOf(1, 200));
+		Set<String> tables = tableFileNames(db);
+		assertFalse(tables.isEmpty());
+		Path links = Files.createDirectories(tempDir.resolve("links"));
+		try (Stream<Path> walk = Files.walk(db)) {
+			for (Path file : walk.filter(Files::isRegularFile).toList()) {
+				if (tables.contains(file.getFileName().toString())) {
+					Files.createLink(links.resolve(file.getFileName()), file);
+				}
+			}
+		}
+		var synced = new java.util.concurrent.ConcurrentLinkedQueue<Path>();
+		NodeStore.syncedForTesting = synced::add;
+		try {
+			NodeStore.recordSeedDigest(db);
+		} finally {
+			NodeStore.syncedForTesting = null;
+		}
+		Set<String> names = synced.stream().filter(path -> path.startsWith(db))
+				.map(path -> path.getFileName().toString()).collect(Collectors.toSet());
+		assertTrue(names.containsAll(tables), "synced " + synced + ", table files " + tables);
+		assertTrue(names.contains("CURRENT"), "synced " + synced);
+		assertTrue(synced.contains(db.toAbsolutePath().normalize()), "synced " + synced);
+		assertTrue(synced.contains(dataDir.toAbsolutePath().normalize()), "synced " + synced);
+	}
+
+	@FunctionalInterface
+	interface IoAction {
+		void run() throws IOException;
+	}
+
+	/** The names of the files and directories under {@code root} that {@code action} fsynced. */
+	private static Set<String> syncedNamesUnder(Path root, IoAction action) throws IOException {
+		Path absolute = root.toAbsolutePath().normalize();
+		var synced = new java.util.concurrent.ConcurrentLinkedQueue<Path>();
+		NodeStore.syncedForTesting = synced::add;
+		try {
+			action.run();
+		} finally {
+			NodeStore.syncedForTesting = null;
+		}
+		return synced.stream().filter(path -> path.startsWith(absolute)).map(path -> path.getFileName().toString())
+				.collect(Collectors.toSet());
+	}
+
+	private static Set<String> tableFileNames(Path dir) throws IOException {
+		try (Stream<Path> walk = Files.walk(dir)) {
+			return walk.filter(Files::isRegularFile).map(path -> path.getFileName().toString())
+					.filter(name -> name.endsWith(".sst") || name.endsWith(".blob")).collect(Collectors.toSet());
+		}
+	}
+
+	/** The highest link count among the files under {@code dir} named in {@code names} (0 if none is there). */
+	private static int maxLinkCount(Path dir, Set<String> names) throws IOException {
+		int max = 0;
+		try (Stream<Path> walk = Files.walk(dir)) {
+			for (Path file : walk.filter(Files::isRegularFile).toList()) {
+				if (names.contains(file.getFileName().toString())) {
+					max = Math.max(max, (Integer) Files.getAttribute(file, "unix:nlink"));
+				}
+			}
+		}
+		return max;
+	}
+
+	/**
 	 * The layout a crash during {@link NodeStore#restore}'s swap leaves in {@code dataDir}: {@code db.restore-ready}
 	 * holds the new database (key 7 = "new", applied 4:40), the old one (key 7 = "old", applied 1:5) is
 	 * {@code db.restore-old} when {@code betweenTheRenames}, else still {@code db/}.

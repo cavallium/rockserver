@@ -1113,6 +1113,34 @@ class CommandLineTest {
 	}
 
 	/**
+	 * R34-2: {@code export-seed --target DATA-DIR/db} of a node whose restore a crash interrupted between its renames (no
+	 * {@code db/}, {@code db.restore-ready} at 4:40, {@code db.restore-old}) is refused with 1 before anything is touched,
+	 * and the same node then exports into a proper target. Before, every pre-check passed, the open swapped the ready
+	 * database into {@code db/} and deleted {@code db.restore-old}, the checkpoint failed as its target existed, and the
+	 * failure cleanup deleted {@code db/}: the node was left with no database at all.
+	 */
+	@Test
+	void exportSeedRefusesTheNodesOwnMissingDbAsTarget() throws IOException {
+		Path dataDir = temp.resolve("node");
+		NodeStoreTest.writeRestoreInterruptedDuringTheSwap(dataDir, true);
+		Files.createDirectories(dataDir.resolve("raft").resolve(NodeConfig.DEFAULT_GROUP_ID));
+		var refused = run("export-seed", "--data-dir", dataDir.toString(), "--target",
+				dataDir.resolve("db").toString());
+		assertEquals(1, refused.code(), refused.toString());
+		assertInstanceOf(IOException.class, refused.thrown());
+		assertTrue(refused.thrown().getMessage().contains("a directory of the node being exported"),
+				refused.thrown().getMessage());
+		assertTrue(Files.notExists(dataDir.resolve("db")));
+		assertTrue(Files.isRegularFile(dataDir.resolve("db.restore-ready").resolve("CURRENT")));
+		assertTrue(Files.isRegularFile(dataDir.resolve("db.restore-old").resolve("CURRENT")));
+
+		Path seed = temp.resolve("seed");
+		var exported = run("export-seed", "--data-dir", dataDir.toString(), "--target", seed.toString());
+		assertEquals(0, exported.code(), exported.toString());
+		assertTrue(exported.out().contains("applied up to index 40 of term 4"), exported.out());
+	}
+
+	/**
 	 * A stopped node in {@code dataDir}: {@code db/} at 1:5, and in raft/{@code group} a snapshot at 4:40 as the node
 	 * takes one (a checkpoint and its position, fsynced before the rename: no digest to verify).
 	 */
