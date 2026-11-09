@@ -15,6 +15,7 @@ import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
+import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
@@ -86,6 +87,12 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 	static final String CHECKSUM_EVERY_HOURS_PROPERTY = DistributedProperties.PREFIX + "checksum-every-hours";
 	static final String BACKUPS_DIR = "backups";
 	static final String BACKUP_DB_DIR = "db";
+	/**
+	 * Where {@link #restore} builds the database, next to {@code db/}, before it renames it to {@code db/} (R36-1). Not
+	 * one of {@code db/}'s own restore directories ({@code db.restore-tmp}, {@code -ready}, {@code -old}), which the
+	 * node's start would finish into {@code db/} while the old cluster's results may still be in place.
+	 */
+	static final String RESTORE_STAGING_DIR = "db.restore-backup";
 	static final String BACKUP_PROPERTIES = "backup.properties";
 	private static final String RESULTS_FILE = "replica-ops.log";
 	/** When the periodic schedule of this node started, while it knows of no check: see {@link #scheduleStartMillis}. */
@@ -583,45 +590,67 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 	 * document. Client sessions and the results kept for them are gone with the metadata: clients open new sessions.
 	 * The results file and the backups of the old cluster in {@code dataDir}, if any, are renamed with the suffix
 	 * {@code .before-restore-<time>}: their results, by log index and by name, would otherwise answer for the new cluster,
-	 * whose log starts again from 1. The renames come first and are fsynced before the database is restored, so that no
-	 * crash or power loss leaves them next to the restored {@code db/} (R35-2). {@code dataDir} is used absolute and
-	 * normalized, the form {@link NodeStore#open} and the node's start use ({@code /x/link/..} is {@code /x}; R35-1).
+	 * whose log starts again from 1. {@code dataDir} is used absolute and normalized, the form {@link NodeStore#open} and
+	 * the node's start use ({@code /x/link/..} is {@code /x}; R35-1).
+	 *
+	 * <p>Order (R35-2, R36-1): the backup is read, and the database built, checked and opened aside in
+	 * {@link #RESTORE_STAGING_DIR}, first; only then are the old results renamed, and the data directory fsynced, before
+	 * the built database is renamed to {@code db/} and the data directory fsynced again. So whenever {@code db/} is
+	 * there, even after a power loss or a kill, the old results are not; a backup inside {@code DATA-DIR/backups}
+	 * (the node's own, directly or through a link) is read completely before it is renamed with them; and a refusal
+	 * (a newer cluster's backup, a config that does not parse) renames nothing (R36-3). A run that stops anywhere can
+	 * run again: it deletes what an earlier one left in {@link #RESTORE_STAGING_DIR}, and finds nothing more to rename
+	 * if the renames were done; a {@code --backup DATA-DIR/backups/<name>} renamed by that earlier run is then refused
+	 * with the path it was moved to.</p>
 	 *
 	 * @throws ReplicatedNode.NewerVersionException if the backup's cluster version has capabilities this version lacks
-	 *                                              (a newer cluster's backup). On this or any other failure,
-	 *                                              {@code dataDir} is left without a database, so the command can run
-	 *                                              again
+	 *                                              (a newer cluster's backup), before anything is renamed. On this or
+	 *                                              any other failure, {@code dataDir} is left without a database, so the
+	 *                                              command can run again
 	 */
 	static TermIndex restore(Path backupDir, Path dataDir, @Nullable Path rockserverConfig) throws IOException {
 		// One form of the data directory for every step below, the normalized one, which NodeStore.open uses: the OS
 		// would resolve /x/link/.. elsewhere, and the backup would be restored into a directory that is not the one
 		// opened here and by the node's start (R35-1).
 		dataDir = dataDir.toAbsolutePath().normalize();
-		var properties = readBackupProperties(backupDir);
+		Properties properties;
+		try {
+			properties = readBackupProperties(backupDir);
+		} catch (NoSuchFileException missing) {
+			throw movedByAnEarlierRun(backupDir, dataDir, missing);
+		}
 		Path db = dataDir.resolve("db");
 		Path raft = dataDir.resolve("raft");
 		if (Files.exists(db) || (Files.isDirectory(raft) && !isEmpty(raft))) {
 			throw new IOException(dataDir + " holds a database or a Raft log: restore into an empty data directory");
 		}
 		Files.createDirectories(dataDir);
-		// Before the database exists, and durably (R35-2): whenever db/ is there, even after a power loss or a kill, the
-		// old cluster's results are not, and a run that stops before db/ is complete can run again, finding nothing more
-		// to move. Before, the moves came last and were never fsynced.
-		moveOldResultsAside(dataDir);
+		Path staging = dataDir.resolve(RESTORE_STAGING_DIR);
 		TermIndex applied;
 		try {
+			// What an earlier run that stopped left aside (R36-1): never opened as the node's database, as its name is
+			// none of db/'s restore directories.
+			NodeStore.deleteWithRestoreDirectories(staging);
 			// The seed digest of the backup's own files, before anything opens them: each restore opens its database and
 			// leaves files of its own (OPTIONS, with this node's paths), so a digest of the restored db/ would differ on
 			// every node restored from a copy of the same backup, and the followers would stop at genesis (R26-1).
 			String seedDigest = NodeStore.databaseFilesDigest(backupDir.resolve(BACKUP_DB_DIR));
-			applied = restoreDatabase(backupDir, db, rockserverConfig);
+			// Everything is read from the backup, and the version checked, before anything of the data directory is
+			// renamed (R36-1, R36-3): the backup may lie in DATA-DIR/backups, which the renames move.
+			applied = restoreDatabase(backupDir, staging, db, rockserverConfig);
+			// Before db/ exists, and durably (R35-2): whenever db/ is there, even after a power loss or a kill, the old
+			// cluster's results are not.
+			moveOldResultsAside(dataDir);
+			Files.move(staging, db);
+			NodeStore.syncDirectory(dataDir);
 			NodeStore.recordRestoredSeedDigest(db, seedDigest);
 		} catch (Throwable failure) {
 			// Leaves the data directory without a database, so that the same command can run again (with the newer
 			// binary after a version refusal, R18-1; after any other failure too, R19-3: the half-made db/ used to stay,
-			// and the rerun refused the directory as holding a database). The old results moved aside stay moved: the
-			// new cluster needs neither them nor the old backups.
+			// and the rerun refused the directory as holding a database). The old results, if they were moved aside,
+			// stay moved: the new cluster needs neither them nor the old backups.
 			try {
+				NodeStore.deleteWithRestoreDirectories(staging);
 				NodeStore.deleteRecursively(db);
 				NodeStore.deleteSeedDigest(db);
 			} catch (IOException | RuntimeException cleanup) {
@@ -632,6 +661,39 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 		LOG.info("Restored backup {} (log index {} of cluster {}) into {}, holding the entries up to {}",
 				properties.getProperty("name"), properties.getProperty("index"), properties.getProperty("cluster"), db, applied);
 		return applied;
+	}
+
+	/**
+	 * The failure for a {@code backupDir} without {@link #BACKUP_PROPERTIES}: when it names {@code DATA-DIR/backups/<x>}
+	 * and an earlier restore-backup that stopped after its renames moved it to
+	 * {@code DATA-DIR/backups.before-restore-<time>/<x>}, a message that gives that path (R36-1); otherwise
+	 * {@code missing}.
+	 */
+	private static IOException movedByAnEarlierRun(Path backupDir, Path dataDir, NoSuchFileException missing)
+			throws IOException {
+		Path given = backupDir.toAbsolutePath().normalize();
+		Path backups = dataDir.resolve(BACKUPS_DIR);
+		if (!given.startsWith(backups) || given.equals(backups) || !Files.isDirectory(dataDir)) {
+			return missing;
+		}
+		Path relative = backups.relativize(given);
+		List<Path> candidates;
+		try (var entries = Files.list(dataDir)) {
+			candidates = entries
+					.filter(entry -> entry.getFileName().toString().startsWith(BACKUPS_DIR + ".before-restore-"))
+					.map(entry -> entry.resolve(relative.toString()))
+					.filter(candidate -> Files.isRegularFile(candidate.resolve(BACKUP_PROPERTIES)))
+					.sorted(java.util.Comparator.comparing(Path::toString).reversed())
+					.toList();
+		}
+		if (candidates.isEmpty()) {
+			return missing;
+		}
+		var moved = new NoSuchFileException(missing.getFile(), null, "an earlier restore-backup into " + dataDir
+				+ " that stopped renamed " + backups + " with the old cluster's results; the backup is now in "
+				+ candidates.getFirst() + ": run again with --backup " + candidates.getFirst());
+		moved.initCause(missing);
+		return moved;
 	}
 
 	/**
@@ -656,16 +718,18 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 	}
 
 	/**
-	 * Copies the backup's database to {@code db} and drops its replication metadata; returns its applied entry. The
+	 * Copies the backup's database to {@code staging}, opened as the future {@code db} (an absolute volume path under
+	 * {@code db} is opened under {@code staging}), and drops its replication metadata; returns its applied entry. The
 	 * files linked from the backup are fsynced: an operator copied it with {@code cp}, {@code rsync} or {@code scp},
-	 * which do not fsync, and its files and the restored ones are the same inodes (R34-1).
+	 * which do not fsync, and its files and the restored ones are the same inodes (R34-1). What the open wrote is fsynced
+	 * too, before the caller renames {@code staging} to {@code db}.
 	 */
-	private static TermIndex restoreDatabase(Path backupDir, Path db, @Nullable Path rockserverConfig)
+	private static TermIndex restoreDatabase(Path backupDir, Path staging, Path db, @Nullable Path rockserverConfig)
 			throws IOException {
-		NodeStore.restore(backupDir.resolve(BACKUP_DB_DIR), db, false);
+		NodeStore.restore(backupDir.resolve(BACKUP_DB_DIR), staging, false);
 		TermIndex applied;
 		long version;
-		try (var store = NodeStore.open(db, rockserverConfig, "restore")) {
+		try (var store = NodeStore.open(staging, rockserverConfig, db, "restore")) {
 			applied = store.applied();
 			// Read before the metadata, which holds it, is dropped: the new cluster starts at GENESIS and no start would
 			// refuse data that a newer version wrote (R18-1).
@@ -678,6 +742,7 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 		if (unknown != 0) {
 			throw ReplicatedNode.NewerVersionException.of(version, unknown);
 		}
+		NodeStore.syncTree(staging);
 		return applied;
 	}
 
