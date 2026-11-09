@@ -8,7 +8,13 @@ import it.cavallium.rockserver.core.client.ClientBuilder;
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.*;
 
+import com.google.protobuf.Empty;
+import it.cavallium.buffer.Buf;
+import it.cavallium.rockserver.core.common.Keys;
 import it.cavallium.rockserver.core.common.RequestContext;
+import it.cavallium.rockserver.core.common.RequestType;
+import it.cavallium.rockserver.core.common.RocksDBException;
+import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand;
 import it.cavallium.rockserver.core.common.RocksDBAsyncAPI;
 import it.cavallium.rockserver.core.common.RockserverCapabilities;
@@ -18,12 +24,16 @@ import it.cavallium.rockserver.core.common.api.proto.CapabilitiesRequest;
 import it.cavallium.rockserver.core.common.api.proto.CapabilitiesResponse;
 import it.cavallium.rockserver.core.common.api.proto.GetColumnIdRequest;
 import it.cavallium.rockserver.core.common.api.proto.GetColumnIdResponse;
+import it.cavallium.rockserver.core.common.api.proto.OpenClientSessionRequest;
+import it.cavallium.rockserver.core.common.api.proto.OpenClientSessionResponse;
+import it.cavallium.rockserver.core.common.api.proto.PutRequest;
 import it.cavallium.rockserver.core.common.api.proto.ReactorRocksDBServiceGrpc;
 import java.io.IOException;
 import java.net.URI;
 import java.net.UnixDomainSocketAddress;
 import java.time.Duration;
 import java.util.concurrent.Callable;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
@@ -399,5 +409,247 @@ class DeferredRockserverConnectionTest {
 		deferred.close();
 		assertThrows(Exception.class, () -> pending.get(5, TimeUnit.SECONDS));
 		assertTrue(interrupted.await(5, TimeUnit.SECONDS));
+	}
+
+	/**
+	 * R47-2: through the deferred client Yotsuba builds by default, a numbered write cancelled after a copy was sent
+	 * ends OUTCOME_UNKNOWN and its cancel returns false, as without the wrapper (SessionWrites' CallResult): the copy
+	 * may have been applied. The wrapper's future ({@code Mono.toFuture()}) answered true and ended cancelled, which
+	 * reads "not applied", so a caller that sends it again can apply a merge twice.
+	 */
+	@Test
+	void numberedWriteCancelledAfterACopyWasSentEndsUnknownThroughTheBuilder() throws Exception {
+		var sent = new CountDownLatch(1);
+		var serverCancelled = new CountDownLatch(1);
+		var sessions = new AtomicInteger();
+		var service = new ReactorRocksDBServiceGrpc.RocksDBServiceImplBase() {
+			@Override
+			public Mono<CapabilitiesResponse> getCapabilities(CapabilitiesRequest request) {
+				return Mono.just(CapabilitiesResponse.newBuilder().setWorkloadContractVersion(3)
+						.setClientSessions(true).build());
+			}
+
+			@Override
+			public Mono<OpenClientSessionResponse> openClientSession(OpenClientSessionRequest request) {
+				sessions.incrementAndGet();
+				return Mono.just(OpenClientSessionResponse.newBuilder().setSessionId(5).build());
+			}
+
+			@Override
+			public Mono<Empty> put(PutRequest request) {
+				assertTrue(request.getContext().hasRequestId(), "the write is numbered");
+				sent.countDown();
+				return Mono.<Empty>never().doOnCancel(serverCancelled::countDown);
+			}
+		};
+		var server = ServerBuilder.forPort(0).addService(service).build().start();
+		try {
+			var builder = new ClientBuilder();
+			builder.setDeferred(true);
+			builder.setHttpAddress(new Utils.HostAndPort("127.0.0.1", server.getPort()));
+			try (var client = builder.build()) {
+				var write = client.getAsyncApi(RequestContext.latency(Duration.ofSeconds(30)))
+						.putAsync(0, 1, new Keys(Buf.wrap(new byte[] {1})), Buf.wrap(new byte[] {2}), RequestType.none());
+				assertTrue(sent.await(5, TimeUnit.SECONDS), "a copy was sent");
+				assertFalse(write.cancel(true), "not cancelled: a copy was sent, so it may have been applied");
+				assertFalse(write.isCancelled());
+				var error = assertThrows(ExecutionException.class, () -> write.get(5, TimeUnit.SECONDS));
+				assertEquals(RocksDBErrorType.OUTCOME_UNKNOWN, rocks(error).getErrorUniqueId());
+				assertTrue(serverCancelled.await(5, TimeUnit.SECONDS), "the copy in flight is cancelled");
+				assertEquals(1, sessions.get());
+			}
+		} finally {
+			server.shutdownNow();
+			assertTrue(server.awaitTermination(5, TimeUnit.SECONDS));
+		}
+	}
+
+	/** R47-2: through the builder, a cancel after the answer returns false and the answer comes through. */
+	@Test
+	void cancelAfterTheAnswerReturnsFalseThroughTheBuilder() throws Exception {
+		var service = new ReactorRocksDBServiceGrpc.RocksDBServiceImplBase() {
+			@Override
+			public Mono<CapabilitiesResponse> getCapabilities(CapabilitiesRequest request) {
+				return Mono.just(CapabilitiesResponse.newBuilder().setWorkloadContractVersion(3).build());
+			}
+
+			@Override
+			public Mono<GetColumnIdResponse> getColumnId(GetColumnIdRequest request) {
+				return Mono.just(GetColumnIdResponse.newBuilder().setColumnId(11).build());
+			}
+		};
+		var server = ServerBuilder.forPort(0).addService(service).build().start();
+		try {
+			var builder = new ClientBuilder();
+			builder.setDeferred(true);
+			builder.setHttpAddress(new Utils.HostAndPort("127.0.0.1", server.getPort()));
+			try (var client = builder.build()) {
+				var answer = client.getAsyncApi(RequestContext.latency(Duration.ofSeconds(5))).getColumnIdAsync("c");
+				assertEquals(11L, answer.get(5, TimeUnit.SECONDS));
+				assertFalse(answer.cancel(true));
+				assertFalse(answer.isCancelled());
+				assertEquals(11L, answer.get());
+			}
+		} finally {
+			server.shutdownNow();
+			assertTrue(server.awaitTermination(5, TimeUnit.SECONDS));
+		}
+	}
+
+	/**
+	 * R47-2: the inner call has ended but its future has not completed yet (R46-4's CancelPropagatingFuture whose source
+	 * answered, a numbered write that ends unknown): its cancel returns false, and so does the wrapper's, whose
+	 * outcome is the inner one, never "cancelled".
+	 */
+	@Test
+	void cancelRefusedByTheCallReturnsFalseAndKeepsItsOutcome() throws Exception {
+		for (var outcome : new Object[] {"answer", RocksDBException.of(RocksDBErrorType.OUTCOME_UNKNOWN, "lost")}) {
+			var inner = new CompletableFuture<Object>() {
+				@Override
+				public boolean cancel(boolean mayInterruptIfRunning) {
+					return false;
+				}
+			};
+			var client = client();
+			var api = mock(RocksDBAsyncAPI.class);
+			when(api.requestAsync(any())).thenAnswer(invocation -> inner);
+			when(client.getAsyncApi(any())).thenReturn(api);
+			try (var deferred = deferred(URL, () -> client)) {
+				CompletableFuture<?> call = deferred.getAsyncApi(RequestContext.analytical()).getColumnIdAsync("c");
+				verify(api, timeout(5_000)).requestAsync(any());
+				assertFalse(call.cancel(true), "the call refused the cancel");
+				assertFalse(call.isCancelled());
+				if (outcome instanceof Throwable failure) {
+					inner.completeExceptionally(failure);
+					var error = assertThrows(ExecutionException.class, () -> call.get(5, TimeUnit.SECONDS));
+					assertEquals(RocksDBErrorType.OUTCOME_UNKNOWN, rocks(error).getErrorUniqueId());
+				} else {
+					inner.complete(outcome);
+					assertEquals(outcome, call.get(5, TimeUnit.SECONDS));
+				}
+			}
+		}
+	}
+
+	/**
+	 * R47-2: a cancel that reaches the inner call cancels it and the wrapper; one before the connection exists cancels
+	 * the wrapper and sends nothing. The same for a single call, a WAL flush and a session opening.
+	 */
+	@Test
+	void cancelReachesTheCallOrStopsItBeforeItIsSent() throws Exception {
+		for (int operation = 0; operation < 3; operation++) {
+			var inner = new CompletableFuture<Object>();
+			var client = client();
+			var api = mock(RocksDBAsyncAPI.class);
+			when(api.requestAsync(any())).thenAnswer(invocation -> inner);
+			doReturn(inner).when(api).flushWalAsync();
+			doReturn(inner).when(client).openClientSessionAsync(any());
+			when(client.getAsyncApi(any())).thenReturn(api);
+			try (var deferred = deferred(URL, () -> client)) {
+				var call = start(operation, deferred);
+				awaitStarted(operation, client, api);
+				assertTrue(call.cancel(true), "operation " + operation);
+				assertTrue(call.isCancelled());
+				assertTrue(inner.isCancelled(), "the cancel reached the call");
+				assertThrows(CancellationException.class, call::get);
+			}
+
+			var release = new CountDownLatch(1);
+			var late = client();
+			var lateApi = mock(RocksDBAsyncAPI.class);
+			when(late.getAsyncApi(any())).thenReturn(lateApi);
+			try (var deferred = deferred(URL, () -> {
+				assertTrue(release.await(5, TimeUnit.SECONDS));
+				return late;
+			})) {
+				var call = start(operation, deferred);
+				assertTrue(call.cancel(true));
+				assertTrue(call.isCancelled());
+				release.countDown();
+				Thread.sleep(200);
+				verify(lateApi, never()).requestAsync(any());
+				verify(lateApi, never()).flushWalAsync();
+				verify(late, never()).openClientSessionAsync(any());
+			} finally {
+				release.countDown();
+			}
+		}
+	}
+
+	/**
+	 * Review of R47, 1: a cancel made on the thread that is making the call, while it is being made (a dependent stage
+	 * of another future that the call completes synchronously), is not a cancel "before the call": the call is made,
+	 * the cancel is passed to it once it exists, and this future ends as the call does. A call that refuses the cancel
+	 * (a numbered write that sent a copy) keeps its outcome; one that accepts it ends cancelled.
+	 */
+	@Test
+	void cancelWhileTheCallIsBeingMadeOnTheSameThreadReachesTheCall() throws Exception {
+		for (boolean refuses : new boolean[] {true, false}) {
+			var inner = new CompletableFuture<Object>() {
+				@Override
+				public boolean cancel(boolean mayInterruptIfRunning) {
+					return !refuses && super.cancel(mayInterruptIfRunning);
+				}
+			};
+			var holder = new java.util.concurrent.atomic.AtomicReference<CompletableFuture<?>>();
+			var nestedCancel = new java.util.concurrent.atomic.AtomicReference<Boolean>();
+			var client = client();
+			var api = mock(RocksDBAsyncAPI.class);
+			when(api.requestAsync(any())).thenAnswer(invocation -> {
+				nestedCancel.set(holder.get().cancel(true));
+				return inner;
+			});
+			when(client.getAsyncApi(any())).thenReturn(api);
+			var release = new CountDownLatch(1);
+			try (var deferred = deferred(URL, () -> {
+				assertTrue(release.await(5, TimeUnit.SECONDS));
+				return client;
+			})) {
+				CompletableFuture<?> call = deferred.getAsyncApi(RequestContext.analytical()).getColumnIdAsync("c");
+				holder.set(call);
+				release.countDown();
+				verify(api, timeout(5_000)).requestAsync(any());
+				assertEquals(Boolean.FALSE, nestedCancel.get(), "the call was being made: the cancel cannot be granted yet");
+				if (refuses) {
+					assertFalse(inner.isCancelled());
+					assertFalse(call.isCancelled(), "the call refused the cancel");
+					inner.completeExceptionally(RocksDBException.of(RocksDBErrorType.OUTCOME_UNKNOWN, "lost"));
+					var error = assertThrows(ExecutionException.class, () -> call.get(5, TimeUnit.SECONDS));
+					assertEquals(RocksDBErrorType.OUTCOME_UNKNOWN, rocks(error).getErrorUniqueId());
+				} else {
+					assertTrue(inner.isCancelled(), "the cancel reached the call made after it");
+					assertThrows(CancellationException.class, () -> call.get(5, TimeUnit.SECONDS));
+				}
+			} finally {
+				release.countDown();
+			}
+		}
+	}
+
+	private static CompletableFuture<?> start(int operation, RocksDBConnection deferred) {
+		var api = deferred.getAsyncApi(RequestContext.analytical());
+		return switch (operation) {
+			case 0 -> api.getColumnIdAsync("c");
+			case 1 -> api.flushWalAsync();
+			case 2 -> deferred.openClientSessionAsync(RequestContext.analytical());
+			default -> throw new AssertionError(operation);
+		};
+	}
+
+	private static void awaitStarted(int operation, RocksDBConnection client, RocksDBAsyncAPI api) {
+		switch (operation) {
+			case 0 -> verify(api, timeout(5_000)).requestAsync(any());
+			case 1 -> verify(api, timeout(5_000)).flushWalAsync();
+			case 2 -> verify(client, timeout(5_000)).openClientSessionAsync(any());
+			default -> throw new AssertionError(operation);
+		}
+	}
+
+	private static RocksDBException rocks(Throwable error) {
+		Throwable cause = error;
+		while (cause.getCause() != null && !(cause instanceof RocksDBException)) {
+			cause = cause.getCause();
+		}
+		return assertInstanceOf(RocksDBException.class, cause);
 	}
 }

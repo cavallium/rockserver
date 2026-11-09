@@ -278,6 +278,46 @@ public final class ReplicatedServerMain {
 		startAndServe(config, directMemoryWatch);
 	}
 
+	/**
+	 * What to do when the start failed because Ratis could not read the Raft log, else null (R47-1). After a power loss
+	 * the last write of the open segment can be torn, which Ratis refuses with the default corruption policy
+	 * ({@link RaftSettings}); {@code repair-log} tells a torn tail, which it drops, from damage, which it refuses. Ratis'
+	 * error does not tell them apart ({@code Log entry corrupted}, an {@code InvalidProtocolBufferException},
+	 * {@code Read extra bytes}), so the failure is recognised by where it was thrown: a frame of Ratis' segment reader,
+	 * anywhere in its causes or suppressed exceptions. That also matches failures that are not damage, thrown while a
+	 * segment was opened or read (a denied permission, an {@code EIO}, an {@code OutOfMemoryError}): telling those
+	 * apart by type would miss a corruption Ratis reports some other way, so the hint names both and leaves the verdict
+	 * to {@code repair-log}, whose {@code OK} means the log is not torn and the cause is elsewhere (review of R47, 3).
+	 * Only a hint is printed: the exit code stays 1.
+	 */
+	static @Nullable String unreadableLogHint(Throwable failure, Path dataDir, String groupId) {
+		if (!readingTheLog(failure, java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>()))) {
+			return null;
+		}
+		String group = NodeConfig.DEFAULT_GROUP_ID.equals(groupId) ? "" : " --group-id " + groupId;
+		return "The node failed while reading its Raft log. After a power loss or a crash its last write may be torn,"
+				+ " but an I/O error, a permission or memory fails the same way (see the cause above): with the node"
+				+ " stopped, run `repair-log --data-dir " + dataDir + group + " --dry-run` and follow its verdict, not this"
+				+ " error; OK means the log is not torn (runbooks.md, \"Node does not start after a power loss\").";
+	}
+
+	private static boolean readingTheLog(@Nullable Throwable failure, java.util.Set<Throwable> seen) {
+		if (failure == null || !seen.add(failure)) return false;
+		for (var frame : failure.getStackTrace()) {
+			String type = frame.getClassName();
+			if (type.equals("org.apache.ratis.server.raftlog.segmented.SegmentedRaftLogReader")
+					|| type.equals("org.apache.ratis.server.raftlog.segmented.SegmentedRaftLogInputStream")
+					|| (type.equals("org.apache.ratis.server.raftlog.segmented.LogSegment")
+							&& frame.getMethodName().equals("readSegmentFile"))) {
+				return true;
+			}
+		}
+		for (var suppressed : failure.getSuppressed()) {
+			if (readingTheLog(suppressed, seen)) return true;
+		}
+		return readingTheLog(failure.getCause(), seen);
+	}
+
 	/** How {@code run} starts its node: {@link ReplicatedNode#start}, unless a test replaced it. */
 	@FunctionalInterface
 	interface NodeStarter {
@@ -322,6 +362,8 @@ public final class ReplicatedServerMain {
 			started.complete(null);
 			System.err.println("Failed to start node " + config.nodeId() + ":");
 			e.printStackTrace();
+			var hint = unreadableLogHint(e, config.dataDir(), config.groupId());
+			if (hint != null) System.err.println(hint);
 			exit(1);
 			return;
 		}
