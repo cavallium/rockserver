@@ -1435,4 +1435,47 @@ class RemovalRulePropertyTest {
 		assertEquals(Reason.NEEDS_TERM, verdict.reason(), verdict::toString);
 		assertEquals(Reason.MEMBER, check(model, x, Map.of()).reason());
 	}
+
+	/**
+	 * Round 37: b leads term 1, adds y (the joint J at index 2, not committed) and replicates J to y, which writes its
+	 * member file; x, with a snapshot at index 1, is elected in term 2 by a and c without J. A chunk of x then reaches b
+	 * (a peer of x's term): b's commit index is past x's snapshot, so Ratis answers ALREADY_INSTALLED and still takes
+	 * x's configuration, without y, at index 2 while b's log keeps J (reachable: repeated errors walk Ratis' nextIndex
+	 * for b down to matchIndex + 1, below x's log start). y keeps J in its own log and in Ratis: it waits. A chunk of x
+	 * to y cannot exist: no configuration x held in its term has y, and Ratis runs log appenders (which send the
+	 * chunks) only for those peers and for the nodes it stages. At f6513af the model delivered it anyway, y's Ratis
+	 * configuration became x's, and y was REMOVED while b, electable without it, holds J (S1 (b), jqwik seed
+	 * 419139274647052654).
+	 */
+	@Example
+	void aChunkReachesOnlyThePeersOfItsSendersTerm() {
+		var model = runAllAnswering(new Setup(false, false), steps(new Elect(B), new Broadcast(B), new Apply(X, 0),
+				new Snapshot(X, 0), new Change(B, Y, false), new Replicate(B, Y, 0), new Elect(X), new StaleInstall(X, B)));
+		var b = model.nodes.get("b");
+		var x = model.nodes.get("x");
+		var y = model.nodes.get("y");
+		assertTrue(x.leader && x.snapshot == 1 && !x.current().holds("y") && y.memberFile && y.current().inNew("y")
+				&& b.at(2).conf() && b.at(2).newHalf().contains("y") && !b.current().holds("y"),
+				() -> "b holds J in its log, x's configuration in Ratis\n" + model);
+		assertEquals(Reason.OWN_LATER_CONFIGURATION, check(model, y, Map.of()).reason(), model::toString);
+		boolean delivered = model.apply(new StaleInstall(X, Y));
+		if (delivered) {
+			var verdict = check(model, y, Map.of());
+			if (verdict.outcome() == Outcome.REMOVED) {
+				checkRemovedIsSafe(model, y, verdict, Map.of());
+			}
+		}
+		assertTrue(!delivered, () -> "a chunk of x reached y, which x never sends to\n" + model);
+	}
+
+	/** Round 37: the 32 steps the shrunk failure of seed 419139274647052654 applied, replayed (S1 (b) at f6513af). */
+	@Example
+	void theRound37HistoryIsSafe() {
+		run(new Setup(false, false), steps(new Elect(0), new Broadcast(0), new Elect(0), new Elect(0), new Apply(3, 0),
+				new Elect(0), new Elect(0), new Elect(0), new Elect(0), new Broadcast(0), new Elect(3), new Elect(1),
+				new Append(0), new Append(0), new Append(0), new Broadcast(3), new Restart(0), new Broadcast(4),
+				new Broadcast(4), new Replicate(1, 2, 1), new Change(0, 5, false), new Crash(3), new Elect(1),
+				new Elect(5), new Elect(1), new Snapshot(1, 0), new Replicate(1, 5, 0), new Append(0), new Append(2),
+				new Elect(4), new StaleInstall(2, 1), new StaleInstall(0, 5)), 1, false);
+	}
 }
