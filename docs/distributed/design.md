@@ -4167,6 +4167,19 @@ install it (`apt-get install gcc libc6-dev`) and run with `-Drockserver.test.req
      data directory whose table files are hard links of a backup copy, the first start killed inside the check, the
      backup copy deleted: the backup's digest kept; red at `fb12aad`). Not tested: a file system without birth times
      (the probe's other branch) and a reused inode number in a real copy (the value test covers the rule).
+   - Review of R45, 1 (low, failed safe): the probe runs at every listing and can give another answer at the restart
+     than when the marker was written (it cannot create its file: `EDQUOT`, no inodes left, a read-only data
+     directory; or the device check differs), so an unchanged file could be listed with a birth time once and `-`
+     the other time. R45-1 compared the whole identity first, then required a known equal birth time, so such a file
+     was "another file" and the node stopped at genesis, where before R45-1 an unchanged `<inode>@<ctime>` was kept.
+     `sameTable` now takes an equal `<inode>@<ctime>` for the same file before anything else (an equal change time
+     implies the link count and modification time; a birth time cannot change) and applies the link-count rule only
+     when the change time differs. Test: `...aTableFileIsTheSameDespiteANewChangeTimeOnlyWhenOnlyItsLinkCountChanged`
+     (birth time known, then `-`, and the reverse, with the inode and change time unchanged; red at `54b84a5`).
+   - Review of R45, 2: `StartupClusterTest.aRestoredFirstStartKilledDuringTheCheckKeepsTheBackupDigestAfterTheBackupCopyIsDeleted`
+     assumes a test file system with birth times (`StartupChecksTest.birthTimeKnown`, now shared), as its
+     `StartupChecksTest` counterpart does: without them a link change is another file by design (ext4 with 128-byte
+     inodes, a seccomp profile blocking `statx`), and the test is skipped instead of failing.
    - The exit status after a start is the same on both paths (R6-2): the main thread's exit is a `System.exit`,
      which runs the shutdown hook, and the hook ends with `Runtime.halt`. The hook used to halt with 3 for any
      failure, which replaced the 4 of a node that found out, while it waited outside the cluster, that it was

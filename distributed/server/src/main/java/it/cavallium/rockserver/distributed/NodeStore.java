@@ -1162,7 +1162,9 @@ final class NodeStore implements Closeable {
 	 * written again in place with its modification time set back while another link to it comes or goes (the outside
 	 * copy then holds the new content too); a link removed and another added to the same file, the count back where it
 	 * was, is taken for another file (fails safe). An identity of a marker written before R45-1 ({@code <inode>@<ctime>})
-	 * is compared on those two only.
+	 * is compared on those two only, and so is any identity whose inode and change time are unchanged: those imply the
+	 * link count and modification time, and the birth time is only listed or not as the probe of {@link #birthTimeDevice}
+	 * succeeded (Review of R45, 1).
 	 */
 	static boolean sameTable(String before, String now) {
 		var a = before.split(" ", 2);
@@ -1176,7 +1178,9 @@ final class NodeStore implements Closeable {
 		// <inode>@<ctime>,<links>,<mtime>,<birth time>
 		var x = a[1].split(",", -1);
 		var y = b[1].split(",", -1);
-		if (x.length != 4 || y.length != 4) {
+		if (x[0].equals(y[0]) || x.length != 4 || y.length != 4) {
+			// The same inode and change time: the link count and modification time cannot differ and a birth time cannot
+			// change, whatever the probe gave at either end (Review of R45, 1: it fails without a file of its own).
 			return x[0].equals(y[0]);
 		}
 		String inodeBefore = x[0].substring(0, Math.max(0, x[0].indexOf('@')));
