@@ -923,9 +923,10 @@ final class NodeStore implements Closeable {
 	 * snapshot with {@code db/} closed and so without RocksDB's LOCK, and the open would otherwise finish or delete the
 	 * restore directories it is building ({@link #open} recovers them before RocksDB locks the database).</p>
 	 *
-	 * <p>A missing {@code dbDir} is accepted when {@code <db>.restore-ready} exists (R33-1): a crash during a restore's
-	 * swap left the complete new database there, and the open, under the lock, swaps it in as the node's start would.
-	 * With neither {@code dbDir/CURRENT} nor that directory, it throws "No database in" before anything is touched.</p>
+	 * <p>A missing {@code dbDir} is accepted when {@code <db>.restore-ready} holds a database (its {@code CURRENT},
+	 * R33-1 and its review): a crash during a restore's swap left the complete new database there, and the open, under
+	 * the lock, swaps it in as the node's start would. With neither {@code dbDir/CURRENT} nor
+	 * {@code <db>.restore-ready/CURRENT}, it throws "No database in" before anything is touched.</p>
 	 *
 	 * @throws NodeRunningException if the node holds its group's lock: nothing of the node is touched, nothing written
 	 */
@@ -937,8 +938,11 @@ final class NodeStore implements Closeable {
 		}
 		// R33-1: a restore that a crash interrupted during its swap may have left no db/ (between its two renames, or
 		// before the parent's fsync), with the complete newer database in <db>.restore-ready: the open below finishes
-		// the swap, under the group's lock, as a start of the node would. Only read here: nothing is touched yet.
-		if (!Files.isRegularFile(dbDir.resolve("CURRENT")) && !Files.isDirectory(RestoreDirs.of(dbDir).ready)) {
+		// the swap, under the group's lock, as a start of the node would. Only read here: nothing is touched yet. The
+		// ready directory must hold a database (its CURRENT, R33 review): one without it is not accepted, as the open
+		// would swap it in, delete <db>.restore-old (then the only complete copy) and create an empty database.
+		if (!Files.isRegularFile(dbDir.resolve("CURRENT"))
+				&& !Files.isRegularFile(RestoreDirs.of(dbDir).ready.resolve("CURRENT"))) {
 			throw new IOException("No database in " + dbDir);
 		}
 		Path groupDir = stateMachineDir == null ? null : stateMachineDir.toAbsolutePath().normalize().getParent();
