@@ -1227,6 +1227,10 @@ final class NodeStore implements Closeable {
 	 * that goes through the WAL could make the file list and the WAL copy disagree.</p>
 	 */
 	TermIndex checkpoint(Path target) throws IOException {
+		return checkpoint(target, true);
+	}
+
+	TermIndex checkpoint(Path target, boolean replaceLeftover) throws IOException {
 		target = target.toAbsolutePath();
 		if (Files.exists(target)) {
 			throw new IOException("Checkpoint target already exists: " + target);

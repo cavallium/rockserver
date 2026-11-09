@@ -767,6 +767,9 @@ class NodeStoreTest {
 		targets.put("inside raft", dataDir -> dataDir.resolve("raft").resolve("seed"));
 		targets.put("db through a link", dataDir -> dataDir.resolveSibling(dataDir.getFileName() + "-alias")
 				.resolve("db"));
+		// R34 review 1: a link to the missing db/ is dangling, and must be followed all the same.
+		targets.put("inside db through a dangling link", dataDir -> dataDir.resolveSibling(dataDir.getFileName()
+				+ "-dangling").resolve("seed"));
 		int n = 0;
 		for (var entry : targets.entrySet()) {
 			Path dataDir = Files.createDirectories(tempDir.resolve("node" + n++));
@@ -774,6 +777,7 @@ class NodeStoreTest {
 			Path stateMachineDir = Files.createDirectories(dataDir.resolve("raft").resolve(NodeConfig.DEFAULT_GROUP_ID))
 					.resolve("sm");
 			Files.createSymbolicLink(dataDir.resolveSibling(dataDir.getFileName() + "-alias"), dataDir);
+			Files.createSymbolicLink(dataDir.resolveSibling(dataDir.getFileName() + "-dangling"), dataDir.resolve("db"));
 			Path target = entry.getValue().apply(dataDir);
 
 			var refused = assertThrows(IOException.class,
@@ -791,6 +795,81 @@ class NodeStoreTest {
 				assertEquals(TermIndex.valueOf(4, 40), ready.applied(), entry.getKey());
 				assertEquals(Map.of(7, "new"), contents(ready, ready.db().getColumnId(DATA_COLUMN)), entry.getKey());
 			}
+		}
+	}
+
+	/**
+	 * R34 review 2: the data directory {@code /x/link/..}, with {@code link} pointing to {@code /real/a/b}, is resolved
+	 * by the OS to {@code /real/a} but by {@link NodeStore#open} (which normalizes) to {@code /x}. The export uses one
+	 * form, the normalized one the open uses, for every step: here {@code /x/db} holds no database, so it refuses with
+	 * "No database in" and touches nothing. Before, the "No database in" check found {@code /real/a/db.restore-ready}
+	 * through the OS, the refusal compared the target with {@code /x}'s directories, and the open created an empty
+	 * database in {@code /x/db} and exported it into {@code /real/a/db/seed}, inside the node's (missing) {@code db/}.
+	 */
+	@Test
+	void exportSeedUsesTheDirectoriesTheOpenUsesWhenTheDataDirHasDotDotAfterALink() throws IOException {
+		Path realDataDir = Files.createDirectories(tempDir.resolve("real").resolve("a"));
+		writeRestoreInterruptedDuringTheSwap(realDataDir, true);
+		Files.createDirectories(realDataDir.resolve("b"));
+		Files.createDirectories(realDataDir.resolve("raft").resolve(NodeConfig.DEFAULT_GROUP_ID));
+		Path x = Files.createDirectories(tempDir.resolve("x"));
+		Files.createSymbolicLink(x.resolve("link"), realDataDir.resolve("b"));
+		Path dataDir = x.resolve("link").resolve("..");
+		Path target = realDataDir.resolve("db").resolve("seed");
+
+		var refused = assertThrows(IOException.class, () -> NodeStore.exportSeed(dataDir.resolve("db"),
+				dataDir.resolve("raft").resolve(NodeConfig.DEFAULT_GROUP_ID).resolve("sm"), null, target, false));
+
+		assertTrue(refused.getMessage().startsWith("No database in " + x.resolve("db")), refused.getMessage());
+		assertFalse(Files.exists(x.resolve("db")));
+		assertFalse(Files.exists(realDataDir.resolve("db")));
+		assertTrue(Files.isRegularFile(realDataDir.resolve("db.restore-old").resolve("CURRENT")));
+		try (var ready = NodeStore.open(realDataDir.resolve("db.restore-ready"), null, "ready")) {
+			assertEquals(TermIndex.valueOf(4, 40), ready.applied());
+		}
+	}
+
+	/**
+	 * R34 review 3: an existing {@code <target>.tmp}, which the checkpoint would build in, is refused before anything is
+	 * touched, as an existing target is, and stays as it was. Before, the checkpoint deleted it first, whoever had made
+	 * it (an operator's {@code /backups/seed.tmp} for {@code --target /backups/seed}).
+	 */
+	@Test
+	void exportSeedRefusesAnExistingTemporaryDirectoryAndLeavesIt() throws IOException {
+		Path source = tempDir.resolve("source");
+		writeDatabase(source, "v", TermIndex.valueOf(1, 5));
+		Path target = tempDir.resolve("seed");
+		Path foreign = Files.createDirectories(tempDir.resolve("seed.tmp"));
+		Files.writeString(foreign.resolve("operator"), "not the export's");
+
+		var refused = assertThrows(IOException.class, () -> NodeStore.exportSeed(source, null, target));
+
+		assertTrue(refused.getMessage().contains("already exists"), refused.getMessage());
+		assertEquals("not the export's", Files.readString(foreign.resolve("operator")));
+		assertFalse(Files.exists(target));
+	}
+
+	/**
+	 * R34 review 3: the checkpoint of an export creates its {@code <target>.tmp} itself, atomically, and never deletes
+	 * one it did not create: one that appears between the export's checks and the checkpoint fails the export and
+	 * stays. The snapshot and backup callers still replace a leftover (they build inside a directory of their own).
+	 */
+	@Test
+	void anExportCheckpointNeverDeletesATemporaryDirectoryItDidNotCreate() throws IOException {
+		Path source = tempDir.resolve("source");
+		writeDatabase(source, "v", TermIndex.valueOf(1, 5));
+		Path target = tempDir.resolve("seed");
+		Path foreign = tempDir.resolve("seed.tmp");
+		try (var store = NodeStore.open(source, null, "source")) {
+			Files.createDirectories(foreign);
+			Files.writeString(foreign.resolve("operator"), "not the export's");
+			assertThrows(java.nio.file.FileAlreadyExistsException.class, () -> store.checkpoint(target, false));
+			assertEquals("not the export's", Files.readString(foreign.resolve("operator")));
+			assertFalse(Files.exists(target));
+
+			store.checkpoint(target, true);
+			assertFalse(Files.exists(foreign));
+			assertTrue(Files.isRegularFile(target.resolve("CURRENT")));
 		}
 	}
 
