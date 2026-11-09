@@ -12,6 +12,8 @@ import it.cavallium.rockserver.core.common.Keys;
 import it.cavallium.rockserver.core.common.RequestType.RequestTypeId;
 import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
+import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -25,10 +27,15 @@ import org.apache.ratis.protocol.Message;
 import org.apache.ratis.protocol.RaftClientRequest;
 import org.apache.ratis.protocol.RaftGroup;
 import org.apache.ratis.protocol.RaftGroupId;
+import org.apache.ratis.protocol.RaftGroupMemberId;
 import org.apache.ratis.protocol.RaftPeer;
 import org.apache.ratis.protocol.RaftPeerId;
+import org.apache.ratis.server.DivisionInfo;
+import org.apache.ratis.server.RaftServer;
 import org.apache.ratis.thirdparty.com.google.protobuf.ByteString;
 import org.apache.ratis.thirdparty.com.google.protobuf.UnsafeByteOperations;
+import org.apache.ratis.thirdparty.io.grpc.Status;
+import org.apache.ratis.thirdparty.io.grpc.StatusRuntimeException;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -277,5 +284,68 @@ class ProposerQueueTest {
 		resentAlone.complete(Applier.SESSION_GONE, false);
 		var type = failure(resentAlone);
 		assertTrue(type == RocksDBErrorType.INVALID_REQUEST, type::toString);
+	}
+
+	/**
+	 * R39 review 1: a backup proposal that the node's proposer refuses as not applied (no leader accepted it in time;
+	 * likewise a full admission or a caller deadline before it was sent) is answered UNAVAILABLE, which {@code admin}
+	 * reads as nothing proposed ({@link ReplicatedServerMain#notProposed}), so that it does not say the backup "may have
+	 * been proposed". Before, it reached the caller as a RocksDBException that the ops service turned into ABORTED. A
+	 * failure without the not-applied flag (the node is stopping) still goes through as it was.
+	 */
+	@Test
+	void aProposalThatNoLeaderAcceptedIsAnsweredAsNotProposed() throws Exception {
+		var peers = List.of(new PeerConfig("n0", "127.0.0.1", 1, "127.0.0.1", 2));
+		var config = NodeConfig.defaults("n0", peers, temp).withRequestTimeout(Duration.ofSeconds(1));
+		var metrics = new NodeMetrics("n0");
+		var threads = new NodeThreads("n0");
+		var group = RaftGroup.valueOf(RaftGroupId.valueOf(UUID.randomUUID()),
+				RaftPeer.newBuilder().setId("n0").setAddress("127.0.0.1:1").build());
+		// A Raft server that knows no leader (an election): every attempt is refused before the append, nothing is sent.
+		var info = stub(DivisionInfo.class, (method, _) -> switch (method) {
+			case "isLeader", "isLeaderReady" -> false;
+			default -> null;
+		});
+		var memberId = RaftGroupMemberId.valueOf(RaftPeerId.valueOf("n0"), group.getGroupId());
+		var division = stub(RaftServer.Division.class, (method, _) -> switch (method) {
+			case "getInfo" -> info;
+			case "getMemberId" -> memberId;
+			case "getGroup" -> group;
+			default -> null;
+		});
+		var server = stub(RaftServer.class, (method, _) -> method.equals("getDivision") ? division : null);
+		var proposer = new Proposer(group, RaftSettings.client(config), config, () -> server, metrics,
+				threads.control(), threads.submit());
+		try (var ops = new ReplicaOps(config, null, metrics)) {
+			ops.clusterVersion(Capabilities.SUPPORTED);
+			ops.proposer(proposer);
+			var name = "b1".getBytes(StandardCharsets.UTF_8);
+			var request = ReplicaOps.request(ReplicaOps.OP_PROPOSE_BACKUP,
+					ByteBuffer.allocate(Long.BYTES + name.length).putLong(42).put(name).array());
+			var error = assertThrows(ExecutionException.class, () -> ops.answer(request).get(10, TimeUnit.SECONDS));
+			var refused = assertInstanceOf(StatusRuntimeException.class, ReplicatedConnection.unwrap(error), error.toString());
+			assertEquals(Status.Code.UNAVAILABLE, refused.getStatus().getCode(), refused.toString());
+			assertTrue(ReplicatedServerMain.notProposed(refused.getStatus().getCode()));
+			assertTrue(refused.getStatus().getDescription().contains("not applied"), refused.toString());
+			proposer.close();
+			var stopping = assertThrows(ExecutionException.class, () -> ops.answer(request).get(10, TimeUnit.SECONDS));
+			var cause = assertInstanceOf(RocksDBException.class, ReplicatedConnection.unwrap(stopping), stopping.toString());
+			assertFalse(cause.isNotApplied());
+		} finally {
+			proposer.close();
+			threads.close();
+			metrics.close();
+		}
+	}
+
+	/** An implementation of {@code type} whose methods answer {@code answer(name, arguments)}. */
+	private static <T> T stub(Class<T> type, java.util.function.BiFunction<String, Object[], Object> answer) {
+		return type.cast(java.lang.reflect.Proxy.newProxyInstance(type.getClassLoader(), new Class<?>[] {type},
+				(proxy, method, arguments) -> switch (method.getName()) {
+					case "toString" -> type.getSimpleName() + " stub";
+					case "hashCode" -> System.identityHashCode(proxy);
+					case "equals" -> proxy == arguments[0];
+					default -> answer.apply(method.getName(), arguments);
+				}));
 	}
 }
