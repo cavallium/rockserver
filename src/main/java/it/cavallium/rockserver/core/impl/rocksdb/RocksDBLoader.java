@@ -313,23 +313,48 @@ public class RocksDBLoader {
         return columnFamilyOptions;
     }
 
+    /**
+     * The options of Rockserver's internal column families ({@code _column_schemas_}, {@code _merge_operators_} and
+     * the legacy {@code _cdc_meta_}): {@link #getCompatibilityColumnOptions(RocksDBObjects)} in the database's
+     * fallback volumes. They read no column config, but follow the global {@code disable-auto-compactions}: with it,
+     * RocksDB starts no compaction of them (no L0 trigger, no TTL or periodic compaction) and no write slowdown, as
+     * for every other column (R44-1). Otherwise they keep RocksDB's defaults.
+     */
     public static ColumnFamilyOptions getCompatibilityColumnOptions(@NotNull RocksDBObjects refs,
             @Nullable Path path, @NotNull Path definitiveDbPath, @NotNull DatabaseConfig config) throws IOException {
-        if (path == null) {
-            return getCompatibilityColumnOptions(refs);
-        }
-        List<DbPathRecord> volumeConfigs;
+        boolean disableAutoCompactions;
         try {
-            volumeConfigs = getVolumeConfigs(definitiveDbPath, config.global().fallbackColumnOptions());
+            disableAutoCompactions = config.global().disableAutoCompactions();
         } catch (GestaltException e) {
             throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.CONFIG_ERROR,
-                    "Failed to resolve internal column-family volumes", e);
+                    "Failed to read disable-auto-compactions for the internal column families", e);
         }
-        for (DbPathRecord volumeConfig : volumeConfigs) {
-            Files.createDirectories(volumeConfig.path());
+        ColumnFamilyOptions columnFamilyOptions;
+        if (path == null) {
+            columnFamilyOptions = getCompatibilityColumnOptions(refs);
+        } else {
+            List<DbPathRecord> volumeConfigs;
+            try {
+                volumeConfigs = getVolumeConfigs(definitiveDbPath, config.global().fallbackColumnOptions());
+            } catch (GestaltException e) {
+                throw it.cavallium.rockserver.core.common.RocksDBException.of(RocksDBErrorType.CONFIG_ERROR,
+                        "Failed to resolve internal column-family volumes", e);
+            }
+            for (DbPathRecord volumeConfig : volumeConfigs) {
+                Files.createDirectories(volumeConfig.path());
+            }
+            columnFamilyOptions = getCompatibilityColumnOptions(refs);
+            columnFamilyOptions.setCfPaths(mapList(volumeConfigs, p -> new DbPath(p.path(), p.targetSize())));
         }
-        var columnFamilyOptions = getCompatibilityColumnOptions(refs);
-        columnFamilyOptions.setCfPaths(mapList(volumeConfigs, p -> new DbPath(p.path(), p.targetSize())));
+        if (disableAutoCompactions) {
+            columnFamilyOptions.setDisableAutoCompactions(true);
+            columnFamilyOptions.setLevel0FileNumCompactionTrigger(-1);
+            // Without compactions, the L0 files of these columns only grow: never slow down or stop their writes.
+            columnFamilyOptions.setLevel0SlowdownWritesTrigger(-1);
+            columnFamilyOptions.setLevel0StopWritesTrigger(Integer.MAX_VALUE);
+            columnFamilyOptions.setHardPendingCompactionBytesLimit(Long.MAX_VALUE);
+            columnFamilyOptions.setSoftPendingCompactionBytesLimit(Long.MAX_VALUE);
+        }
         return columnFamilyOptions;
     }
 

@@ -103,6 +103,28 @@ class RocksDBCompatibilityOptionsTest {
 		}
 	}
 
+	/**
+	 * R44-1: the internal column families follow the global {@code disable-auto-compactions} (no compaction, no write
+	 * slowdown), which a replica's start-up check sets for the one open that must delete no table file; without it they
+	 * keep RocksDB's automatic compactions.
+	 */
+	@Test
+	void internalFamiliesFollowTheGlobalDisableAutoCompactions(@TempDir Path tempDir) throws Exception {
+		Path configPath = tempDir.resolve("no-compactions.conf");
+		Files.writeString(configPath, "database.global.disable-auto-compactions: true");
+		Path disabled = tempDir.resolve("disabled");
+		new EmbeddedDB(disabled, "no-compactions", configPath).closeTesting();
+		Path enabled = tempDir.resolve("enabled");
+		new EmbeddedDB(enabled, "compactions", null).closeTesting();
+		for (String columnFamily : STARTUP_COLUMN_FAMILIES.subList(1, STARTUP_COLUMN_FAMILIES.size())) {
+			String off = section(latestOptions(disabled), "[CFOptions \"" + columnFamily + "\"]");
+			assertTrue(off.contains("\n  disable_auto_compactions=true\n"), columnFamily + ": " + off);
+			assertTrue(off.contains("\n  level0_stop_writes_trigger=2147483647\n"), columnFamily + ": " + off);
+			String on = section(latestOptions(enabled), "[CFOptions \"" + columnFamily + "\"]");
+			assertTrue(on.contains("\n  disable_auto_compactions=false\n"), columnFamily + ": " + on);
+		}
+	}
+
 	private enum Fixture { DEFAULT, SEPARATE, NAMED, LEGACY, NAMED_DEFAULT, ROOT_FALLBACK, ROOT_OVERRIDE }
 
 	private static void assertFlushedInternalFamiliesReopen(Path tempDir, Fixture fixture) throws Exception {
