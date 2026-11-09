@@ -1,6 +1,8 @@
 package it.cavallium.rockserver.distributed;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -194,6 +196,69 @@ class StartupClusterTest {
 			assertTrue(node.stateMachine().store().seeded());
 			assertTrue(!node.isFailed());
 			assertNotNull(node.stateMachine().store().seedDigest());
+		}
+	}
+
+	/**
+	 * R41-1: a first start killed while the start-up check had the seed open (a WAL replay cut by a start timeout): the
+	 * files then match neither the seed digest nor an {@code opened} line. The next first start must keep the digest
+	 * recorded before the open, not record the digest of the files that open left, which no other copy has: the node
+	 * would stop at genesis (or, as leader, stop every follower) although its copy is right.
+	 */
+	@Test
+	void aFirstStartKilledDuringTheStartupCheckKeepsTheSeedDigest() throws Exception {
+		cluster = new InProcessCluster(root, 3, config -> config);
+		var seed = createSeed(root.resolve("seed"), 100);
+		for (var id : cluster.ids()) {
+			copy(seed, cluster.config(id).dbDir());
+		}
+		var n2 = cluster.config("n2");
+		String seedDigest = NodeStore.databaseFilesDigest(seed);
+		failFirstStartDuringTheCheck("n2");
+		assertEquals(seedDigest, NodeStore.readSeedDigest(n2.dbDir()), "recorded before the open");
+		assertNotEquals(seedDigest, NodeStore.databaseFilesDigest(n2.dbDir()), "the open changed nothing");
+
+		cluster.startAll();
+		InProcessCluster.await(TIMEOUT, () -> cluster.runningNodes().stream().anyMatch(ReplicatedNode::isFailed)
+				|| cluster.runningNodes().stream().allMatch(node -> node.stateMachine().store().clusterId() != null));
+		for (var node : cluster.runningNodes()) {
+			assertFalse(node.isFailed(), node.config().nodeId() + " failed: " + node.stopped().getNow(null));
+			assertEquals(seedDigest, node.stateMachine().store().seedDigest(), node.config().nodeId());
+		}
+	}
+
+	/**
+	 * R41-1, for a data directory that restore-backup prepared: its seed digest is the backup's, with the files the
+	 * restore left as the {@code opened} line. A first start killed during the start-up check's open keeps the backup's
+	 * digest too.
+	 */
+	@Test
+	void aRestoredFirstStartKilledDuringTheStartupCheckKeepsTheBackupDigest() throws Exception {
+		cluster = new InProcessCluster(root, 1, config -> config);
+		var seed = createSeed(root.resolve("seed"), 100);
+		var n0 = cluster.config("n0");
+		copy(seed, n0.dbDir());
+		String backupDigest = "0123456789abcdef";
+		NodeStore.recordRestoredSeedDigest(n0.dbDir(), backupDigest);
+		failFirstStartDuringTheCheck("n0");
+		assertEquals(backupDigest, NodeStore.recordSeedDigest(n0.dbDir()));
+		assertEquals(backupDigest, NodeStore.readSeedDigest(n0.dbDir()));
+	}
+
+	/** Starts {@code id} for the first time and stops it inside the start-up check's open, as a kill there would. */
+	private void failFirstStartDuringTheCheck(String id) {
+		var dbDir = cluster.config(id).dbDir();
+		ReplicatedNode.startupCheckOpenedForTesting = config -> {
+			if (config.dbDir().equals(dbDir)) {
+				throw new IllegalStateException("killed during the start-up check (test)");
+			}
+		};
+		try {
+			var failure = assertThrows(Exception.class, () -> cluster.start(id));
+			assertTrue(Stream.iterate((Throwable) failure, cause -> cause != null, Throwable::getCause)
+					.anyMatch(cause -> String.valueOf(cause.getMessage()).contains("killed during")), failure::toString);
+		} finally {
+			ReplicatedNode.startupCheckOpenedForTesting = null;
 		}
 	}
 

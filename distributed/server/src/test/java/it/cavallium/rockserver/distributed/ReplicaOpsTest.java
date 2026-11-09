@@ -437,4 +437,78 @@ class ReplicaOpsTest {
 		assertEquals("20", ReplicaOps.readBackupProperties(dir).getProperty("index"));
 		assertTrue(Files.isRegularFile(dir.resolve(ReplicaOps.BACKUP_DB_DIR).resolve("CURRENT")));
 	}
+
+	/**
+	 * R41-2: a backup fsyncs the directories whose new entries it made, {@code backups/} (entry {@code <name>}) and the
+	 * data directory (entry {@code backups}, at the first backup), before it records DONE: otherwise a power loss can
+	 * take back a backup that admin reported written.
+	 */
+	@Test
+	void aBackupSyncsTheDirectoriesItCreatesEntriesIn() throws Exception {
+		var config = NodeConfig.defaults("n0", List.of(new PeerConfig("n0", "127.0.0.1", 1, "127.0.0.1", 2)), temp);
+		Path dataDir = config.dataDir().toAbsolutePath().normalize();
+		Path backups = ReplicaOps.backupsDir(dataDir);
+		var synced = java.util.Collections.synchronizedList(new java.util.ArrayList<Path>());
+		try (var store = NodeStore.open(temp.resolve("store"), null, "n0");
+				var ops = new ReplicaOps(config, null, new NodeMetrics("n0"))) {
+			NodeStore.syncedForTesting = synced::add;
+			try {
+				ops.backup("nightly", 5, org.apache.ratis.server.protocol.TermIndex.valueOf(1, 10), store);
+			} finally {
+				NodeStore.syncedForTesting = null;
+			}
+			assertEquals(ReplicaOps.State.DONE, ops.backupResult("nightly", 10).state());
+		}
+		assertTrue(synced.contains(backups), "backups/ not fsynced: " + synced);
+		assertTrue(synced.contains(dataDir), "the data directory not fsynced: " + synced);
+		// After the entry was made in it: its last fsync comes after the backup's own directory's first one.
+		assertTrue(synced.lastIndexOf(backups) > synced.indexOf(backups.resolve("nightly")), synced.toString());
+	}
+
+	/**
+	 * R41-3: the same backup request proposed twice (admin's first answer was cut, so it proposed the same request id
+	 * through another member). Node a applied the first entry (index 100) and has the backup taken there; node b installed
+	 * a snapshot past 100 and never applied it. At the second entry (200) every copy of the request must still be the
+	 * one at 100: a reports DONE with the copy at 100 (and says so), b writes no copy at 200 and reports that it holds
+	 * none, instead of two copies of one name at different log positions, all reported DONE at 200.
+	 */
+	@Test
+	void aBackupProposedAgainKeepsTheFirstPositionOnEveryNode() throws Exception {
+		var peers = List.of(new PeerConfig("a", "127.0.0.1", 1, "127.0.0.1", 2),
+				new PeerConfig("b", "127.0.0.1", 3, "127.0.0.1", 4));
+		var configA = NodeConfig.defaults("a", peers, temp.resolve("a"));
+		var configB = NodeConfig.defaults("b", peers, temp.resolve("b"));
+		long requestId = 77;
+		var first = new Request(5, 1, 1, new LogEntry.Backup("nightly", requestId));
+		var again = new Request(6, 1, 1, new LogEntry.Backup("nightly", requestId));
+		var i1 = org.apache.ratis.server.protocol.TermIndex.valueOf(1, 100);
+		var i2 = org.apache.ratis.server.protocol.TermIndex.valueOf(1, 200);
+		Path dirA = ReplicaOps.backupsDir(configA.dataDir()).resolve("nightly");
+		Path dirB = ReplicaOps.backupsDir(configB.dataDir()).resolve("nightly");
+		Path storeB = temp.resolve("b-store");
+		try (var store = NodeStore.open(temp.resolve("a-store"), null, "a");
+				var ops = new ReplicaOps(configA, null, new NodeMetrics("a"))) {
+			var applier = new Applier(store);
+			applier.maintenance(ops);
+			applier.apply(first, i1);
+			assertEquals(ReplicaOps.State.DONE, ops.backupResult("nightly", 100).state());
+			// b's database: a snapshot of the leader past the first entry. backups/ is local, so b has no copy.
+			store.checkpoint(storeB);
+			applier.apply(again, i2);
+			var result = ops.backupResult("nightly", 200);
+			assertEquals(ReplicaOps.State.DONE, result.state(), result.detail());
+			assertTrue(result.detail().contains("100"), "a does not say its copy is at 100: " + result.detail());
+		}
+		assertEquals("100", ReplicaOps.readBackupProperties(dirA).getProperty("index"));
+		try (var store = NodeStore.open(storeB, null, "b");
+				var ops = new ReplicaOps(configB, null, new NodeMetrics("b"))) {
+			var applier = new Applier(store);
+			applier.maintenance(ops);
+			applier.apply(again, i2);
+			var result = ops.backupResult("nightly", 200);
+			assertEquals(ReplicaOps.State.FAILED, result.state(), "b took a copy at 200: " + result.detail());
+			assertTrue(result.detail().contains("100"), result.detail());
+		}
+		assertFalse(Files.exists(dirB), "a copy of the request at another log position");
+	}
 }
