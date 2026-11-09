@@ -771,14 +771,20 @@ class CommandLineTest {
 	}
 
 	/**
-	 * A member that answers the capabilities question, takes the first proposal and then shuts its server down without
-	 * answering it, as a member that is killed or restarted mid-call (R40-1).
+	 * A member that answers the capabilities question, takes the first proposal and then breaks the call without
+	 * answering it (R40-1, review 1). With {@code reset}, the member sits behind a TCP proxy that then resets every
+	 * client connection (SO_LINGER 0) and refuses new ones, as a member that is killed or whose host drops the
+	 * connection mid-call: the client sees the transport close under the open call, which grpc-java answers with
+	 * UNAVAILABLE. Without it, the member's server shuts down with {@code shutdownNow}, which resets its open streams
+	 * with RST_STREAM(CANCEL): the client sees CANCELLED.
 	 */
 	private static final class DroppingMember implements AutoCloseable {
 		final java.util.concurrent.atomic.AtomicInteger taken = new java.util.concurrent.atomic.AtomicInteger();
 		final Server server;
+		final java.net.@Nullable ServerSocket proxy;
+		final List<java.net.Socket> clients = new CopyOnWriteArrayList<>();
 
-		DroppingMember() throws IOException {
+		DroppingMember(boolean reset) throws IOException {
 			var self = new java.util.concurrent.atomic.AtomicReference<Server>();
 			ServerCalls.UnaryMethod<byte[], byte[]> ops = (request, response) -> {
 				var rest = java.util.Arrays.copyOfRange(request, 16, request.length);
@@ -787,7 +793,7 @@ class CommandLineTest {
 							.putLong(Capabilities.SUPPORTED).array());
 					response.onCompleted();
 				} else if (taken.getAndIncrement() == 0) {
-					Thread.ofPlatform().start(() -> self.get().shutdownNow());
+					Thread.ofPlatform().start(reset ? this::resetClients : () -> self.get().shutdownNow());
 				}
 			};
 			server = NettyServerBuilder.forAddress(new java.net.InetSocketAddress("127.0.0.1", 0))
@@ -796,14 +802,67 @@ class CommandLineTest {
 					.build()
 					.start();
 			self.set(server);
+			if (reset) {
+				var loopback = java.net.InetAddress.getByName("127.0.0.1");
+				var listener = new java.net.ServerSocket(0, 50, loopback);
+				proxy = listener;
+				Thread.ofPlatform().daemon().start(() -> {
+					while (true) {
+						try {
+							var client = listener.accept();
+							var backend = new java.net.Socket(loopback, server.getPort());
+							clients.add(client);
+							pump(client, backend);
+							pump(backend, client);
+						} catch (IOException ex) {
+							return;
+						}
+					}
+				});
+			} else {
+				proxy = null;
+			}
+		}
+
+		private static void pump(java.net.Socket from, java.net.Socket to) {
+			Thread.ofPlatform().daemon().start(() -> {
+				try (from; to) {
+					from.getInputStream().transferTo(to.getOutputStream());
+				} catch (IOException ignored) {
+					// The other side closed or was reset.
+				}
+			});
+		}
+
+		private void resetClients() {
+			try {
+				proxy.close();
+			} catch (IOException ignored) {
+				// Closing it only refuses new connections.
+			}
+			for (var client : clients) {
+				try {
+					client.setSoLinger(true, 0);
+					client.close();
+				} catch (IOException ignored) {
+					// Closed already.
+				}
+			}
+		}
+
+		String address() {
+			return "127.0.0.1:" + (proxy != null ? proxy.getLocalPort() : server.getPort());
 		}
 
 		String peer(String id) {
-			return id + "=127.0.0.1:" + server.getPort() + "/127.0.0.1:" + server.getPort();
+			return id + "=" + address() + "/" + address();
 		}
 
 		@Override
 		public void close() throws InterruptedException {
+			if (proxy != null) {
+				resetClients();
+			}
 			server.shutdownNow().awaitTermination(5, TimeUnit.SECONDS);
 		}
 	}
@@ -1014,9 +1073,11 @@ class CommandLineTest {
 
 	/**
 	 * R40-1 to R40-3: a {@code backup} that a member took before its call broke with a bare UNAVAILABLE (here answered
-	 * so, and then by a member whose server shuts down mid-call) may have been proposed: at the deadline the command
-	 * says so and names the member, not "Nothing was proposed: run the command again", whose rerun would be refused with
-	 * "A backup named ... exists already" once the first one is written.
+	 * so, and then by a member whose connection is reset under the open call) may have been proposed: at the deadline
+	 * the command says so and names the member, not "Nothing was proposed: run the command again", whose rerun would be
+	 * refused with "A backup named ... exists already" once the first one is written. A member whose server shuts down
+	 * with {@code shutdownNow} mid-call is CANCELLED (RST_STREAM CANCEL), not UNAVAILABLE, and counts as took too
+	 * (review 1 of R40: that half alone was green before R40; the reset half was red then, "Nothing was proposed").
 	 */
 	@Test
 	void aBackupWhoseCallBrokeAfterTheMemberTookItMayHaveBeenProposed() throws Exception {
@@ -1029,13 +1090,26 @@ class CommandLineTest {
 			assertTrue(result.out().contains("m1 took the request"), result.toString());
 			assertTrue(result.out().contains("may have been proposed"), result.toString());
 		}
-		try (var dropping = new DroppingMember()) {
-			var result = run("admin", "--peer", dropping.peer("m1"), "--timeout-ms", "3000", "backup", "b9");
-			assertEquals(ReplicatedServerMain.EXIT_INCOMPLETE, result.code(), result.toString());
-			assertEquals(1, dropping.taken.get(), result.toString());
-			assertTrue(!result.out().contains("Nothing was proposed"), result.toString());
-			assertTrue(result.out().contains("m1 took the request"), result.toString());
-			assertTrue(result.out().contains("may have been proposed"), result.toString());
+		// Review 1 of R40: each kind of break, first with the status that a direct call sees, so that the half tests
+		// what it claims: a connection reset under the open call is the bare UNAVAILABLE of R40-1; a server
+		// shutdownNow resets the stream and is CANCELLED, which never counted as nothing proposed.
+		var groupId = org.apache.ratis.protocol.RaftGroupId.valueOf(java.util.UUID.fromString(NodeConfig.DEFAULT_GROUP_ID));
+		for (var reset : List.of(true, false)) {
+			var expected = reset ? Status.Code.UNAVAILABLE : Status.Code.CANCELLED;
+			try (var probe = new DroppingMember(reset)) {
+				var ex = org.junit.jupiter.api.Assertions.assertThrows(java.util.concurrent.CompletionException.class,
+						() -> ReplicaOps.call(probe.address(), groupId, ReplicaOps.OP_PROPOSE_BACKUP, new byte[0],
+								Duration.ofSeconds(10)).join());
+				assertEquals(expected, Status.fromThrowable(ex.getCause()).getCode(), "reset " + reset + ": " + ex);
+			}
+			try (var dropping = new DroppingMember(reset)) {
+				var result = run("admin", "--peer", dropping.peer("m1"), "--timeout-ms", "3000", "backup", "b9");
+				assertEquals(ReplicatedServerMain.EXIT_INCOMPLETE, result.code(), result.toString());
+				assertEquals(1, dropping.taken.get(), result.toString());
+				assertTrue(!result.out().contains("Nothing was proposed"), result.toString());
+				assertTrue(result.out().contains("m1 took the request"), result.toString());
+				assertTrue(result.out().contains("may have been proposed"), result.toString());
+			}
 		}
 	}
 

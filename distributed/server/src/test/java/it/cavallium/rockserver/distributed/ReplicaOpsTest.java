@@ -122,7 +122,11 @@ class ReplicaOpsTest {
 		assertTrue(ReplicatedServerMain.notProposed(Status.NOT_FOUND.withDescription("No group x")));
 		assertFalse(ReplicatedServerMain.notProposed(Status.UNAVAILABLE));
 		assertFalse(ReplicatedServerMain.notProposed(Status.UNAVAILABLE.withDescription("Network closed for unknown reason")));
-		assertFalse(ReplicatedServerMain.notProposed(Status.UNAVAILABLE.withDescription("shutdownNow invoked")));
+		// What a caller sees of a member whose connection is reset mid-call, and of one whose server runs shutdownNow
+		// (RST_STREAM CANCEL): Review of R40, 1 to 3.
+		assertFalse(ReplicatedServerMain.notProposed(Status.UNAVAILABLE.withDescription("io exception")));
+		assertFalse(ReplicatedServerMain.notProposed(
+				Status.CANCELLED.withDescription("RST_STREAM closed stream. HTTP/2 error code: CANCEL")));
 		assertFalse(ReplicatedServerMain.notProposed(Status.ABORTED.withDescription(ReplicaOps.NOT_PROPOSED + "x")));
 		assertFalse(ReplicatedServerMain.notProposed(Status.DEADLINE_EXCEEDED));
 	}

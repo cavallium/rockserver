@@ -237,7 +237,8 @@ why it failed (disk full, a backup of that name exists), and `OK` only if every 
 with 1 if a node failed, and with 4 if a node gave no result within `--timeout-ms` (down, or slow): then ask again
 later with `rs admin $PEERS backup-status 2026-11-06 <index it printed>`, which proposes nothing. It also exits with 4
 when no node gave the log index in time. If it says `Nothing was proposed`, no node took the request (or each one that did refused it as not applied, such
-as when no leader accepted it in time, or was still starting: its answer begins with `Not proposed: `): run it again.
+as when no leader accepted it in time, or was still starting: its answer begins with `Not proposed: `, or, from a node
+of an older version during a rolling upgrade, is exactly `The node is starting`): run it again.
 If it says a node `took the request ... it may have been proposed`, the backup may still be written (a slow leader
 appended it, or the node's connection broke after it took the request, such as a node restarted or killed mid-call:
 it may have sent it to the leader already): do not run it again under the same name, which is refused (`A backup named 2026-11-06 exists already`,
