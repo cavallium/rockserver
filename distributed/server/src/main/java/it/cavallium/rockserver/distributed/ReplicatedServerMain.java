@@ -557,6 +557,11 @@ public final class ReplicatedServerMain {
 			System.err.println("Not exported: " + e.getMessage());
 			exit(5);
 			return;
+		} catch (NodeStore.NodeRunningException e) {
+			// R32-5: the node runs (or another export of it does), maybe installing a snapshot: nothing was touched.
+			System.err.println("Not exported: " + e.getMessage());
+			exit(1);
+			return;
 		} catch (NodeStore.DamagedSnapshotNotExportedException e) {
 			// Not a usage error: the same command line works on another replica (R32-1).
 			System.err.println("Not exported: " + e.getMessage());
