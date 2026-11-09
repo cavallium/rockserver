@@ -262,7 +262,7 @@ over (clients open new ones by themselves).
 2. On every node of the new cluster, into an empty data directory, from a copy of the same backup:
    `rs restore-backup --backup /path/to/<name> --data-dir /srv/rockserver/data [--rockserver-config ...]`.
    It prints `OK`, the data directory and the log index the data reaches. It refuses a data directory with a `db/` or a
-   Raft log. It reads the backup and builds the database aside, in `DATA-DIR/db.restore-backup`, checking its cluster
+   Raft log, before it looks at the backup. It reads the backup and builds the database aside, in `DATA-DIR/db.restore-backup`, checking its cluster
    version; only then does it rename a `replica-ops.log` and a `backups/` of the old cluster found there (suffix
    `.before-restore-<time>`) and fsync the directory, and then rename the built database to `db/`, so that their
    results never answer for the new cluster. A backup inside `DATA-DIR/backups` (the node's own
@@ -276,9 +276,13 @@ over (clients open new ones by themselves).
    newer version under the oldest cluster version. On any other failure (a `--rockserver-config` that does not parse,
    a column that does not open, a full disk) it also removes what it built, and renames nothing if it failed before
    the renames, so fix the cause and run the same command again. A run interrupted (power loss, `kill -9`) before
-   `db/` appeared leaves at most `db.restore-backup` and the renames: run the same command again, which deletes the
-   former and finds nothing more to rename; if that run had already renamed the `backups/` your `--backup` pointed
-   into, the rerun says where the backup is now (`run again with --backup .../backups.before-restore-<time>/<name>`).
+   `db/` appeared leaves at most `db.restore-backup` (with possibly `db.restore-backup.restore-tmp`, `.restore-ready`
+   or `.restore-old`, and `rockserver-replica-for-db.restore-backup.conf`, which holds the resolved config with its
+   secrets) and the renames: run the same command again, which deletes all of those and finds nothing more to rename;
+   if that run had already renamed the `backups/` your `--backup` pointed into, the rerun says where the backup is
+   now (`run again with --backup .../backups.before-restore-<time>/<name>`). A `wal-path`, `log-path` or volume path
+   of the `--rockserver-config` that is absolute inside `DATA-DIR/db` is fine: the database built aside keeps them
+   under `db.restore-backup`, and they are in `db/` after the rename.
    A `db/` left by a run interrupted in its last step (recording `db.seed-digest`) is not removed: delete
    `DATA-DIR/db` and run it again.
    Use copies of one node's backup on every node (`cp -a`, `rsync`, `scp` of the whole `<name>` directory), not the
