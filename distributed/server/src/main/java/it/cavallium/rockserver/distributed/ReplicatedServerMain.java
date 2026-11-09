@@ -534,7 +534,9 @@ public final class ReplicatedServerMain {
 	}
 
 	private static void exportSeed(Options options) throws IOException {
-		var dataDir = Path.of(options.required("--data-dir"));
+		// Normalized as NodeStore.exportSeed and open() take it, so the group directory checked here is the one the
+		// export locks and reads (R34 review 2).
+		var dataDir = Path.of(options.required("--data-dir")).toAbsolutePath().normalize();
 		var target = Path.of(options.required("--target"));
 		var rockserverConfig = options.value("--rockserver-config") != null
 				? Path.of(options.value("--rockserver-config")) : null;

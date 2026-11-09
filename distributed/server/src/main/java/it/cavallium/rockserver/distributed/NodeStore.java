@@ -956,11 +956,22 @@ final class NodeStore implements Closeable {
 	 */
 	static ExportedSeed exportSeed(Path dbDir, @Nullable Path stateMachineDir, @Nullable Path rockserverConfig,
 			Path target, boolean withoutDamagedSnapshot) throws IOException {
+		// One form of every path for every step below (R34 review 2): the normalized one, which open() uses for dbDir.
+		// The OS would resolve /x/link/.. to the link's parent's parent instead, and the "No database in" check, the
+		// lock, the refusal and the open would then look at different directories.
+		dbDir = dbDir.toAbsolutePath().normalize();
+		stateMachineDir = stateMachineDir == null ? null : stateMachineDir.toAbsolutePath().normalize();
 		target = target.toAbsolutePath().normalize();
 		refuseTargetAmongNodeDirectories(dbDir, stateMachineDir, target);
 		// NOFOLLOW_LINKS: a symbolic link to nothing is refused too, as the copy would be written where it points (R34-2).
 		if (Files.exists(target, LinkOption.NOFOLLOW_LINKS)) {
 			throw new IOException("The target " + target + " already exists");
+		}
+		// The checkpoint builds in <target>.tmp: one that exists is not this run's, and stays (R34 review 3).
+		Path building = target.resolveSibling(target.getFileName() + ".tmp");
+		if (Files.exists(building, LinkOption.NOFOLLOW_LINKS)) {
+			throw new IOException("The target's temporary directory " + building + " already exists: remove it or choose"
+					+ " another target");
 		}
 		// R33-1: a restore that a crash interrupted during its swap may have left no db/ (between its two renames, or
 		// before the parent's fsync), with the complete newer database in <db>.restore-ready: the open below finishes
@@ -971,7 +982,7 @@ final class NodeStore implements Closeable {
 				&& !Files.isRegularFile(RestoreDirs.of(dbDir).ready.resolve("CURRENT"))) {
 			throw new IOException("No database in " + dbDir);
 		}
-		Path groupDir = stateMachineDir == null ? null : stateMachineDir.toAbsolutePath().normalize().getParent();
+		Path groupDir = stateMachineDir == null ? null : stateMachineDir.getParent();
 		if (groupDir == null || !Files.isDirectory(groupDir)) {
 			return exportSeedStopped(dbDir, stateMachineDir, rockserverConfig, target, withoutDamagedSnapshot);
 		}
@@ -994,18 +1005,19 @@ final class NodeStore implements Closeable {
 	 * deletes first) would be, contain or lie inside a directory of the node being exported: {@code dbDir}, its restore
 	 * directories ({@code <db>.restore-tmp}, {@code -ready}, {@code -old}) and, when {@code stateMachineDir} is given,
 	 * the node's Raft directory ({@code raft/}, the parent of its group directory). Paths are compared by their real
-	 * paths, so a symbolic link to one of them is refused too; a path that does not exist is compared as its nearest
-	 * existing ancestor's real path plus the rest (R34-2). Before, with no {@code db/} and a complete
+	 * paths, so a symbolic link to one of them is refused too, also a dangling one (R34 review 1: every link to a
+	 * missing {@code db/} is); the part of a path that does not exist is compared as it is written (R34-2). The
+	 * caller passes the normalized paths that every later step uses (R34 review 2). Before, with no {@code db/} and a complete
 	 * {@code <db>.restore-ready} (R33-1), {@code --target DATA-DIR/db} passed every check: the open swapped the ready
 	 * database into {@code db/} and deleted {@code <db>.restore-old}, the checkpoint failed as its target existed, and
 	 * the failure cleanup deleted {@code db/}, the node's only complete database.
 	 */
 	private static void refuseTargetAmongNodeDirectories(Path dbDir, @Nullable Path stateMachineDir, Path target)
 			throws IOException {
-		var dirs = RestoreDirs.of(dbDir.toAbsolutePath().normalize());
+		var dirs = RestoreDirs.of(dbDir);
 		var nodeDirs = new ArrayList<>(List.of(dirs.dbDir, dirs.building, dirs.ready, dirs.old));
 		if (stateMachineDir != null) {
-			Path groupDir = stateMachineDir.toAbsolutePath().normalize().getParent();
+			Path groupDir = stateMachineDir.getParent();
 			if (groupDir != null) {
 				nodeDirs.add(groupDir.getParent() != null ? groupDir.getParent() : groupDir);
 			}
@@ -1025,27 +1037,52 @@ final class NodeStore implements Closeable {
 	}
 
 	/**
-	 * The real path of {@code path} when it exists; otherwise the real path of its nearest existing ancestor with the
-	 * rest of {@code path} appended. A symbolic link to nothing counts as existing, and is taken as it is.
+	 * The path the OS would reach for {@code path}, with every symbolic link resolved, dangling ones too (R34 review 1:
+	 * {@code toRealPath} of the nearest existing ancestor kept a link to a missing directory as a plain name, and
+	 * {@code /srv/link/seed}, with {@code link} pointing to the missing {@code DATA-DIR/db}, passed the refusal). It
+	 * walks the path a name at a time: a link is replaced by its target (relative to the link's directory), {@code ..}
+	 * goes to the parent of the resolved directory, as the OS does; names that do not exist are kept as they are.
 	 */
-	private static Path realPathOf(Path path) throws IOException {
-		Path absolute = path.toAbsolutePath().normalize();
-		Path existing = absolute;
-		while (existing != null && !Files.exists(existing, LinkOption.NOFOLLOW_LINKS)) {
-			existing = existing.getParent();
+	static Path realPathOf(Path path) throws IOException {
+		Path absolute = path.toAbsolutePath();
+		Path real = absolute.getRoot();
+		var rest = new java.util.ArrayDeque<String>();
+		for (Path name : absolute) {
+			rest.addLast(name.toString());
 		}
-		if (existing == null) {
-			return absolute;
+		int links = 0;
+		while (!rest.isEmpty()) {
+			String name = rest.removeFirst();
+			if (name.isEmpty() || name.equals(".")) {
+				continue;
+			}
+			if (name.equals("..")) {
+				if (real.getParent() != null) {
+					real = real.getParent();
+				}
+				continue;
+			}
+			Path next = real.resolve(name);
+			if (Files.isSymbolicLink(next)) {
+				if (++links > 40) {
+					throw new IOException("Too many levels of symbolic links in " + path);
+				}
+				Path linked = Files.readSymbolicLink(next);
+				var names = new ArrayList<String>();
+				for (Path linkedName : linked) {
+					names.add(linkedName.toString());
+				}
+				for (int i = names.size() - 1; i >= 0; i--) {
+					rest.addFirst(names.get(i));
+				}
+				if (linked.isAbsolute()) {
+					real = linked.getRoot();
+				}
+				continue;
+			}
+			real = next;
 		}
-		Path real;
-		if (Files.exists(existing)) {
-			real = existing.toRealPath();
-		} else {
-			Path parent = existing.getParent();
-			real = parent == null ? existing : realPathOf(parent).resolve(existing.getFileName().toString());
-		}
-		String rest = existing.relativize(absolute).toString();
-		return rest.isEmpty() ? real : real.resolve(rest);
+		return real;
 	}
 
 	/** The lock on {@code channel}'s file, or null when another process or a channel of this one holds it. */
@@ -1133,7 +1170,7 @@ final class NodeStore implements Closeable {
 				throw ReplicatedNode.NewerVersionException.of(version, unknown);
 			}
 			clusterId = store.clusterId();
-			applied = store.checkpoint(target);
+			applied = store.checkpoint(target, false);
 			created.set(true);
 		} finally {
 			// A no-op when restoreSnapshotIfAhead failed after closing it.
@@ -1230,14 +1267,27 @@ final class NodeStore implements Closeable {
 		return checkpoint(target, true);
 	}
 
+	/**
+	 * {@link #checkpoint(Path)}; with {@code replaceLeftover} false, a {@code <target>.tmp} that exists is not deleted
+	 * but fails the call ({@link java.nio.file.FileAlreadyExistsException}), as this call creates it atomically before
+	 * building in it: the export of a seed into an operator's directory deletes only what it made (R34 review 3). The
+	 * snapshot and backup callers pass true: they build inside a directory of their own, where a leftover is theirs.
+	 */
 	TermIndex checkpoint(Path target, boolean replaceLeftover) throws IOException {
 		target = target.toAbsolutePath();
 		if (Files.exists(target)) {
 			throw new IOException("Checkpoint target already exists: " + target);
 		}
 		Path building = target.resolveSibling(target.getFileName() + ".tmp");
-		deleteRecursively(building);
+		if (replaceLeftover) {
+			deleteRecursively(building);
+		}
 		TermIndex applied = applied();
+		if (!replaceLeftover) {
+			Files.createDirectories(building.getParent());
+			// Before the try: one that exists is not this call's, and the cleanup below must not delete it.
+			Files.createDirectory(building);
+		}
 		try {
 			Files.createDirectories(building);
 			RocksDB rocksDB = db().getDb().get();
