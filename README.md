@@ -247,7 +247,8 @@ changes one voter per command and refuses more (a change of several voters at on
 leader changes meanwhile): replace a lost node with `remove-peer <old>` and then `add-peer <new>`, a running one with
 `add-peer <new>` and then `remove-peer <old>`. The `--peer` addresses of the members that stay are written into the
 new configuration, so `admin` refuses one that differs from the leader's configuration (a mistyped port) unless
-`--change-addresses` asks for it. See "Replacing a node" in the
+`--change-addresses` asks for it; to move a member to another address, replace it under a new id (its old id can come
+back only wiped and started with `--join`, as any removed node). See "Replacing a node" in the
 [runbooks](docs/distributed/runbooks.md) and the [design document](docs/distributed/design.md). Run every replicated node with `-XX:+ExitOnOutOfMemoryError` (it refuses to start
 without it) and preferably without `-Djava.io.tmpdir` (`run` extracts the RocksDB library into `DATA-DIR/tmp`, where
 it deletes the copies that killed runs leave, in either case), and see "Heap" there for the heap that a snapshot send

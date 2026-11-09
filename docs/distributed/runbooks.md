@@ -275,8 +275,14 @@ with exit code 1 and before they propose anything, a `--peer` address of a membe
 address in the leader's configuration: `FAILED: refused: --peer gives members that stay another address than the
 leader's configuration: n3 (at 10.0.0.3:9001 in the configuration, 10.0.0.3:9010 in --peer)`. Addresses are compared
 as written, so `localhost:9001` is not `127.0.0.1:9001`. Fix `--peer` to the addresses the refusal names as those of
-the configuration. To move a member to another address, remove it and add it again, one voter per call as in
-"Replacing a node": the member that moves is the one removed or added, never one that stays. Only when the
+the configuration. To move a member to another address, replace it as in "Replacing a node" (the old node runs: a
+move): start a node under a new id at the new address, with an empty data directory and `--join`, `add-peer` it,
+then `remove-peer` the old id. The member that moves is the one added or removed, never one that stays. Keeping its
+id is possible only as for any removed node ("Removed node"): `remove-peer` it, stop it and take it out of its
+supervisor, wipe its data directory, start it at the new address with `--join` (its own `--peer` entry giving that
+address), then `add-peer` it with that address. Started again with its old data it exits 4 or waits outside the
+cluster, and `add-peer` refuses a node that has a log of its own; until the `add-peer` ends the cluster has one
+voter fewer. Only when the
 configuration itself holds a wrong address of a member that stays (written by an `admin` without this check, say),
 pass `--change-addresses` to an `add-peer` or `remove-peer` call whose `--peer` gives the right one: it prints
 `--change-addresses: this change also moves ...` and writes the `--peer` addresses.
