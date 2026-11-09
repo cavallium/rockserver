@@ -135,7 +135,9 @@ Failure branches:
   node prints the index its copy holds; pick the highest. It refuses a node that runs (exit 1, `Not exported:
   .../raft/<group>/in_use.lock is locked: stop the node first.`, the message of `repair-log`), also one that is
   installing a snapshot with `db/` closed, before it touches anything of the node. A node that crashed while installing a snapshot can have
-  `db/` behind that snapshot: `export-seed` verifies the snapshot and restores it into `db/` first, as a start of the
+  no `db/` at all, its complete new database in `db.restore-ready` (a crash in the middle of swapping it in):
+  `export-seed` finishes the swap, as a start of the node would, and exports that database; it prints `No database in
+  .../db` only when neither `db/` nor `db.restore-ready` holds one. It can also have `db/` behind that snapshot: `export-seed` verifies the snapshot and restores it into `db/` first, as a start of the
   node would, and its output then says `its database was behind its snapshot at index N, restored first`. If the
   crash damaged that snapshot, `export-seed` exits 1 with `Not exported: The replica's latest snapshot ... (at index N)
   is damaged`, the database's index, and writes nothing: that replica may have applied entries up to N that its `db/`

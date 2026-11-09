@@ -883,8 +883,9 @@ final class NodeStore implements Closeable {
 	 * new cluster, the last resort of "No quorum" in the design document: a checkpoint of what the replica holds (its
 	 * flushed state plus what its RocksDB WAL replays), without the replication metadata ({@link #META_COLUMN}: the
 	 * cluster id, the applied position, results and sessions), whose cluster id would make every node of a new cluster
-	 * refuse it. The source is opened as a replica, which also finishes a restore that a crash interrupted; it must not
-	 * run, which this form cannot check (the command uses {@link #exportSeed(Path, Path, Path, Path, boolean)}, which
+	 * refuse it. The source is opened as a replica, which also finishes a restore that a crash interrupted, also one
+	 * that left no {@code dbDir} but its complete {@code <db>.restore-ready} (a crash between the swap's two renames,
+	 * R33-1); it must not run, which this form cannot check (the command uses {@link #exportSeed(Path, Path, Path, Path, boolean)}, which
 	 * checks the node's Raft lock, R32-5). Table files are hard-linked when {@code target} is on the same file system. This form ignores the Raft
 	 * snapshots: the command passes them, see {@link #exportSeed(Path, Path, Path, Path)} (R31-2).
 	 *
@@ -922,6 +923,11 @@ final class NodeStore implements Closeable {
 	 * snapshot with {@code db/} closed and so without RocksDB's LOCK, and the open would otherwise finish or delete the
 	 * restore directories it is building ({@link #open} recovers them before RocksDB locks the database).</p>
 	 *
+	 * <p>A missing {@code dbDir} is accepted when {@code <db>.restore-ready} holds a database (its {@code CURRENT},
+	 * R33-1 and its review): a crash during a restore's swap left the complete new database there, and the open, under
+	 * the lock, swaps it in as the node's start would. With neither {@code dbDir/CURRENT} nor
+	 * {@code <db>.restore-ready/CURRENT}, it throws "No database in" before anything is touched.</p>
+	 *
 	 * @throws NodeRunningException if the node holds its group's lock: nothing of the node is touched, nothing written
 	 */
 	static ExportedSeed exportSeed(Path dbDir, @Nullable Path stateMachineDir, @Nullable Path rockserverConfig,
@@ -930,7 +936,13 @@ final class NodeStore implements Closeable {
 		if (Files.exists(target)) {
 			throw new IOException("The target " + target + " already exists");
 		}
-		if (!Files.isRegularFile(dbDir.resolve("CURRENT"))) {
+		// R33-1: a restore that a crash interrupted during its swap may have left no db/ (between its two renames, or
+		// before the parent's fsync), with the complete newer database in <db>.restore-ready: the open below finishes
+		// the swap, under the group's lock, as a start of the node would. Only read here: nothing is touched yet. The
+		// ready directory must hold a database (its CURRENT, R33 review): one without it is not accepted, as the open
+		// would swap it in, delete <db>.restore-old (then the only complete copy) and create an empty database.
+		if (!Files.isRegularFile(dbDir.resolve("CURRENT"))
+				&& !Files.isRegularFile(RestoreDirs.of(dbDir).ready.resolve("CURRENT"))) {
 			throw new IOException("No database in " + dbDir);
 		}
 		Path groupDir = stateMachineDir == null ? null : stateMachineDir.toAbsolutePath().normalize().getParent();
