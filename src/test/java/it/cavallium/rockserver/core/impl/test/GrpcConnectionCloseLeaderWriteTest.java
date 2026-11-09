@@ -2,6 +2,7 @@ package it.cavallium.rockserver.core.impl.test;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.google.protobuf.Empty;
@@ -34,6 +35,7 @@ import java.time.Duration;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
@@ -56,6 +58,8 @@ class GrpcConnectionCloseLeaderWriteTest {
 
 	/** The address both nodes name as the leader. */
 	private final AtomicReference<String> leader = new AtomicReference<>();
+	/** Calls that reached either node, of any method. */
+	private final AtomicInteger served = new AtomicInteger();
 	private Node a;
 	private Node b;
 	private Thread closing;
@@ -82,6 +86,7 @@ class GrpcConnectionCloseLeaderWriteTest {
 		@Override
 		public <Q, R> ServerCall.Listener<Q> interceptCall(ServerCall<Q, R> call, Metadata headers,
 				ServerCallHandler<Q, R> next) {
+			served.incrementAndGet();
 			return next.startCall(new ForwardingServerCall.SimpleForwardingServerCall<>(call) {
 				private volatile boolean headersSent;
 
@@ -198,6 +203,53 @@ class GrpcConnectionCloseLeaderWriteTest {
 		closing.join(TimeUnit.SECONDS.toMillis(20));
 		assertTrue(!closing.isAlive(), "close() did not end after the write in flight was answered");
 		assertEquals(1, b.service.puts.get(), "the write was sent again");
+	}
+
+	/**
+	 * Review of R51, 1: while the close waits for a numbered write in flight, it takes no new call, numbered or not, on
+	 * either channel, as before R51-3, when it began the graceful shutdown at once.
+	 */
+	@Test
+	void theCloseTakesNoNewCallWhileItWaitsForANumberedWrite() throws Exception {
+		a = new Node();
+		b = new Node();
+		leader.set(b.address());
+		var client = GrpcConnection.forHostsAndPorts("close-leader-write-new-calls",
+				List.of(new HostAndPort("127.0.0.1", a.server.getPort()),
+						new HostAndPort("127.0.0.1", b.server.getPort())));
+		var api = client.getAsyncApi(RequestContext.batch());
+		long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(20);
+		while (b.service.columnIdCalls.get() == 0 && System.nanoTime() < deadline) {
+			assertEquals(73L, api.getColumnIdAsync("find-the-leader").get(5, TimeUnit.SECONDS));
+			Thread.sleep(10);
+		}
+		assertTrue(b.service.columnIdCalls.get() > 0, "the leader's channel to b never served a call");
+
+		var held = client.getAsyncApi(RequestContext.latency(Duration.ofSeconds(30)))
+				.putAsync(0, 1, new Keys(Buf.wrap(new byte[] {1})), Buf.wrap(new byte[] {1}), RequestType.none());
+		assertTrue(b.service.firstPut.await(10, TimeUnit.SECONDS), "the write did not reach the leader b");
+
+		closing = Thread.ofPlatform().name("closing").start(client::close);
+		long until = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(300);
+		while (System.nanoTime() < until) {
+			Thread.sleep(10);
+		}
+		assertTrue(closing.isAlive(), "close() did not wait for the numbered write in flight");
+		int before = served.get();
+		// A call the leader serves, and a point read that stays on the ordinary channel.
+		var leaderCall = api.getColumnIdAsync("after-close");
+		var ordinaryCall = api.getAsync(0, 1, new Keys(Buf.wrap(new byte[] {2})), RequestType.current());
+		assertThrows(ExecutionException.class, () -> leaderCall.get(10, TimeUnit.SECONDS),
+				"a call to the leader was taken while the close waited");
+		assertThrows(ExecutionException.class, () -> ordinaryCall.get(10, TimeUnit.SECONDS),
+				"a call on the ordinary channel was taken while the close waited");
+		assertEquals(before, served.get(), "a call started after the close began reached a node");
+		assertTrue(!held.isDone(), () -> "the write in flight ended: " + outcome(held));
+
+		b.service.release.complete(Empty.getDefaultInstance());
+		assertNull(held.get(10, TimeUnit.SECONDS));
+		closing.join(TimeUnit.SECONDS.toMillis(20));
+		assertTrue(!closing.isAlive(), "close() did not end after the write in flight was answered");
 	}
 
 	private static String outcome(CompletableFuture<?> future) {
