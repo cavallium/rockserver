@@ -36,7 +36,7 @@ import org.slf4j.LoggerFactory;
  *
  * <p>Layout, under the Ratis state machine directory: {@code snapshots/} ({@link #getSnapshotDir()}) holds one
  * directory per snapshot, {@code snapshot-<term>-<index>/}, with {@code db/} (the checkpoint) and
- * {@code snapshot.properties} (term, index). New snapshots are built in {@code tmp/} and renamed into
+ * {@code snapshot.properties} (term, index, and from R51-2 the size of every file of the checkpoint). New snapshots are built in {@code tmp/} and renamed into
  * {@code snapshots/} once complete and fsynced. The latest snapshot is the usable one with the highest
  * position.</p>
  *
@@ -55,7 +55,9 @@ import org.slf4j.LoggerFactory;
  * deleted when the server starts, soon after a newer installation starts writing (installations on one follower
  * never overlap, a new one invalidates the older ones), and once their files did not change for
  * {@link #INSTALL_ABANDONED_AFTER}. The node's install cleanup thread looks for them ({@link #discardFailedInstalls});
- * {@link #getLatestSnapshot()}, which Ratis calls under its locks, never does.</p>
+ * {@link #getLatestSnapshot()}, which Ratis calls under its locks, never does. After a crash during the swap, the old
+ * snapshots moved aside are used only if the new ones are missing or damaged, and only those whose checkpoint is
+ * complete: Ratis deletes the aside file by file, so a crash during that delete leaves it partial (R51-2).</p>
  *
  * <p>Ratis saves a {@code <file>.md5} next to every received file but syncs nothing, so an installed snapshot is
  * used only once each file matches its saved digest; it is then fsynced and marked as verified. A snapshot that

@@ -148,7 +148,10 @@ import org.rocksdb.NativeLibraryLoader;
  * <p>{@code add-peer} and {@code remove-peer} build the new voters from {@code --peer} (plus or minus the one node), read
  * the leader's configuration (waiting while a change is under way), and refuse with exit code 1, before proposing
  * anything, a change of more than one voter ({@link VoterChange}): with Ratis 3.3.1 a leader elected during such a
- * change commits with the new voters alone, which can lose committed entries. They send the change as a compare-and-set
+ * change commits with the new voters alone, which can lose committed entries. They also refuse a {@code --peer}
+ * address of a member that stays that differs from its address in that configuration (R51-1,
+ * {@link VoterChange#addressChanges}), since the new configuration is written from {@code --peer} and a wrong address
+ * shows only once the nodes restart; {@value #CHANGE_ADDRESSES} writes such addresses instead. They send the change as a compare-and-set
  * against the configuration they read, and read it again if another change came first. The leader checks the same
  * ({@link MembershipGuard}), also for older {@code admin} versions and other Ratis clients, once every node that can
  * lead runs this version (a leader of an older version, during a rolling upgrade, does not). A refusal of Ratis' own

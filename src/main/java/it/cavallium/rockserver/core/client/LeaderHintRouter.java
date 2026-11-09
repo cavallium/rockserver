@@ -619,7 +619,8 @@ final class LeaderHintRouter implements AutoCloseable {
 	 * can still tell its caller, instead of running on after the connection closed. A replayable read failed this way
 	 * is not sent again on the ordinary channel (review of R49, 1): its caller gets the {@code UNAVAILABLE}. Waits up
 	 * to 5 s in all for the channels to terminate. A retired channel is never forced before this (R46-1): its calls end
-	 * as they do.
+	 * as they do. {@code GrpcConnection.close()} lets the numbered writes in flight on these channels end first (R51-3),
+	 * so that the forcing does not cut them.
 	 */
 	@Override
 	public void close() {
