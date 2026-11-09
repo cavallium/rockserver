@@ -142,7 +142,8 @@ final class Proposer implements Closeable {
 	 * Bytes of attempts one node has in flight at once. Ratis' pending-request byte limit on the leader
 	 * ({@link RaftSettings}) is a multiple of this, so that the leader's own attempts never reach it, nor those of
 	 * all the nodes of a cluster of up to {@link RaftSettings#NODES_UNDER_PENDING_LIMIT} nodes. At least one entry of
-	 * the largest size must fit.
+	 * the largest size must fit, and one that is refused gets in ahead of later attempts that would leave it no room
+	 * (R50-1, see {@link ByteAdmission}).
 	 */
 	static final long ATTEMPT_BYTES_IN_FLIGHT = 2L * RaftSettings.MAX_ENTRY_BYTES;
 
@@ -803,7 +804,13 @@ final class Proposer implements Closeable {
 		 * transaction commits. An attempt that does not fit is not sent: it is refused before the append by this
 		 * node's own decision, and sent again after {@link #NOT_READY_RETRY_MS}, data writes as the same batch,
 		 * commits back through the queue. A local attempt keeps its permit until Ratis answers it, not only until
-		 * this node stops waiting: the entry stays pending in Ratis until then.
+		 * this node stops waiting: the entry stays pending in Ratis until then. A refused attempt asks again under
+		 * the name of its batch (data writes: the batch; commits: its first commit), so the oldest one reserves its
+		 * bytes until it gets in (R50-1): in a saturated lane the bytes a finished batch frees would otherwise go to
+		 * the batch dispatched right after it, and an attempt larger than one release, up to
+		 * {@link RaftSettings#MAX_ENTRY_BYTES} against batches of up to {@link #MAX_BATCH_BYTES}, could be refused
+		 * until its deadline. A batch that stops sending gives its reservation up; one of commits that leaves the queue
+		 * otherwise lets it lapse ({@link ByteAdmission#RESERVATION_NANOS}).
 		 */
 		final ByteAdmission permits = new ByteAdmission(ATTEMPT_BYTES_IN_FLIGHT);
 		/** Guarded by this. */
@@ -1127,26 +1134,26 @@ final class Proposer implements Closeable {
 					CompletableFuture<RaftClientReply> submitted;
 					try {
 						submitted = CompletableFuture.supplyAsync(
-								() -> submitLocal(message, local, callId, deadlineNanos, permits), submitter)
+								() -> submitLocal(message, local, callId, deadlineNanos, permits, batch), submitter)
 								.thenCompose(Function.identity());
 					} catch (RejectedExecutionException stopping) {
 						submitted = CompletableFuture.failedFuture(stopping);
 					}
 					reply = submitted;
 				} else {
-					reply = submitLocal(message, local, callId, deadlineNanos, permits);
+					reply = submitLocal(message, local, callId, deadlineNanos, permits, batch);
 				}
 			} else if (onSender) {
 				// Already on the sender: no second hand-off. Failures as supplyAsync would report them.
 				CompletableFuture<RaftClientReply> sent;
 				try {
-					sent = CompletableFuture.completedFuture(sendToLeader(message, callId, permits));
+					sent = CompletableFuture.completedFuture(sendToLeader(message, callId, permits, batch));
 				} catch (Throwable ex) {
 					sent = CompletableFuture.failedFuture(ex instanceof CompletionException ? ex : new CompletionException(ex));
 				}
 				reply = sent;
 			} else {
-				reply = CompletableFuture.supplyAsync(() -> sendToLeader(message, callId, permits), sender);
+				reply = CompletableFuture.supplyAsync(() -> sendToLeader(message, callId, permits, batch), sender);
 			}
 			reply.handleAsync((answer, error) -> {
 				var refusal = error != null ? stateMachineException(error)
@@ -1166,6 +1173,8 @@ final class Proposer implements Closeable {
 						// The resend itself must go out before the deadline, not only the decision to resend.
 						if (closed || System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(delay) - deadlineNanos >= 0) {
 							roundTrip.since(sentNanos);
+							// No more copies: a reservation of its permit bytes (R50-1) would only hold others back.
+							permits.cancel(batch);
 							endUnanswered(batch, deadlineNanos, nowAmbiguous, refusal, cause);
 							finished();
 							return null;
@@ -1174,6 +1183,7 @@ final class Proposer implements Closeable {
 						// recorded results.
 						resends.record(1);
 						Runnable end = () -> {
+							permits.cancel(batch);
 							try {
 								endUnanswered(batch, deadlineNanos, nowAmbiguous, refusal, cause);
 							} catch (Throwable unexpected) {
@@ -1194,6 +1204,7 @@ final class Proposer implements Closeable {
 								attempt(batch, message, local, callId, deadlineNanos, sentNanos, nowAmbiguous, viaSender);
 							} catch (Throwable unexpected) {
 								// The executor would keep it to itself. Earlier copies may have been appended.
+								permits.cancel(batch);
 								fail(batch, unavailable(unexpected));
 								finished();
 							}
@@ -1213,11 +1224,14 @@ final class Proposer implements Closeable {
 						return null;
 					}
 				} catch (Throwable unexpected) {
+					permits.cancel(batch);
 					fail(batch, unavailable(unexpected));
 					finished();
 					return null;
 				}
 				roundTrip.since(sentNanos);
+				// Answered: it got its permit, which ended a reservation it held; nothing of it waits any more.
+				permits.cancel(batch);
 				try {
 					if (refusal != null) {
 						for (var pending : batch) {
@@ -1289,8 +1303,12 @@ final class Proposer implements Closeable {
 		 */
 		private void sendCommits(List<Pending> batch, Message message, @Nullable List<Request> local, long callId,
 				long deadlineNanos, long sentNanos) {
-			submitLocal(message, local, callId, deadlineNanos, permits).handleAsync((answer, error) -> {
+			// The first commit names the attempts of these commits: one refused for want of a permit comes back first in the
+			// queue (retryLater), heads the next batch and asks again under the same name (R50-1).
+			var waiter = batch.getFirst();
+			submitLocal(message, local, callId, deadlineNanos, permits, waiter).handleAsync((answer, error) -> {
 				roundTrip.since(sentNanos);
+				boolean again = false;
 				try {
 					var refusal = error != null ? stateMachineException(error)
 							: !answer.isSuccess() && answer.getException() instanceof StateMachineException e ? e : null;
@@ -1326,6 +1344,7 @@ final class Proposer implements Closeable {
 					} else if (isBusyBeforeAppend(error != null ? ReplicatedConnection.unwrap(error)
 							: answer.isSuccess() ? null : answer.getException())) {
 						// Not appended, only no room yet: back through the queue, under the commits' own deadlines.
+						again = true;
 						retryLater(batch);
 					} else if (isRefusedBeforeAppend(error != null ? ReplicatedConnection.unwrap(error)
 							: answer.isSuccess() ? null : answer.getException())) {
@@ -1342,6 +1361,9 @@ final class Proposer implements Closeable {
 				} catch (Throwable unexpected) {
 					fail(batch, unavailable(unexpected));
 				} finally {
+					if (!again) {
+						permits.cancel(waiter);
+					}
 					finished();
 				}
 				return null;
@@ -1483,9 +1505,9 @@ final class Proposer implements Closeable {
 	 * starting a transaction (a refusal, or the retry cache).
 	 */
 	private CompletableFuture<RaftClientReply> submitLocal(Message message, @Nullable List<Request> local, long callId,
-			long deadlineNanos, ByteAdmission permits) {
+			long deadlineNanos, ByteAdmission permits, Object waiter) {
 		long weight = message.size();
-		if (!permits.tryAcquire(weight)) {
+		if (!permits.tryAcquire(weight, waiter)) {
 			return CompletableFuture.failedFuture(new NoPermitException(weight));
 		}
 		CompletableFuture<RaftClientReply> reply;
@@ -1527,7 +1549,7 @@ final class Proposer implements Closeable {
 	 * a new invocation. With no leader known (an election), nothing is sent: the attempt fails as refused before
 	 * the append.
 	 */
-	private RaftClientReply sendToLeader(Message message, long callId, ByteAdmission permits) {
+	private RaftClientReply sendToLeader(Message message, long callId, ByteAdmission permits, Object waiter) {
 		var rpc = client.getClientRpc();
 		RaftPeerId leader;
 		try {
@@ -1547,7 +1569,7 @@ final class Proposer implements Closeable {
 		// Per attempt: the remote leader's pending requests cannot be seen from here. Ratis' own refusal when its
 		// limit is full is recognized as before the append (see isRatisPendingLimit).
 		long weight = message.size();
-		if (!permits.tryAcquire(weight)) {
+		if (!permits.tryAcquire(weight, waiter)) {
 			throw new CompletionException(new NoPermitException(weight));
 		}
 		Object proxy = null;

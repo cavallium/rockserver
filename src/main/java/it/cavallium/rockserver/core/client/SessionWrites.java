@@ -289,10 +289,24 @@ final class SessionWrites {
 				"The connection is closed; the write was not sent");
 	}
 
-	/** Set by {@link #close}: nothing is sent or scheduled any more. */
+	/**
+	 * Set by {@link #closing} or {@link #close}: nothing is sent or scheduled any more. A copy already in flight still
+	 * gets its answer until {@link #close}.
+	 */
 	private volatile boolean closed;
 	/** Calls without their answer yet, which {@link #close} ends. */
 	private final Set<Call> live = ConcurrentHashMap.newKeySet();
+
+	/**
+	 * The connection starts to close (R50-3): from now on no copy is sent, neither of a new write, which fails flagged
+	 * not applied, nor a resend, which ends its write as {@link Call#failClosed}; a copy already in flight keeps its
+	 * answer, so that the channel's graceful shutdown can still drain it. Without it, a write started while the
+	 * channel shut down was sent to a channel that refused it locally ({@code UNAVAILABLE}), a lost call here, and
+	 * ended {@code OUTCOME_UNKNOWN} although nothing left the client.
+	 */
+	void closing() {
+		closed = true;
+	}
 
 	/**
 	 * Ends every call still waiting, as {@link Call#failClosed}: a call waiting for a resend or a session would

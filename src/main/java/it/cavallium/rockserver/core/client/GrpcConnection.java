@@ -323,6 +323,11 @@ public final class GrpcConnection extends BaseConnection {
 	@Override
 	public void close() {
 		var writes = sessionWrites;
+		if (writes != null) {
+			// Before the channel (R50-3): a numbered write started while it shuts down, which can take minutes, is not
+			// sent and fails not applied; copies already in flight still drain.
+			writes.closing();
+		}
 		try {
 			delegate.close();
 		} finally {
