@@ -971,6 +971,40 @@ class CommandLineTest {
 		assertEquals(5, restore.code(), restore.toString());
 		assertTrue(restore.out().startsWith("FAILED: ") && restore.out().contains("0x10000000000"), restore.out());
 		assertTrue(Files.notExists(target.resolve("db")));
+
+		// R36-3: "nothing is written", also with the old cluster's results in the data directory: they stay in place.
+		Files.writeString(target.resolve("replica-ops.log"), "old cluster\n");
+		Files.createDirectories(target.resolve(ReplicaOps.BACKUPS_DIR).resolve("old"));
+		var again = run("restore-backup", "--backup", backup.toString(), "--data-dir", target.toString());
+		assertEquals(5, again.code(), again.toString());
+		try (var entries = Files.list(target)) {
+			assertEquals(List.of("backups", "replica-ops.log"),
+					entries.map(path -> path.getFileName().toString()).sorted().toList());
+		}
+	}
+
+	/**
+	 * R36-1/R36-2: {@code restore-backup --backup DATA-DIR/backups/<name>}, the backup the node itself wrote, restores
+	 * and prints OK. Since R35-2 the command renamed {@code backups/} before reading the backup and failed with
+	 * {@code NoSuchFileException}; at 52ea5e3 it worked.
+	 */
+	@Test
+	void restoreBackupFromTheDataDirectorysOwnBackupsDirectory() throws IOException {
+		Path source = temp.resolve("source");
+		NodeStoreTest.writeDatabaseOfVersion(source.resolve("db"), Capabilities.SUPPORTED);
+		Path dataDir = Files.createDirectories(temp.resolve("data"));
+		Path backup = dataDir.resolve(ReplicaOps.BACKUPS_DIR).resolve("2026-11-06");
+		try (var store = NodeStore.open(source.resolve("db"), null, "source")) {
+			store.checkpoint(backup.resolve(ReplicaOps.BACKUP_DB_DIR));
+		}
+		Files.writeString(backup.resolve(ReplicaOps.BACKUP_PROPERTIES), "name=b\nindex=7\ncluster=c\n");
+
+		var restore = run("restore-backup", "--backup", backup.toString(), "--data-dir", dataDir.toString());
+
+		assertEquals(0, restore.code(), restore.toString());
+		assertTrue(restore.out().startsWith("OK: "), restore.out());
+		assertTrue(Files.isRegularFile(dataDir.resolve("db").resolve("CURRENT")));
+		assertTrue(Files.notExists(dataDir.resolve(ReplicaOps.BACKUPS_DIR)));
 	}
 
 	/**
