@@ -1034,19 +1034,9 @@ class NodeStoreTest {
 		Files.writeString(dataDir.resolve("replica-ops.log"), "old cluster\n");
 		Files.createDirectories(dataDir.resolve(ReplicaOps.BACKUPS_DIR).resolve("nightly-1"));
 		Path absolute = dataDir.toAbsolutePath().normalize();
-		var observed = new java.util.concurrent.ConcurrentLinkedQueue<String>();
-		NodeStore.syncedForTesting = path -> {
-			if (path.equals(absolute)) {
-				observed.add((Files.exists(absolute.resolve("replica-ops.log")) ? "log " : "")
-						+ (Files.exists(absolute.resolve(ReplicaOps.BACKUPS_DIR)) ? "backups " : "")
-						+ (Files.exists(absolute.resolve("db")) ? "db" : "no db"));
-			}
-		};
-		try {
-			ReplicaOps.restore(backupDir, dataDir, null);
-		} finally {
-			NodeStore.syncedForTesting = null;
-		}
+		var observed = dataDirStatesAtEachFsync(absolute, () -> ReplicaOps.restore(backupDir, dataDir, null));
+		// The first fsync of the data directory is moveOldResultsAside's own: it comes before NodeStore.restore makes
+		// any db.restore-* entry, whose later fsync of the data directory would otherwise be the first (R35 review 1).
 		assertEquals("no db", observed.peek(), "fsyncs of the data directory: " + observed);
 		assertTrue(observed.stream().noneMatch(state -> state.contains("log") || state.contains("backups")),
 				"fsyncs of the data directory: " + observed);
@@ -1078,6 +1068,53 @@ class NodeStoreTest {
 
 		assertEquals(TermIndex.valueOf(1, 10), ReplicaOps.restore(backupDir, dataDir, null));
 		assertFalse(Files.exists(dataDir.resolve("replica-ops.log")));
+	}
+
+	/**
+	 * R35 review 2: a rerun of a {@code restore-backup} killed after its renames and before their fsync finds nothing
+	 * to rename, and still fsyncs the data directory before the database is restored: the renames it inherits are
+	 * durable by its own fsync, not only by {@link NodeStore#restore}'s later one. Before, the fsync ran only if
+	 * something moved, and the first fsync of the data directory came after {@code db.restore-ready} existed.
+	 */
+	@Test
+	void restoreBackupFsyncsTheDataDirectoryBeforeTheDatabaseEvenWithNothingToMove() throws IOException {
+		Path backupDir = tempDir.resolve("backup");
+		checkpointWithData(backupDir.resolve(ReplicaOps.BACKUP_DB_DIR), 10, TermIndex.valueOf(1, 10));
+		Files.writeString(backupDir.resolve(ReplicaOps.BACKUP_PROPERTIES), "name=b\nindex=10\ncluster=c\n");
+		Path dataDir = Files.createDirectories(tempDir.resolve("data"));
+		// What the killed run left: the renames done, possibly not yet durable.
+		Files.writeString(dataDir.resolve("replica-ops.log.before-restore-1"), "old cluster\n");
+		Path absolute = dataDir.toAbsolutePath().normalize();
+		var observed = dataDirStatesAtEachFsync(absolute, () -> ReplicaOps.restore(backupDir, dataDir, null));
+		assertEquals("no db", observed.peek(), "fsyncs of the data directory: " + observed);
+	}
+
+	/**
+	 * What {@code dataDir} holds at each of its fsyncs during {@code action}: {@code log} and {@code backups} for the old
+	 * results in place, {@code restore} for any {@code db.restore-*} entry, then {@code db} or {@code no db}.
+	 */
+	private static java.util.Queue<String> dataDirStatesAtEachFsync(Path dataDir, IoAction action) throws IOException {
+		var observed = new java.util.concurrent.ConcurrentLinkedQueue<String>();
+		NodeStore.syncedForTesting = path -> {
+			if (path.equals(dataDir)) {
+				boolean restoreEntry;
+				try (Stream<Path> list = Files.list(dataDir)) {
+					restoreEntry = list.anyMatch(entry -> entry.getFileName().toString().startsWith("db.restore-"));
+				} catch (IOException e) {
+					throw new java.io.UncheckedIOException(e);
+				}
+				observed.add((Files.exists(dataDir.resolve("replica-ops.log")) ? "log " : "")
+						+ (Files.exists(dataDir.resolve(ReplicaOps.BACKUPS_DIR)) ? "backups " : "")
+						+ (restoreEntry ? "restore " : "")
+						+ (Files.exists(dataDir.resolve("db")) ? "db" : "no db"));
+			}
+		};
+		try {
+			action.run();
+		} finally {
+			NodeStore.syncedForTesting = null;
+		}
+		return observed;
 	}
 
 	@FunctionalInterface
