@@ -7,6 +7,7 @@ import it.cavallium.rockserver.core.common.Keys;
 import it.cavallium.rockserver.core.common.RangeBudget;
 import it.cavallium.rockserver.core.common.RequestType;
 import it.cavallium.rockserver.core.common.RocksDBException;
+import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
 import it.cavallium.rockserver.core.common.WorkloadProfile;
 import it.cavallium.rockserver.core.impl.EmbeddedDB;
 import java.io.IOException;
@@ -1106,7 +1107,27 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 					+ Capabilities.describe(clusterVersion) + " (the leader raises it within about 10 s of the last"
 					+ " member's upgrade, and a member that lags behind the leader applies it later)");
 		}
-		return proposer.propose(entry).thenApply(index -> ByteBuffer.allocate(Long.BYTES).putLong((Long) index).array());
+		return proposer.propose(entry)
+				.<byte[]>thenApply(index -> ByteBuffer.allocate(Long.BYTES).putLong((Long) index).array())
+				.exceptionallyCompose(error -> CompletableFuture.failedFuture(notAppliedAsStatus(error)));
+	}
+
+	/**
+	 * R39 review 1: a proposal that the proposer refused as not applied ({@link RocksDBException#isNotApplied()}: no
+	 * leader accepted it in time, a full write admission, a deadline before it was sent) becomes UNAVAILABLE, which
+	 * {@code admin} reads as nothing proposed ({@link ReplicatedServerMain#notProposed}): so a backup that no leader
+	 * accepted does not end with "it may have been proposed", and a checksum is asked of the next member. One that
+	 * could not be encoded becomes INVALID_ARGUMENT, a refusal. Any other failure is left as it is, and the ops
+	 * service turns it into ABORTED: it does not tell whether the entry was appended.
+	 */
+	static Throwable notAppliedAsStatus(Throwable error) {
+		var cause = ReplicatedConnection.unwrap(error);
+		if (!(cause instanceof RocksDBException rocks) || !rocks.isNotApplied()) {
+			return error;
+		}
+		var status = rocks.getErrorUniqueId() == RocksDBErrorType.INVALID_REQUEST ? Status.INVALID_ARGUMENT
+				: Status.UNAVAILABLE;
+		return status.withDescription(rocks.getMessage()).asRuntimeException();
 	}
 
 	private static CompletableFuture<byte[]> failed(Status status, String message) {

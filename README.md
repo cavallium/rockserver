@@ -252,7 +252,9 @@ needs. `admin status` asks the members at once and waits for their answers up to
 prints `unreachable` without holding the others (closing its connections may take about 5 s more after the output);
 `admin checksum` and `admin backup` ask the members at once and propose through one that answers (within 3 s, or the
 time left of `--timeout-ms`), then ask every member for its result at once within the time left, and
-exit with 4 ("incomplete, run it again") when no member took the request in time. A removed node that is started again exits
+exit with 4 ("incomplete, run it again") when no member took the request in time (a `backup` that a member took
+without answering in time also exits 4, but says it may have been proposed: check it with `backup-status`, see the
+runbooks). A removed node that is started again exits
 with 4 once a majority of the current configuration's members can confirm its removal; until they answer (they are
 down, unreachable, or of an older version) it prints `READY` and waits outside the cluster, serving nothing; it
 votes only when its own log missed its removal (then it runs as a follower, whose vote cannot elect a leader without

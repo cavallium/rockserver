@@ -913,6 +913,45 @@ class CommandLineTest {
 	}
 
 	/**
+	 * R39-1: a member that took a {@code backup} proposal and gave no answer within {@code --timeout-ms} (a leader whose
+	 * disk stalls: the entry may be appended and commit later) leaves open whether the backup is written. The command
+	 * still exits 4, but must not say "Nothing was proposed: run the command again": a rerun has a new request id and
+	 * is refused with "A backup named ... exists already" once the first one is applied. It names the member, the
+	 * request id and how to find the index for {@code backup-status}, or advises another name. When no member took the
+	 * request (a closed port), "Nothing was proposed" stays.
+	 */
+	@Test
+	void aBackupThatAMemberTookWithoutAnsweringMayHaveBeenProposed() throws Exception {
+		try (var hanging = new HangingMember()) {
+			var taken = run("admin", "--peer", hanging.peer("h1"), "--timeout-ms", "3000", "backup", "b9");
+			assertEquals(ReplicatedServerMain.EXIT_INCOMPLETE, taken.code(), taken.toString());
+			assertTrue(hanging.count(ReplicaOps.OP_PROPOSE_BACKUP) >= 1, taken.toString());
+			var sent = hanging.held.stream().filter(request -> request[0] == ReplicaOps.OP_PROPOSE_BACKUP).findFirst()
+					.orElseThrow();
+			long requestId = ByteBuffer.wrap(sent, 1, Long.BYTES).getLong();
+			assertTrue(taken.out().contains("FAILED: "), taken.toString());
+			assertTrue(!taken.out().contains("Nothing was proposed"), taken.toString());
+			assertTrue(taken.out().contains("h1 took the request"), taken.toString());
+			assertTrue(taken.out().contains("may have been proposed"), taken.toString());
+			assertTrue(taken.out().contains("request=" + requestId), taken.toString());
+			assertTrue(taken.out().contains("backup-status b9 <index>"), taken.toString());
+			assertTrue(taken.out().contains("another name"), taken.toString());
+			// R39 review 3: an answer of an earlier round is kept, and a missing one is not printed as "null".
+			assertTrue(!taken.out().contains("last answer null"), taken.toString());
+		}
+		int closedPort;
+		try (var probe = new java.net.ServerSocket(0)) {
+			closedPort = probe.getLocalPort();
+		}
+		var none = run("admin", "--peer", "d1=127.0.0.1:" + closedPort + "/127.0.0.1:" + closedPort,
+				"--timeout-ms", "2000", "backup", "b9");
+		assertEquals(ReplicatedServerMain.EXIT_INCOMPLETE, none.code(), none.toString());
+		assertTrue(none.out().contains("Nothing was proposed: run the command again"), none.toString());
+		assertTrue(!none.out().contains("may have been proposed"), none.toString());
+		assertTrue(!none.out().contains("last answer null"), none.toString());
+	}
+
+	/**
 	 * R29-4: a word that no command expects is wrong usage (exit 2), for every command: before, {@code run},
 	 * {@code repair-log}, {@code export-seed} and {@code restore-backup} ignored it, so a flag given a value
 	 * ({@code --dry-run yes}, {@code --join false}) turned the flag on, and {@code admin status} took any word after it.

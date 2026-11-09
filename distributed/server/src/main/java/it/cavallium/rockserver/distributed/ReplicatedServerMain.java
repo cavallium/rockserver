@@ -9,6 +9,7 @@ import java.nio.file.Path;
 import java.security.SecureRandom;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -83,7 +84,8 @@ import org.rocksdb.NativeLibraryLoader;
  * {@code <data-dir>/backups/NAME}; it prints where each member wrote it, and prints {@code OK} only if every member of
  * {@code --peer} wrote it; it exits with 1 if a member failed or gave an answer that cannot be read (a member of
  * another version), and with 4 if a member gave no result in time, or no
- * member took the request in time. Both ask the members at once and propose through one that answers, so that a
+ * member took the request in time, or one took it and gave no log index in time: then it says the backup may have
+ * been proposed, with its request id, instead of "Nothing was proposed" (R39-1). Both ask the members at once and propose through one that answers, so that a
  * frozen member listed first does not hold them (see {@code proposeOp}); a member that refuses by the cluster version
  * it has applied (it may lag behind the leader) proposed nothing, and the next member that answered is asked: only when
  * every member that answered refuses so do they exit with 1, naming each and its version (R32-4). They then ask every
@@ -687,7 +689,7 @@ public final class ReplicatedServerMain {
 						usage("checksum takes no argument");
 					}
 					// Not idempotent: proposed again only after an answer that says nothing was proposed.
-					long index = proposeOp(peers, groupId, ReplicaOps.OP_PROPOSE_CHECKSUM, new byte[0], false, deadline);
+					long index = proposeOp(peers, groupId, ReplicaOps.OP_PROPOSE_CHECKSUM, new byte[0], false, null, deadline);
 					System.out.println("checksum at log index " + index);
 					var answers = awaitResults(peers, groupId, ReplicaOps.OP_CHECKSUM_RESULT,
 							ByteBuffer.allocate(Long.BYTES).putLong(index).array(), deadline);
@@ -703,8 +705,14 @@ public final class ReplicatedServerMain {
 					}
 					// A request id makes it safe to propose again after an answer that was lost.
 					long requestId = new SecureRandom().nextLong() | 1;
+					// R39-1: what to do when a member took it and gave no answer in time, so that it may still be written.
+					var ifTaken = "Look on the members for <data-dir>/backups/" + name + "/backup.properties holding request="
+							+ requestId + " (its index= is the log index), or for \"backup " + name + " at log index\" in their"
+							+ " logs, and then run backup-status " + name + " <index>; or take the backup under another name: run"
+							+ " again with " + name + ", it is refused (\"A backup named " + name + " exists already\") once this"
+							+ " one is written";
 					long index = proposeOp(peers, groupId, ReplicaOps.OP_PROPOSE_BACKUP,
-							ReplicaOps.backupPayload(requestId, name), true, deadline);
+							ReplicaOps.backupPayload(requestId, name), true, ifTaken, deadline);
 					System.out.println("backup " + name + " at log index " + index);
 					yield awaitBackup(peers, groupId, name, index, deadline);
 				}
@@ -750,7 +758,14 @@ public final class ReplicatedServerMain {
 	 *
 	 * <p>Ends with {@link #EXIT_INCOMPLETE} (R28-2) when no member took the request within the time limit, or when the
 	 * answer of a non-idempotent one leaves open whether it was proposed: nothing was compared or written for sure, and
-	 * the command can be run again. Any other refusal (FAILED_PRECONDITION other than the one for the cluster version
+	 * the command can be run again. An idempotent one ({@code backup}) that a member took (it answered the capabilities
+	 * question, and its call then ended with a status other than {@link #notProposed}: cut by the time limit or by
+	 * {@link #proposalWait}, CANCELLED, UNKNOWN, INTERNAL; a proposer's not-applied refusal is UNAVAILABLE, see
+	 * {@link ReplicaOps#notAppliedAsStatus}) and that no member then answered with its log index in time
+	 * ends with {@link #EXIT_INCOMPLETE} too, but names those members and says that it may have been proposed and may
+	 * still be applied, followed by {@code ifTaken} (R39-1): a slow leader may have appended it, and a rerun has a new
+	 * request id, so a {@code backup} run again under the same name is refused once the first one is written.
+	 * "Nothing was proposed" is said only when no member took it. Any other refusal (FAILED_PRECONDITION other than the one for the cluster version
 	 * below, such as a backup name in the way; INVALID_ARGUMENT; UNIMPLEMENTED, an operation that member's version does
 	 * not know) ends the command at once with 1, without asking the next member.</p>
 	 *
@@ -767,10 +782,13 @@ public final class ReplicatedServerMain {
 	 * rather than asking again within the time limit (R32 review 2).</p>
 	 */
 	private static long proposeOp(List<PeerConfig> peers, RaftGroupId groupId, byte op, byte[] payload,
-			boolean idempotent, long deadlineNanos) throws InterruptedException {
+			boolean idempotent, @Nullable String ifTaken, long deadlineNanos) throws InterruptedException {
 		record Answer(PeerConfig peer, @Nullable String silence) {}
+		// The members that took the request without telling whether it was proposed (R39-1), over every round.
+		var took = new LinkedHashSet<String>();
+		// The last answer of any round (R39 review 3): the final round can end at the deadline before any answer.
+		String last = null;
 		while (true) {
-			String last = null;
 			int answering = 0;
 			var versionRefusals = new ArrayList<String>();
 			var answered = new LinkedBlockingQueue<Answer>();
@@ -813,6 +831,9 @@ public final class ReplicatedServerMain {
 								+ " was proposed: look for it in the logs of the members, or run the command again");
 					}
 					last = peer.id() + ": " + status;
+					if (!notProposed(status.getCode())) {
+						took.add(peer.id());
+					}
 				}
 			}
 			if (answering > 0 && versionRefusals.size() == answering) {
@@ -824,7 +845,14 @@ public final class ReplicatedServerMain {
 						+ " caught up. Otherwise upgrade every member first");
 			}
 			if (System.nanoTime() - deadlineNanos > 0) {
-				failIncomplete("no member took the request within the time limit (--timeout-ms); last answer " + last
+				var lastAnswer = last != null ? "; last answer " + last : "";
+				if (!took.isEmpty()) {
+					failIncomplete("no member answered with the log index of the request within the time limit"
+							+ " (--timeout-ms)" + lastAnswer + ". " + String.join(", ", took) + " took the request"
+							+ " and gave no answer in time: it may have been proposed, and may still be applied. "
+							+ (ifTaken != null ? ifTaken : "Look for it in the logs of the members"));
+				}
+				failIncomplete("no member took the request within the time limit (--timeout-ms)" + lastAnswer
 						+ ". Nothing was proposed: run the command again");
 			}
 			Thread.sleep(SEED_SNAPSHOT_POLL_MS);
