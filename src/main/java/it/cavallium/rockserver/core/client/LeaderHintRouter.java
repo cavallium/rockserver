@@ -210,7 +210,12 @@ final class LeaderHintRouter implements AutoCloseable {
 	 * leader's channel itself does not retry, so this happens at once. Other calls fail as on any lost connection.
 	 *
 	 * <p>Methods of a {@link ClientCall} come from one caller at a time, listener calls from one thread at a time; the
-	 * two may overlap, hence the lock.</p>
+	 * two may overlap (the listener runs on the channel's executor), hence the lock. Each caller method forwards to the
+	 * current call while it holds the lock, and a replay starts the new call and forwards what the caller did so far
+	 * while it holds it too, so that the caller's later operations reach the new call after those, never before its
+	 * start (R43-3). The lock is reentrant: a listener called back on the caller's own thread inside a forwarded method
+	 * (a channel that fails the call at once) replays there. Nothing that holds the lock waits for another thread: the
+	 * methods of a {@link ClientCall} do not block, and {@link #drop} runs outside it.</p>
 	 */
 	private final class LeaderCall<Q, R> extends ClientCall<Q, R> {
 
@@ -244,7 +249,6 @@ final class LeaderHintRouter implements AutoCloseable {
 
 		@Override
 		public void start(Listener<R> listener, Metadata headers) {
-			ClientCall<Q, R> call;
 			synchronized (callLock) {
 				this.listener = listener;
 				if (replayable) {
@@ -252,51 +256,42 @@ final class LeaderHintRouter implements AutoCloseable {
 					copy.merge(headers);
 					this.headers = copy;
 				}
-				call = current;
+				current.start(new LeaderListener(listener), headers);
 			}
-			call.start(new LeaderListener(listener), headers);
 		}
 
 		@Override
 		public void request(int numMessages) {
-			ClientCall<Q, R> call;
 			synchronized (callLock) {
 				requested += numMessages;
-				call = current;
+				current.request(numMessages);
 			}
-			call.request(numMessages);
 		}
 
 		@Override
 		public void cancel(@Nullable String message, @Nullable Throwable cause) {
-			ClientCall<Q, R> call;
 			synchronized (callLock) {
 				cancelled = true;
-				call = current;
+				current.cancel(message, cause);
 			}
-			call.cancel(message, cause);
 		}
 
 		@Override
 		public void halfClose() {
-			ClientCall<Q, R> call;
 			synchronized (callLock) {
 				halfClosed = true;
-				call = current;
+				current.halfClose();
 			}
-			call.halfClose();
 		}
 
 		@Override
 		public void sendMessage(Q message) {
-			ClientCall<Q, R> call;
 			synchronized (callLock) {
 				if (replayable) {
 					sent.add(message);
 				}
-				call = current;
+				current.sendMessage(message);
 			}
-			call.sendMessage(message);
 		}
 
 		@Override
@@ -325,36 +320,30 @@ final class LeaderHintRouter implements AutoCloseable {
 		 * cannot.
 		 */
 		private boolean replay(Listener<R> listener) {
-			ClientCall<Q, R> call;
-			Metadata replayHeaders;
-			List<Q> messages;
-			int toRequest;
-			boolean close;
+			// Under the lock to the end (R43-3): the caller's next request, message or half-close reaches the new call only
+			// once it is started and has what the caller did so far, in order. Outside it, a request could reach the call
+			// before its start (grpc: "Not started") or a half-close come before the replayed message.
 			synchronized (callLock) {
 				if (!replayable || answered || replayed || cancelled || headers == null) {
 					return false;
 				}
 				replayed = true;
-				call = main.newCall(method, options);
+				var call = main.newCall(method, options);
 				current = call;
-				replayHeaders = headers;
-				messages = List.copyOf(sent);
-				toRequest = requested;
-				close = halfClosed;
+				var swapped = replaySwappedForTesting;
+				if (swapped != null) {
+					swapped.run();
+				}
+				call.start(listener, headers);
+				if (requested > 0) {
+					call.request(requested);
+				}
+				sent.forEach(call::sendMessage);
+				if (halfClosed) {
+					call.halfClose();
+				}
+				return true;
 			}
-			var swapped = replaySwappedForTesting;
-			if (swapped != null) {
-				swapped.run();
-			}
-			call.start(listener, replayHeaders);
-			if (toRequest > 0) {
-				call.request(toRequest);
-			}
-			messages.forEach(call::sendMessage);
-			if (close) {
-				call.halfClose();
-			}
-			return true;
 		}
 
 		private final class LeaderListener extends ForwardingClientCallListener.SimpleForwardingClientCallListener<R> {

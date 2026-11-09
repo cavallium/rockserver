@@ -166,7 +166,7 @@ class StartupChecksTest {
 		var digest = NodeStore.recordSeedDigest(node);
 		NodeStore.noteSeedOpening(node);
 		// The check's open, cut before noteSeedOpened: the files changed, the seed's table files are the same ones.
-		NodeStore.open(node, null, "node").close();
+		startupCheckOpen(node);
 		assertNotEquals(digest, NodeStore.databaseFilesDigest(node));
 		assertEquals(digest, NodeStore.recordSeedDigest(node));
 		assertEquals(digest, NodeStore.recordSeedDigest(node), "kept again by a retry");
@@ -225,7 +225,7 @@ class StartupChecksTest {
 			copy(seed, node);
 			var digest = NodeStore.recordSeedDigest(node);
 			NodeStore.noteSeedOpening(node);
-			NodeStore.open(node, null, "node").close();
+			startupCheckOpen(node);
 			assertEquals(digest, NodeStore.recordSeedDigest(node), "the killed check alone");
 			var seedTables = fileNames(node, ".sst");
 			var otherTables = fileNames(other, ".sst");
@@ -324,7 +324,7 @@ class StartupChecksTest {
 	/**
 	 * R43-2: the start-up check's open deletes no table file the marker listed, so the keep rule can ask for every one of
 	 * them. Its own compaction did: here the data column holds four overlapping L0 files, which the default compaction
-	 * trigger (four L0 files) folds into one, deleting them.
+	 * trigger (four L0 files) folds into one, deleting them. Compactions stay off whatever the node's config says.
 	 */
 	@Test
 	void theStartupCheckOpenDeletesNoListedTableFile() throws Exception {
@@ -346,8 +346,14 @@ class StartupChecksTest {
 		NodeStore.noteSeedOpening(node);
 		var seedTables = fileNames(node, ".sst");
 		assertTrue(seedTables.size() >= 2, seedTables.toString());
-		// Killed while open, after its compaction (if any) had the time to run.
-		try (var store = startupCheckStore(node)) {
+		// Killed while open, after its compaction (if any) had the time to run. The node's config turns compactions on
+		// for the column itself, and asks for adaptive compaction I/O, which needs them: the check's open overrides both.
+		var nodeConfig = tempDir.resolve("node.conf");
+		Files.writeString(nodeConfig, """
+				database.global.adaptive-compaction-io = true
+				database.global.column-options = [ { name: "%s", disable-auto-compactions: false } ]
+				""".formatted(NodeStoreTest.DATA_COLUMN));
+		try (var store = NodeStore.openForStartupCheck(node, nodeConfig, "node")) {
 			long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(3);
 			while (fileNames(node, ".sst").containsAll(seedTables) && System.nanoTime() < deadline) {
 				Thread.sleep(20);
@@ -364,7 +370,7 @@ class StartupChecksTest {
 	}
 
 	private static NodeStore startupCheckStore(Path dbDir) throws IOException {
-		return NodeStore.open(dbDir, null, "node");
+		return NodeStore.openForStartupCheck(dbDir, null, "node");
 	}
 
 	private static List<String> fileNamesUnchecked(Path root, String suffix) {

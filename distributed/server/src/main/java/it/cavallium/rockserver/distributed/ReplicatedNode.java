@@ -1259,7 +1259,8 @@ public final class ReplicatedNode implements AutoCloseable {
 		if (!Files.isDirectory(config.dbDir())) {
 			return;
 		}
-		try (var store = NodeStore.open(config.dbDir(), config.rockserverConfig(), config.nodeId())) {
+		// Without automatic compactions: the open must delete none of the table files the opening marker listed (R43-2).
+		try (var store = NodeStore.openForStartupCheck(config.dbDir(), config.rockserverConfig(), config.nodeId())) {
 			var opened = startupCheckOpenedForTesting;
 			if (opened != null) {
 				opened.accept(config);

@@ -198,10 +198,27 @@ final class NodeStore implements Closeable {
 	 */
 	static NodeStore open(Path dbDir, @Nullable Path rockserverConfig, @Nullable Path configuredDbDir, String name)
 			throws IOException {
+		return open(dbDir, rockserverConfig, configuredDbDir, name, false);
+	}
+
+	/**
+	 * Like {@link #open(Path, Path, String)}, for the start-up check of a first start ({@code requireNoClusterData}):
+	 * without automatic compactions ({@link #withoutAutoCompactions}), so that the open deletes none of the table files
+	 * that {@link #noteSeedOpening} listed before it (R43-2). Its WAL replay and its close still flush, which only adds
+	 * table files. With compactions the open could fold every listed file into new ones (an L0-only seed reaches the
+	 * L0 trigger at once), and a kill after that left nothing to compare: the next first start recorded a digest no
+	 * other copy has and stopped at genesis.
+	 */
+	static NodeStore openForStartupCheck(Path dbDir, @Nullable Path rockserverConfig, String name) throws IOException {
+		return open(dbDir, rockserverConfig, null, name, true);
+	}
+
+	private static NodeStore open(Path dbDir, @Nullable Path rockserverConfig, @Nullable Path configuredDbDir,
+			String name, boolean noAutoCompactions) throws IOException {
 		dbDir = dbDir.toAbsolutePath().normalize();
 		RestoreDirs.of(dbDir).recover();
 		deleteLeftConfigs(dbDir.getParent());
-		Path config = replicaConfig(rockserverConfig, dbDir, configuredDbDir, name);
+		Path config = replicaConfig(rockserverConfig, dbDir, configuredDbDir, name, noAutoCompactions);
 		EmbeddedConnection connection;
 		try {
 			connection = new EmbeddedConnection(dbDir, name, config);
@@ -257,6 +274,12 @@ final class NodeStore implements Closeable {
 	 */
 	static Path replicaConfig(@Nullable Path rockserverConfig, Path dbDir, @Nullable Path sourceDbDir,
 			String nodeId) throws IOException {
+		return replicaConfig(rockserverConfig, dbDir, sourceDbDir, nodeId, false);
+	}
+
+	/** Like {@link #replicaConfig(Path, Path, Path, String)}, {@link #withoutAutoCompactions} if asked. */
+	private static Path replicaConfig(@Nullable Path rockserverConfig, Path dbDir, @Nullable Path sourceDbDir,
+			String nodeId, boolean noAutoCompactions) throws IOException {
 		var config = ConfigFactory.parseString(REPLICA_OVERRIDES);
 		try {
 			if (rockserverConfig != null) {
@@ -271,6 +294,9 @@ final class NodeStore implements Closeable {
 			config = withReplicaWriteBuffers(config.resolve());
 			if (sourceDbDir != null) {
 				config = withRelativePaths(config, sourceDbDir);
+			}
+			if (noAutoCompactions) {
+				config = withoutAutoCompactions(config);
 			}
 		} catch (ConfigException | IllegalArgumentException e) {
 			throw new IOException("Failed to read the Rockserver config " + rockserverConfig, e);
@@ -383,6 +409,29 @@ final class NodeStore implements Closeable {
 			var columns = new ArrayList<ConfigValue>();
 			for (ConfigObject column : config.getObjectList(columnsPath)) {
 				columns.add(column.withValue("write-buffer-size", size));
+			}
+			result = result.withValue(columnsPath, ConfigValueFactory.fromIterable(columns));
+		}
+		return result;
+	}
+
+	/**
+	 * {@code config} with automatic compactions off for every column: globally, in {@code fallback-column-options} and in
+	 * every entry of {@code column-options} (a column's own {@code disable-auto-compactions: false} would otherwise win),
+	 * and with {@code adaptive-compaction-io} off, which Rockserver refuses without automatic compactions. RocksDB then
+	 * starts no compaction (and no write slowdown); flushes still run. For the start-up check's open only
+	 * ({@link #openForStartupCheck}): it reads one value and closes, so no compaction is missed.
+	 */
+	static Config withoutAutoCompactions(Config config) {
+		ConfigValue off = ConfigValueFactory.fromAnyRef(true);
+		Config result = config.withValue("database.global.disable-auto-compactions", off)
+				.withValue("database.global.adaptive-compaction-io", ConfigValueFactory.fromAnyRef(false))
+				.withValue("database.global.fallback-column-options.disable-auto-compactions", off);
+		String columnsPath = "database.global.column-options";
+		if (config.hasPath(columnsPath)) {
+			var columns = new ArrayList<ConfigValue>();
+			for (ConfigObject column : config.getObjectList(columnsPath)) {
+				columns.add(column.withValue("disable-auto-compactions", off));
 			}
 			result = result.withValue(columnsPath, ConfigValueFactory.fromIterable(columns));
 		}
@@ -802,14 +851,17 @@ final class NodeStore implements Closeable {
 	 * Raft made its group directory. A recorded digest is kept only while the files are those it was taken from, or
 	 * those the start-up check left, or, when the check was stopped during its open ({@value #OPENING}, written by
 	 * {@link #noteSeedOpening} before it), files that only that open can have changed: every table or blob file the
-	 * marker listed that is still there is the same file (same inode and change time, same size), and at least one of
-	 * them is still there (a seed without table files cannot be compared, and is not kept), and IDENTITY, if the seed had
-	 * one, is the same file with the same content (Review of R41, 1: another database copied over {@code db/} without
-	 * deleting it first leaves the seed's table files next to its own, with other numbers, but brings its IDENTITY).
-	 * Otherwise the database was replaced since (the operator copied the seed again) and the digest is taken again. Not
-	 * found: a later copy of the seed's own source database (same IDENTITY) copied over {@code db/} by {@code rsync}
-	 * without {@code --delete}, which skips the unchanged IDENTITY; the runbooks say to delete {@code db/} and the digest
-	 * file before copying again. Once Raft has its group directory the node no longer calls this.</p>
+	 * marker listed is still there and is the same file (same inode and change time, same size; the open runs without
+	 * automatic compactions, so it deletes none, R43-2), the marker listed one at least (a seed without table files
+	 * cannot be compared, and is not kept), and IDENTITY, if the seed had one, is the same file with the same content
+	 * (Review of R41, 1: another database copied over {@code db/} without deleting it first leaves the seed's table files
+	 * next to its own, with other numbers, but brings its IDENTITY). Otherwise the database was replaced since (the
+	 * operator copied the seed again) and the digest is taken again. Not found: a later copy of the seed's own source
+	 * database (same IDENTITY) copied over {@code db/} with or without {@code rsync --delete}, when the source's later
+	 * run kept every table file of the seed (it only flushed new ones): the quick check skips the unchanged IDENTITY and
+	 * table files, and the new files look like the open's (R43-1; with a listed file compacted away it is found). The
+	 * runbooks say to delete {@code db/} and the digest file before copying again. Once Raft has its group directory the
+	 * node no longer calls this.</p>
 	 *
 	 * <p>The seed's files are fsynced first ({@link #syncSeed}, R34-1).</p>
 	 *
@@ -877,10 +929,14 @@ final class NodeStore implements Closeable {
 	 * OPTIONS and CURRENT, replays and flushes its WAL, may compact: a first start killed during that open leaves files
 	 * that match neither the seed digest nor an {@code opened} line, and {@link #recordSeedDigest} would otherwise take
 	 * the digest of those files, which no other copy of the seed has. With the marker it keeps the seed digest as long
-	 * as the files listed here that are still there are the same files, and one at least is: the open adds and deletes
-	 * table files but never rewrites one, while a copy made again ({@code cp}, {@code rsync}, restore-backup) makes new
-	 * ones. It also lists IDENTITY ({@code identity <size> <identity> <sha-256>}, or {@code identity none}), which the
-	 * open keeps and another database copied over this one replaces. Does nothing
+	 * as every file listed here is still there and is the same file, and one at least is listed: the open
+	 * ({@link #openForStartupCheck}, without automatic compactions: R43-2) adds table files but neither deletes nor
+	 * rewrites one, while a copy made again ({@code cp}, {@code rsync}, restore-backup) makes new ones, and a later copy
+	 * of the seed's source lacks those its compactions replaced (R43-1). A seed with table files that its MANIFEST does
+	 * not reference (copied from a source that crashed) loses them in the open, which deletes obsolete files: such a
+	 * killed start is not kept, and fails safe at genesis. It also lists IDENTITY
+	 * ({@code identity <size> <identity> <sha-256>}, or {@code identity none}), which the open keeps and another database
+	 * copied over this one replaces. Does nothing
 	 * when no seed digest was recorded or {@code dbDir} holds no database; {@link #noteSeedOpened} drops the marker.
 	 */
 	static void noteSeedOpening(Path dbDir) throws IOException {
@@ -902,9 +958,9 @@ final class NodeStore implements Closeable {
 	}
 
 	/**
-	 * Null if every table or blob file that {@code lines} (the marker of {@link #noteSeedOpening}) listed and that is
-	 * still under {@code dbDir} is the same file, with the same size, at least one of them is still there, and IDENTITY
-	 * is the file the marker listed; otherwise what differs.
+	 * Null if every table or blob file that {@code lines} (the marker of {@link #noteSeedOpening}) listed is still under
+	 * {@code dbDir} and is the same file, with the same size, the marker listed one at least, and IDENTITY is the file the
+	 * marker listed; otherwise what differs. Table files that the marker did not list are allowed: the open adds them.
 	 */
 	private static @Nullable String tablesChangedSinceOpening(Path dbDir, List<String> lines) throws IOException {
 		var listed = new HashMap<String, String>();
@@ -930,19 +986,24 @@ final class NodeStore implements Closeable {
 				return "IDENTITY is not the file it was before the open";
 			}
 		}
-		int same = 0;
-		for (var table : tableFiles(dbDir).entrySet()) {
-			String before = listed.get(table.getKey());
-			if (before == null) {
-				continue;
+		// Nothing to compare (a seed whose data is all in its WAL, which the open flushed and deleted): not kept.
+		if (listed.isEmpty()) {
+			return "no table file was listed before the open";
+		}
+		// Every listed file, still there and the same: the check's open runs without automatic compactions
+		// (openForStartupCheck, R43-2), so it deletes none; a later copy of the seed's source made with rsync --delete
+		// lacks the ones its own compactions replaced (R43-1). Files the open added are not listed, and allowed.
+		var now = tableFiles(dbDir);
+		for (var table : listed.entrySet()) {
+			String current = now.get(table.getKey());
+			if (current == null) {
+				return table.getKey() + " was listed before the open and is gone";
 			}
-			if (!sameTable(before, table.getValue())) {
+			if (!sameTable(table.getValue(), current)) {
 				return table.getKey() + " is another file than before the open";
 			}
-			same++;
 		}
-		// Nothing to compare (a seed whose data is all in its WAL, which the open flushed and deleted): not kept.
-		return same > 0 ? null : "none of the table files listed before the open is there";
+		return null;
 	}
 
 	/**
