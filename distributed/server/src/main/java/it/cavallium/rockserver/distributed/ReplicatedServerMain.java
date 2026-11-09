@@ -84,7 +84,10 @@ import org.rocksdb.NativeLibraryLoader;
  * {@code --peer} wrote it; it exits with 1 if a member failed or gave an answer that cannot be read (a member of
  * another version), and with 4 if a member gave no result in time, or no
  * member took the request in time. Both ask the members at once and propose through one that answers, so that a
- * frozen member listed first does not hold them (see {@code proposeOp}), and then ask every member for its result at
+ * frozen member listed first does not hold them (see {@code proposeOp}); a member that refuses by the cluster version
+ * it has applied (it may lag behind the leader) proposed nothing, and the next member that answered is asked: only when
+ * every member that answered refuses so do they exit with 1, naming each and its version (R32-4). They then ask every
+ * member for its result at
  * once, each within the time left (see {@code awaitResults}), so that they end within {@code --timeout-ms}. A node on
  * which a backup fails deletes what it wrote of it.
  * {@code backup-status NAME INDEX} asks the members again about that backup ({@code INDEX} is the log index that
@@ -127,7 +130,8 @@ import org.rocksdb.NativeLibraryLoader;
  * and a group without a directory in a {@code raft/} holding other groups is wrong usage, given or not (R31-2, R32-2).
  * A damaged snapshot fails it with exit code 1, naming the snapshot's index and the database's, and writes nothing;
  * {@code --without-damaged-snapshot} exports the database as it is, and the output names the snapshot left out
- * (R32-1).</p>
+ * (R32-1). A node that runs is refused with exit code 1 before anything of it is touched: the command first takes
+ * its group's {@code in_use.lock}, which a running node holds, as {@code repair-log} does (R32-5).</p>
  *
  * <p>{@code admin} refuses an option it does not know, a malformed value (a malformed {@code add-peer} argument
  * included), or a word its command does not take, with exit code 2. Its changes end with
@@ -557,6 +561,11 @@ public final class ReplicatedServerMain {
 			System.err.println("Not exported: " + e.getMessage());
 			exit(5);
 			return;
+		} catch (NodeStore.NodeRunningException e) {
+			// R32-5: the node runs (or another export of it does), maybe installing a snapshot: nothing was touched.
+			System.err.println("Not exported: " + e.getMessage());
+			exit(1);
+			return;
 		} catch (NodeStore.DamagedSnapshotNotExportedException e) {
 			// Not a usage error: the same command line works on another replica (R32-1).
 			System.err.println("Not exported: " + e.getMessage());
@@ -729,14 +738,29 @@ public final class ReplicatedServerMain {
 	 *
 	 * <p>Ends with {@link #EXIT_INCOMPLETE} (R28-2) when no member took the request within the time limit, or when the
 	 * answer of a non-idempotent one leaves open whether it was proposed: nothing was compared or written for sure, and
-	 * the command can be run again. A refusal (not every member supports the operation, an invalid argument) exits
-	 * with 1.</p>
+	 * the command can be run again. Any other refusal (FAILED_PRECONDITION other than the one for the cluster version
+	 * below, such as a backup name in the way; INVALID_ARGUMENT; UNIMPLEMENTED, an operation that member's version does
+	 * not know) ends the command at once with 1, without asking the next member.</p>
+	 *
+	 * <p>A member refuses for the cluster version ({@link ReplicaOps#versionRefusal}) by its own applied view, which
+	 * lags behind the leader's on a member that is catching up (an add-peer, a slow disk): that refusal proposed
+	 * nothing, so the next member that answered is asked, also for an operation that is not idempotent (R32-4). Only
+	 * when every member that answered refuses for the version does the command fail with 1, naming each of them and the
+	 * version it gave. That is also what happens while the leader has not raised the cluster version yet (it asks the
+	 * members every {@code VERSION_CHECK_EVERY}, 10 s, and at each new term): right after the last member of a rolling
+	 * upgrade restarts, every member refuses, the leader too, and the command is to be run again in about 10 s (R32
+	 * review 1). Who answered is decided by the capabilities question: a member that has not answered it is waited for
+	 * until it times out ({@link #PEER_ANSWER_TIMEOUT}, 3 s, or the time left), so if the one member that would take the
+	 * proposal answers later than that while all those that answered refuse for the version, the command fails with 1
+	 * rather than asking again within the time limit (R32 review 2).</p>
 	 */
 	private static long proposeOp(List<PeerConfig> peers, RaftGroupId groupId, byte op, byte[] payload,
 			boolean idempotent, long deadlineNanos) throws InterruptedException {
 		record Answer(PeerConfig peer, @Nullable String silence) {}
 		while (true) {
 			String last = null;
+			int answering = 0;
+			var versionRefusals = new ArrayList<String>();
 			var answered = new LinkedBlockingQueue<Answer>();
 			var question = min(PEER_ANSWER_TIMEOUT, remaining(deadlineNanos));
 			for (PeerConfig peer : peers) {
@@ -753,12 +777,21 @@ public final class ReplicatedServerMain {
 					last = peer.id() + ": " + answer.silence();
 					continue;
 				}
+				answering++;
 				try {
 					var reply = ReplicaOps.call(peer.raftAddress(), groupId, op, payload,
 							proposalWait(idempotent, remaining(deadlineNanos))).join();
 					return ByteBuffer.wrap(reply).getLong();
 				} catch (CompletionException ex) {
 					var status = Status.fromThrowable(ex.getCause());
+					if (ReplicaOps.versionRefusal(status)) {
+						// Its own applied view (R32-4): it may lag behind the leader. Nothing was proposed, so asking the
+						// next member is safe also for an operation that is not idempotent.
+						System.out.println(peer.id() + " refused: " + status.getDescription() + "; asking the next member");
+						versionRefusals.add(peer.id() + " (" + status.getDescription() + ")");
+						last = peer.id() + ": " + status;
+						continue;
+					}
 					if (status.getCode() == Status.Code.FAILED_PRECONDITION || status.getCode() == Status.Code.INVALID_ARGUMENT
 							|| status.getCode() == Status.Code.UNIMPLEMENTED) {
 						fail(peer.id() + " refused: " + status.getDescription());
@@ -769,6 +802,14 @@ public final class ReplicatedServerMain {
 					}
 					last = peer.id() + ": " + status;
 				}
+			}
+			if (answering > 0 && versionRefusals.size() == answering) {
+				fail("every member that answered refused for the cluster version it has applied: "
+						+ String.join("; ", versionRefusals) + ". If every member runs a version that supports it, either"
+						+ " the leader has not raised the cluster version yet (it asks the members every 10 s; right after"
+						+ " the last member of an upgrade restarts, every member refuses, the leader too): run the command"
+						+ " again in about 10 s; or those that answered lag behind the leader: run it again once they"
+						+ " caught up. Otherwise upgrade every member first");
 			}
 			if (System.nanoTime() - deadlineNanos > 0) {
 				failIncomplete("no member took the request within the time limit (--timeout-ms); last answer " + last

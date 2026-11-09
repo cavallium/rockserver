@@ -79,7 +79,8 @@ import org.jetbrains.annotations.Nullable;
 final class RaftLogRepair {
 
 	/** Not a public name in Ratis ({@code RaftStorageDirectoryImpl}); locked by a running node. */
-	private static final String LOCK_FILE = "in_use.lock";
+	/** Ratis' lock file in a group directory, held by a node for as long as it runs that group. */
+	static final String LOCK_FILE = "in_use.lock";
 	private static final String CURRENT_DIR = "current";
 	/**
 	 * What {@code LogSegmentStartEnd} accepts. Its {@code LogSegmentPath.matchLogSegment} cannot list the segments: it
@@ -198,8 +199,13 @@ final class RaftLogRepair {
 		}
 	}
 
+	/** Why a command that needs the node stopped refuses: the node holds {@code lockFile} ({@link #LOCK_FILE}). */
+	static String nodeRunning(Path lockFile) {
+		return lockFile + " is locked: stop the node first.";
+	}
+
 	private static Report nodeRunning(Path lockFile, List<String> lines) {
-		lines.add("REFUSED: " + lockFile + " is locked: stop the node first.");
+		lines.add("REFUSED: " + nodeRunning(lockFile));
 		return new Report(Outcome.REFUSED, lines);
 	}
 

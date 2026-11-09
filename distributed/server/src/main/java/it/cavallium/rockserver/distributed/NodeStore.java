@@ -884,7 +884,8 @@ final class NodeStore implements Closeable {
 	 * flushed state plus what its RocksDB WAL replays), without the replication metadata ({@link #META_COLUMN}: the
 	 * cluster id, the applied position, results and sessions), whose cluster id would make every node of a new cluster
 	 * refuse it. The source is opened as a replica, which also finishes a restore that a crash interrupted; it must not
-	 * run. Table files are hard-linked when {@code target} is on the same file system. This form ignores the Raft
+	 * run, which this form cannot check (the command uses {@link #exportSeed(Path, Path, Path, Path, boolean)}, which
+	 * checks the node's Raft lock, R32-5). Table files are hard-linked when {@code target} is on the same file system. This form ignores the Raft
 	 * snapshots: the command passes them, see {@link #exportSeed(Path, Path, Path, Path)} (R31-2).
 	 *
 	 * @return what the copy held: the applied position and cluster of the replica
@@ -915,6 +916,13 @@ final class NodeStore implements Closeable {
 	 * Like {@link #exportSeed(Path, Path, Path, Path)}; with {@code withoutDamagedSnapshot}, a damaged latest snapshot
 	 * does not stop the export: the copy holds what {@code dbDir} holds, and {@link ExportedSeed#damagedSnapshot} and
 	 * {@link ExportedSeed#damagedSnapshotIndex} say which snapshot was left out (R32-1).
+	 *
+	 * <p>When the group directory (the parent of {@code stateMachineDir}) exists, its {@link RaftLogRepair#LOCK_FILE}
+	 * is locked first and held to the end (R32-5): a node holds it for as long as it runs, also while it installs a
+	 * snapshot with {@code db/} closed and so without RocksDB's LOCK, and the open would otherwise finish or delete the
+	 * restore directories it is building ({@link #open} recovers them before RocksDB locks the database).</p>
+	 *
+	 * @throws NodeRunningException if the node holds its group's lock: nothing of the node is touched, nothing written
 	 */
 	static ExportedSeed exportSeed(Path dbDir, @Nullable Path stateMachineDir, @Nullable Path rockserverConfig,
 			Path target, boolean withoutDamagedSnapshot) throws IOException {
@@ -925,6 +933,36 @@ final class NodeStore implements Closeable {
 		if (!Files.isRegularFile(dbDir.resolve("CURRENT"))) {
 			throw new IOException("No database in " + dbDir);
 		}
+		Path groupDir = stateMachineDir == null ? null : stateMachineDir.toAbsolutePath().normalize().getParent();
+		if (groupDir == null || !Files.isDirectory(groupDir)) {
+			return exportSeedStopped(dbDir, stateMachineDir, rockserverConfig, target, withoutDamagedSnapshot);
+		}
+		// R32-5: a node holds its group's lock for as long as it runs, also while it installs a snapshot with db/ closed
+		// (no RocksDB LOCK on it then), when the open below would finish or delete the restore directories it builds.
+		// Taken first, as repair-log does; the file stays, as Ratis accepts (see RaftLogRepair.run).
+		Path lockFile = groupDir.resolve(RaftLogRepair.LOCK_FILE);
+		try (var channel = FileChannel.open(lockFile, StandardOpenOption.CREATE, StandardOpenOption.WRITE)) {
+			try (var lock = tryLock(channel)) {
+				if (lock == null) {
+					throw new NodeRunningException(RaftLogRepair.nodeRunning(lockFile));
+				}
+				return exportSeedStopped(dbDir, stateMachineDir, rockserverConfig, target, withoutDamagedSnapshot);
+			}
+		}
+	}
+
+	/** The lock on {@code channel}'s file, or null when another process or a channel of this one holds it. */
+	private static java.nio.channels.@Nullable FileLock tryLock(FileChannel channel) throws IOException {
+		try {
+			return channel.tryLock();
+		} catch (java.nio.channels.OverlappingFileLockException e) {
+			return null;
+		}
+	}
+
+	/** {@link #exportSeed(Path, Path, Path, Path, boolean)} once the node is known to be stopped, as far as it can be. */
+	private static ExportedSeed exportSeedStopped(Path dbDir, @Nullable Path stateMachineDir,
+			@Nullable Path rockserverConfig, Path target, boolean withoutDamagedSnapshot) throws IOException {
 		// The copy's config first: when it is refused, nothing has been written yet.
 		Path config = replicaConfig(rockserverConfig, target, dbDir, "export-target");
 		try {
@@ -953,7 +991,7 @@ final class NodeStore implements Closeable {
 		long damagedSnapshotIndex = -1;
 		var store = open(dbDir, rockserverConfig, "export-source");
 		try {
-			// After the open: it fails while the replica runs, before anything in its Raft directory is touched.
+			// The node does not run: its group's lock is held (R32-5), and the open took the database's LOCK.
 			if (stateMachineDir != null && Files.isDirectory(stateMachineDir)) {
 				var storage = new CheckpointStorage();
 				try {
@@ -1017,6 +1055,16 @@ final class NodeStore implements Closeable {
 	 */
 	record ExportedSeed(TermIndex applied, @Nullable String clusterId, @Nullable TermIndex restoredSnapshot,
 			@Nullable String damagedSnapshot, long damagedSnapshotIndex) {}
+
+	/**
+	 * {@code export-seed} found the node running: it holds its group's {@link RaftLogRepair#LOCK_FILE}. Nothing of the
+	 * node was touched and nothing was written (R32-5).
+	 */
+	static final class NodeRunningException extends IOException {
+		NodeRunningException(String message) {
+			super(message);
+		}
+	}
 
 	/**
 	 * {@code export-seed} found the replica's latest snapshot damaged and was not told to export without it: nothing
