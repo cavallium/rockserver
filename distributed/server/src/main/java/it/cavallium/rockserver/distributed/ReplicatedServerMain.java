@@ -151,7 +151,9 @@ import org.rocksdb.NativeLibraryLoader;
  * change commits with the new voters alone, which can lose committed entries. They also refuse a {@code --peer}
  * address of a member that stays that differs from its address in that configuration (R51-1,
  * {@link VoterChange#addressChanges}), since the new configuration is written from {@code --peer} and a wrong address
- * shows only once the nodes restart; {@value #CHANGE_ADDRESSES} writes such addresses instead. They send the change as a compare-and-set
+ * shows only once the nodes restart; {@value #CHANGE_ADDRESSES} writes such addresses instead, on a call that adds or
+ * removes a voter (one that changes addresses only is refused, since Ratis would write nothing: R52-3). A member
+ * keeps its address under its id while the other nodes run (R52-2): one moves under a new id. They send the change as a compare-and-set
  * against the configuration they read, and read it again if another change came first. The leader checks the same
  * ({@link MembershipGuard}), also for older {@code admin} versions and other Ratis clients, once every node that can
  * lead runs this version (a leader of an older version, during a rolling upgrade, does not). A refusal of Ratis' own
@@ -195,6 +197,9 @@ public final class ReplicatedServerMain {
 	/**
 	 * R51-1: lets {@code add-peer} and {@code remove-peer} write a {@code --peer} address of a member that stays that
 	 * differs from its address in the leader's configuration; without it such a call is refused before it proposes.
+	 * It takes effect only on a call that adds or removes a voter (R52-3, Ratis ignores a change of addresses alone), and
+	 * it changes the configuration only: a running node keeps the address it knows for a member id, its {@code --peer}
+	 * one first (R52-2), so it never moves a member.
 	 */
 	static final String CHANGE_ADDRESSES = "--change-addresses";
 
@@ -1145,7 +1150,9 @@ public final class ReplicatedServerMain {
 	 * {@link MembershipGuard} checks it again. Without {@code changeAddresses} it also fails, before anything is
 	 * proposed, if a member that stays has another address in {@code target} than in the leader's configuration (R51-1,
 	 * {@link VoterChange#addressChanges}): {@code target} is written as it is, so a mistyped {@code --peer} address
-	 * would show only after the nodes restart. If another change commits meanwhile (the compare-and-set fails), it reads
+	 * would show only after the nodes restart. With {@code changeAddresses} it still fails, before anything is proposed,
+	 * if such an address differs and no voter is added or removed (R52-3): Ratis 3.3.1 answers success to a configuration
+	 * with the same voter ids and priorities without writing it. If another change commits meanwhile (the compare-and-set fails), it reads
 	 * the configuration again and checks again, until the deadline.
 	 */
 	private static RaftClientReply changeVoters(RaftClient client, List<PeerConfig> peers, RaftGroupId groupId,
@@ -1171,9 +1178,19 @@ public final class ReplicatedServerMain {
 						fail("refused: --peer gives members that stay another address than the leader's configuration: "
 								+ String.join(", ", moved) + ". The change writes the --peer address of every member that"
 								+ " stays into the configuration, which the nodes use once they restart. Fix --peer to the"
-								+ " addresses of the configuration; to move a member, remove-peer it and add-peer it at its new"
-								+ " address, or pass " + CHANGE_ADDRESSES + " to write the --peer addresses. Nothing was"
-								+ " proposed. See \"Replacing a node\" in docs/distributed/runbooks.md");
+								+ " addresses of the configuration; to move a member, add-peer a node under a new id at the new"
+								+ " address and remove-peer the old id (the running nodes keep the address they know for an id),"
+								+ " or pass " + CHANGE_ADDRESSES + " to write the --peer addresses. Nothing was proposed. See"
+								+ " \"Replacing a node\" in docs/distributed/runbooks.md");
+					}
+					if (change.size() == 0) {
+						// R52-3: Ratis 3.3.1 compares voter ids and priorities only (RaftConfigurationImpl.hasNoChange) and
+						// answers success without writing a configuration that changes no voter.
+						fail("refused: " + CHANGE_ADDRESSES + " on a call that adds and removes no voter: Ratis takes a"
+								+ " configuration with the same voters for no change and writes nothing, so the configuration would"
+								+ " keep " + String.join(", ", moved) + ". Nothing was written. The addresses are written only"
+								+ " together with a voter that is added or removed; see \"One voter per change\" in"
+								+ " docs/distributed/runbooks.md");
 					}
 					System.out.println(CHANGE_ADDRESSES + ": this change also moves " + String.join(", ", moved));
 				}
@@ -1295,8 +1312,10 @@ public final class ReplicatedServerMain {
 		}
 		if (!String.valueOf(voter.getAddress()).equals(raftPeer(added).getAddress())) {
 			fail("node " + added.id() + " is a voter already, at " + voter.getAddress() + ", not at "
-					+ raftPeer(added).getAddress() + ": add-peer does not move a voter (Ratis compares peers by id). Never"
-					+ " wipe a voter's data directory: to move it, remove-peer " + added.id() + " and add it again");
+					+ raftPeer(added).getAddress() + ": add-peer does not move a voter (Ratis compares peers by id, and the"
+					+ " running nodes keep the address they know for it). Never wipe a voter's data directory: to move it,"
+					+ " add-peer a node under a new id at the new address, then remove-peer " + added.id()
+					+ " (\"Replacing a node\" in docs/distributed/runbooks.md)");
 		}
 		System.out.println("node " + added.id() + " is already a voter at " + voter.getAddress() + ": nothing to do");
 		return true;
