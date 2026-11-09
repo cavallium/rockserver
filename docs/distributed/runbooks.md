@@ -62,8 +62,17 @@ config, the InfluxDB token and every `${?ENV}` substitution included, so they ar
 whatever the umask; RocksDB's and Raft's own files are not, so keep `DATA-DIR` itself at 0700 or 0750
 (`chmod 0750 /srv/rockserver/data`).
 
-and `PEERS` for the peer list of the cluster, one `--peer` per member, the same on every node and in every `admin`
-command:
+Run the offline commands (`export-seed`, `repair-log`, `restore-backup`) as the user the node runs as (the service
+unit's `User=`), not as root through `sudo`. They create and rewrite files in `DATA-DIR`: `restore-backup` builds
+`db/`, `export-seed` may finish a restore or restore a snapshot into `db/` and opens the database (RocksDB writes its
+`LOG`, `OPTIONS`, `MANIFEST` and WAL files), `repair-log` rewrites a log segment, and `export-seed` and a `repair-log`
+that is not a dry run create `raft/<group>/in_use.lock`, which stays. Each file gets the owner and the umask of whoever
+ran the command, and a node of another user then fails to start on a denied permission that names the file. If that
+happened, give the data directory back to the node's user (`chown -R <node user>: /srv/rockserver/data`, with the
+unit's `User=`) before the start.
+
+The commands below use `PEERS` for the peer list of the cluster, one `--peer` per member, the same on every node and
+in every `admin` command:
 
 ```bash
 PEERS="--peer n1=10.0.0.1:9001/10.0.0.1:5333 --peer n2=10.0.0.2:9001/10.0.0.2:5333 --peer n3=10.0.0.3:9001/10.0.0.3:5333"
