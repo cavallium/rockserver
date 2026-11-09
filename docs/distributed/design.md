@@ -4251,7 +4251,9 @@ install it (`apt-get install gcc libc6-dev`) and run with `-Drockserver.test.req
      twice; a cancel after the answer (R46-4) was accepted too while the answer was on its way. In the red run a
      cancel did not reach a pending single call either (`inner.isCancelled()` false). `DeferredCall` replaces it: a cancel before the connection exists
      disposes the acquisition (its waiter leaves as before; nothing was sent) and cancels the future; the call is made
-     under the same lock, so a cancel either comes first or reaches it; after, the cancel is the call's, false when
+     under the same lock, so a cancel from another thread either comes first or reaches it (one from the thread making
+     the call, while it is made, is remembered and passed to the call once made: review of R47, 1); after, the cancel
+     is the call's, false when
      the call refuses it, and the future completes from the call (a `CompletionException` unwrapped, as
      `Mono.fromFuture` did; cancelled only when the call is). Streams keep `Flux.defer`: a subscription's cancel has
      no outcome to report. Tests: `DeferredRockserverConnectionTest` (see the test table; red at `9f2c2e9`). Not
@@ -4266,6 +4268,28 @@ install it (`apt-get install gcc libc6-dev`) and run with `-Drockserver.test.req
      bytes`); the exit code stays 1. Tests: `RaftLogRepairTest.aStartThatCannotReadTheLogPointsToRepairLog` (red at
      `a51c6c3`) and the refused starts of its process tests. Not tested: a Ratis version that reads segments through
      other classes (the hint would then be missing, nothing else changes).
+   - Review of R47, 1 (low): `DeferredCall.connected` checked `cancelledBeforeCall` before `function.apply` and set
+     `call` after it, under a reentrant monitor. A cancel from the same thread while the call was made (a dependent
+     stage of another future that `requestAsync` completes synchronously) saw no call, took the "before the call" path,
+     returned true and completed the wrapper cancelled: the call just made, possibly a numbered write that sent a copy,
+     was never cancelled and its outcome was dropped, R47-2 again, reentrantly. A `making` flag, set while
+     `function.apply` runs, makes such a cancel return false and be remembered; once the call exists it is passed to
+     it, and the wrapper ends as the call does (cancelled if it took the cancel, its outcome if it refused). It returns
+     false rather than a later answer because nothing can be granted yet: a false `cancel` means "the outcome will come
+     through", which is what the caller then sees. Another thread still waits on the lock and so sees the made call.
+     Test: `DeferredRockserverConnectionTest.cancelWhileTheCallIsBeingMadeOnTheSameThreadReachesTheCall` (both a call
+     that refuses and one that takes the cancel; red at `641e0e0`: the nested cancel returned true).
+   - Review of R47, 2 (low, docs): step 2 of "Node does not start after a power loss" read every `REFUSED` as damage
+     and every exit 0 as "go on". `repair-log` also refuses for a missing directory (a wrong `--data-dir` or
+     `--group-id`) and for a running node, which say nothing about the log, and its `OK` means there is no torn tail,
+     so repairing changes nothing and the same start fails again. The step now lists the verdicts by their line:
+     `WOULD REPAIR` goes on; `OK` looks for the cause elsewhere (or replaces the node); the two refusals that read
+     nothing are fixed and retried; only a refusal ending "replace the node" replaces it. performance.md says the same.
+   - Review of R47, 3 (nit): `unreadableLogHint` matches any failure thrown in Ratis' segment reader, I/O errors that
+     are not damage included (a denied permission, an `EIO`, an `OutOfMemoryError` while reading). Kept as is: telling
+     them apart by type would miss a corruption Ratis reports in some other way, and `repair-log`'s verdict is the one
+     that decides. The hint now says the start failed while reading the log, that an I/O error, a permission or memory
+     fails the same way, and that `OK` means the log is not torn; the runbook says the hint appears for those too.
    - Review of R46, 1 (low, docs): the R46-2 recipe ran `dependency:build-classpath` on `distributed/server/pom.xml`
      alone, so Maven resolved `rockserver-core:${revision}` and that version's pom from `~/.m2` (or the snapshot
      repository): `grep -v /rockserver-core/` dropped the jar but kept the third-party jars of that pom, from whichever

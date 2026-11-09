@@ -281,8 +281,10 @@ Other results:
   last write can show up as `Log entry corrupted` or as an `InvalidProtocolBufferException`, and damage it refuses
   can show up the same way or as `Read extra bytes`. If it would repair, run it again without `--dry-run` and start
   the node: the leader sends it what it lost. That is safe only if the dropped entry was never fsynced, as the
-  command says, so disks that lose fsynced data void it (see Durability in the design document). If it refuses,
-  replace the node under a new id. If too few nodes are left to elect a leader, which replacing a node needs, see
+  command says, so disks that lose fsynced data void it (see Durability in the design document). If it answers `OK`,
+  the log is not torn and the start failed for another reason (an I/O error, a permission, memory): repairing would
+  change nothing. If it refuses because the log is damaged, replace the node under a new id; a refusal for a missing
+  directory (a wrong `--data-dir` or `--group-id`) or a running node says nothing about the log. If too few nodes are left to elect a leader, which replacing a node needs, see
   "No quorum" in the design document: there is no override. The runbooks have it step by step ("Node does not start
   after a power loss").
 - **Disk space.** Each retained snapshot keeps the table files it links, also after compaction replaced them.

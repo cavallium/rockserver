@@ -284,16 +284,21 @@ public final class ReplicatedServerMain {
 	 * ({@link RaftSettings}); {@code repair-log} tells a torn tail, which it drops, from damage, which it refuses. Ratis'
 	 * error does not tell them apart ({@code Log entry corrupted}, an {@code InvalidProtocolBufferException},
 	 * {@code Read extra bytes}), so the failure is recognised by where it was thrown: a frame of Ratis' segment reader,
-	 * anywhere in its causes or suppressed exceptions. Only a hint is printed: the exit code stays 1.
+	 * anywhere in its causes or suppressed exceptions. That also matches failures that are not damage, thrown while a
+	 * segment was opened or read (a denied permission, an {@code EIO}, an {@code OutOfMemoryError}): telling those
+	 * apart by type would miss a corruption Ratis reports some other way, so the hint names both and leaves the verdict
+	 * to {@code repair-log}, whose {@code OK} means the log is not torn and the cause is elsewhere (review of R47, 3).
+	 * Only a hint is printed: the exit code stays 1.
 	 */
 	static @Nullable String unreadableLogHint(Throwable failure, Path dataDir, String groupId) {
 		if (!readingTheLog(failure, java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>()))) {
 			return null;
 		}
 		String group = NodeConfig.DEFAULT_GROUP_ID.equals(groupId) ? "" : " --group-id " + groupId;
-		return "The node could not read its Raft log. After a power loss or a crash its last write may be torn: with the"
-				+ " node stopped, run `repair-log --data-dir " + dataDir + group + " --dry-run` and follow its verdict,"
-				+ " not this error (runbooks.md, \"Node does not start after a power loss\").";
+		return "The node failed while reading its Raft log. After a power loss or a crash its last write may be torn,"
+				+ " but an I/O error, a permission or memory fails the same way (see the cause above): with the node"
+				+ " stopped, run `repair-log --data-dir " + dataDir + group + " --dry-run` and follow its verdict, not this"
+				+ " error; OK means the log is not torn (runbooks.md, \"Node does not start after a power loss\").";
 	}
 
 	private static boolean readingTheLog(@Nullable Throwable failure, java.util.Set<Throwable> seen) {

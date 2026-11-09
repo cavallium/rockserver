@@ -258,6 +258,16 @@ final class DeferredRockserverConnection implements RocksDBConnection {
 		private CompletableFuture<T> call;
 		/** Guarded by {@link #lock}: cancelled before the call was made, which then never is. */
 		private boolean cancelledBeforeCall;
+		/**
+		 * Guarded by {@link #lock}: the call is being made. Only the thread making it can see this (the lock is held
+		 * meanwhile), when the call completes some other future synchronously and one of its dependent stages cancels
+		 * this one (review of R47, 1).
+		 */
+		private boolean making;
+		/** Guarded by {@link #lock}: a cancel came while the call was being made; it is passed to the call once made. */
+		private boolean cancelWhileMaking;
+		/** Guarded by {@link #lock}: that cancel's argument. */
+		private boolean interruptWhileMaking;
 
 		static <T> CompletableFuture<T> start(Mono<RocksDBConnection> connection,
 				Function<RocksDBConnection, CompletableFuture<T>> call) {
@@ -274,15 +284,24 @@ final class DeferredRockserverConnection implements RocksDBConnection {
 
 		private void connected(RocksDBConnection client, Function<RocksDBConnection, CompletableFuture<T>> function) {
 			CompletableFuture<T> made;
+			boolean cancelMade;
+			boolean interrupt;
 			synchronized (lock) {
 				if (cancelledBeforeCall) return;
-				// Made under the lock, so that a cancel either comes first (and nothing is sent) or reaches the call.
+				// Made under the lock, so that a cancel from another thread either comes first (and nothing is sent) or
+				// reaches the call. One from this thread while the call is made (a dependent stage run synchronously) is
+				// remembered and passed to the call below.
+				making = true;
 				try {
 					made = Objects.requireNonNull(function.apply(client), "call");
 				} catch (Throwable failure) {
 					made = CompletableFuture.failedFuture(failure);
+				} finally {
+					making = false;
 				}
 				call = made;
+				cancelMade = cancelWhileMaking;
+				interrupt = interruptWhileMaking;
 			}
 			var source = made;
 			made.whenComplete((value, error) -> {
@@ -294,6 +313,9 @@ final class DeferredRockserverConnection implements RocksDBConnection {
 					completeExceptionally(unwrap(error));
 				}
 			});
+			// The cancel that came while the call was made: if the call takes it, this future ends cancelled through the
+			// stage above; if it refuses it (it ended, or a numbered write sent a copy), its outcome comes through.
+			if (cancelMade) made.cancel(interrupt);
 		}
 
 		@Override
@@ -303,6 +325,14 @@ final class DeferredRockserverConnection implements RocksDBConnection {
 			Disposable pending = null;
 			synchronized (lock) {
 				made = call;
+				if (made == null && making) {
+					// Reentrant, from the thread making the call: the call may already have sent something, so this is not
+					// a cancel before the call. It cannot be granted yet: it is passed to the call once made, and this
+					// future ends as the call does.
+					cancelWhileMaking = true;
+					interruptWhileMaking |= mayInterruptIfRunning;
+					return false;
+				}
 				if (made == null) {
 					cancelledBeforeCall = true;
 					pending = acquisition;

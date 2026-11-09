@@ -427,14 +427,26 @@ A difference (the log says `REPLICAS DIVERGED`, the alert `rockserver-checksum-m
 
 A node that lost power (or crashed) while writing can have a torn last entry in its Raft log, which Ratis refuses:
 `run` exits with 1, and the stack trace shows `Log entry corrupted`, an `InvalidProtocolBufferException` or `Read
-extra bytes`. The start failure then also prints the `repair-log` command for that node. The error does not tell a
-torn tail from damage; `repair-log` does, so follow its verdict:
+extra bytes`. The start failure then also prints the `repair-log` command for that node: it does so for any failure
+thrown while Ratis read a log segment, which includes I/O errors that are not damage (a denied permission, an `EIO`
+of the disk, memory running out), so read the cause in the stack trace too. The error does not tell a torn tail from
+damage; `repair-log` does, so follow its verdict:
 
 1. Stop the node's supervisor, so that it does not restart it meanwhile (`repair-log` refuses while the node runs:
    its `in_use.lock` is locked).
-2. `rs repair-log --data-dir DATA-DIR --dry-run`, with the node's `--group-id` if it runs with one. Exit 0 with
-   `WOULD REPAIR` (or a valid log): go on. Exit 1 (`REFUSED`): the log is damaged, not torn; do not force it, replace
-   the node ("Replacing a node").
+2. `rs repair-log --data-dir DATA-DIR --dry-run`, with the node's `--group-id` if it runs with one, and read its
+   last line:
+   - `WOULD REPAIR` (exit 0): go on with step 3.
+   - `OK: every entry is valid` or `OK: no open segment` (exit 0): the log has no torn tail, so repairing changes
+     nothing and the same start would fail again. The failure is elsewhere: read the stack trace's cause (a permission,
+     a disk error in the kernel log, memory, the Raft disk full), fix it and start the node; if nothing explains it,
+     replace the node ("Replacing a node").
+   - `REFUSED: ... does not exist: wrong --data-dir or --group-id?` (exit 1): nothing was read. Check the paths and the
+     `--group-id` against the node's `run` command and try again: this says nothing about the log.
+   - `REFUSED: ... is locked: stop the node first.` (exit 1): the node, or its supervisor's restart, is running. Go
+     back to step 1.
+   - Any other `REFUSED` (exit 1, ending "Nothing was changed: replace the node"): the log is damaged, not torn; do not
+     force it, replace the node ("Replacing a node").
 3. `rs repair-log --data-dir DATA-DIR` (the same `--group-id`): `REPAIRED`, with the index of the first entry dropped.
 4. Start the node: the leader sends it what it dropped, and `status` shows it catching up.
 
