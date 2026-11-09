@@ -230,7 +230,8 @@ final class NodeStore implements Closeable {
 
 	/**
 	 * Writes the config the replica opens its database with to {@link #replicaConfigFile}: {@link #REPLICA_OVERRIDES} over
-	 * the given Rockserver config (HOCON), or over the defaults when there is none.
+	 * the given Rockserver config (HOCON), or over the defaults when there is none. The file is owner-only
+	 * ({@link #writeOwnerOnly}, R31-1).
 	 */
 	private static Path replicaConfig(@Nullable Path rockserverConfig, Path dbDir, String nodeId) throws IOException {
 		return replicaConfig(rockserverConfig, dbDir, null, nodeId);
@@ -240,8 +241,9 @@ final class NodeStore implements Closeable {
 	 * Like {@link #replicaConfig(Path, Path, String)}, for a copy in {@code dbDir} of the database in {@code sourceDbDir}
 	 * (when not null): an absolute {@code volume-path} under {@code sourceDbDir} becomes the same path relative to the
 	 * database directory, so that the copy opens its own volumes. The file is made next to {@code dbDir}, not in the
-	 * JDK's temporary directory (see {@code ReplicatedServerMain}). {@code nodeId} is the metrics node name when the
-	 * config sets none.
+	 * JDK's temporary directory (see {@code ReplicatedServerMain}), owner-only since it holds the resolved config with
+	 * its secrets ({@link #writeOwnerOnly}, R31-1). {@code nodeId} is the metrics node name when the config sets none.
+	 * Package-private for tests.
 	 */
 	static Path replicaConfig(@Nullable Path rockserverConfig, Path dbDir, @Nullable Path sourceDbDir,
 			String nodeId) throws IOException {
@@ -882,7 +884,8 @@ final class NodeStore implements Closeable {
 	 * flushed state plus what its RocksDB WAL replays), without the replication metadata ({@link #META_COLUMN}: the
 	 * cluster id, the applied position, results and sessions), whose cluster id would make every node of a new cluster
 	 * refuse it. The source is opened as a replica, which also finishes a restore that a crash interrupted; it must not
-	 * run. Table files are hard-linked when {@code target} is on the same file system.
+	 * run. Table files are hard-linked when {@code target} is on the same file system. This form ignores the Raft
+	 * snapshots: the command passes them, see {@link #exportSeed(Path, Path, Path, Path)} (R31-2).
 	 *
 	 * @return what the copy held: the applied position and cluster of the replica
 	 * @throws ReplicatedNode.NewerVersionException if the replica's cluster version has capabilities this version lacks:

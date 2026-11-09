@@ -120,7 +120,10 @@ import org.rocksdb.NativeLibraryLoader;
  * deletes the copies that earlier runs left there; a given one outside the data directory is warned about.</p>
  *
  * <p>{@code export-seed} runs on a stopped node and copies its database into a new directory that can seed a new
- * cluster, the last resort of "No quorum" in the design document (see {@link NodeStore#exportSeed}).</p>
+ * cluster, the last resort of "No quorum" in the design document (see {@link NodeStore#exportSeed}). A verified snapshot
+ * in {@code raft/<group>/sm} ahead of the database (a crash during its installation) is restored into it first, as the
+ * node's start would, and the output says so; {@code --group-id} names the node's group (default as for {@code run}),
+ * and without it a {@code raft/} holding only other groups is wrong usage (R31-2).</p>
  *
  * <p>{@code admin} refuses an option it does not know, a malformed value (a malformed {@code add-peer} argument
  * included), or a word its command does not take, with exit code 2. Its changes end with
