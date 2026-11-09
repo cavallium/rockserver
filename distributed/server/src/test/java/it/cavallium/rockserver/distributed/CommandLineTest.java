@@ -322,6 +322,23 @@ class CommandLineTest {
 		assertTrue(!refused.out().strip().endsWith("OK"), refused.out());
 		assertVoters(List.of("n0", "n1", "n2"));
 		assertEquals(self.raftAddress(), voterAddress(staying));
+
+		// Review of R52, 1: an add-peer of a voter already (a re-run) adds and removes no voter either. With
+		// --change-addresses it is refused the same way, and without it the address of a member that stays is checked
+		// (R51-1) instead of printing OK.
+		var voter = "n0".equals(staying) ? "n1" : "n0";
+		var again = cluster.config(voter).self().format();
+		var addAgain = run(with(List.of(adminWith(List.of("n0", "n1", "n2"), staying, respelled, "add-peer", again)),
+				"--change-addresses"));
+		assertEquals(1, addAgain.code(), addAgain.toString());
+		assertTrue(addAgain.out().contains("Nothing was written"), addAgain.out());
+		assertTrue(!addAgain.out().strip().endsWith("OK"), addAgain.out());
+		var addAgainChecked = run(adminWith(List.of("n0", "n1", "n2"), staying, respelled, "add-peer", again));
+		assertEquals(1, addAgainChecked.code(), addAgainChecked.toString());
+		assertTrue(addAgainChecked.out().contains(staying + " (at " + self.raftAddress() + " in the configuration, "
+				+ respelled.raftAddress() + " in --peer)"), addAgainChecked.out());
+		assertTrue(!addAgainChecked.out().strip().endsWith("OK"), addAgainChecked.out());
+		assertEquals(self.raftAddress(), voterAddress(staying));
 	}
 
 	/** {@link #admin} with member {@code replaced} given as {@code peer} instead of its own address. */
