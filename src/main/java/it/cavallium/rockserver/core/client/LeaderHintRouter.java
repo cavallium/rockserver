@@ -175,12 +175,15 @@ final class LeaderHintRouter implements AutoCloseable {
 	private final Map<String, Long> failedAt = new HashMap<>();
 	/**
 	 * Retired hints whose channel may still carry calls started on it, which its graceful shutdown waits for:
-	 * {@link #close} forces them as it forces the current one (R49-1). A hint leaves once its channel terminated,
-	 * checked at each retirement, so the set holds only channels with calls still running. Guarded by {@link #lock}.
+	 * {@link #close} forces them as it forces the current one (R49-1). Hints whose channel terminated are forgotten
+	 * only at the next retirement, and the hint being retired is added after that check, so the set can also hold the
+	 * hint retired last even when it terminated at once, and hints whose calls were handed out but not started yet. It
+	 * holds at most the retired channels that have not terminated plus one; forcing a terminated channel at the close
+	 * does nothing. Guarded by {@link #lock}.
 	 */
 	private final Set<Hint> retiredOpen = new HashSet<>();
-	/** Guarded by {@link #lock}. */
-	private boolean closed;
+	/** Written under {@link #lock}; read without it by a failed leader call, which must not replay after the close. */
+	private volatile boolean closed;
 
 	/**
 	 * @param listed the addresses the client was given
@@ -428,7 +431,9 @@ final class LeaderHintRouter implements AutoCloseable {
 			// once it is started and has what the caller did so far, in order. Outside it, a request could reach the call
 			// before its start (grpc: "Not started") or a half-close come before the replayed message.
 			synchronized (callLock) {
-				if (!replayable || answered || replayed || cancelled || headers == null) {
+				// After close() (review of R49, 1): the failure is most likely the close forcing this channel, and the
+				// ordinary channel is shut down next, gracefully, so a replay there would outlive the close by a minute.
+				if (closed || !replayable || answered || replayed || cancelled || headers == null) {
 					return false;
 				}
 				replayed = true;
@@ -610,9 +615,11 @@ final class LeaderHintRouter implements AutoCloseable {
 
 	/**
 	 * Forces the leader's channel and every retired one whose calls have not ended (R49-1), so that a stream or a call
-	 * without a deadline on a former leader's channel fails now, while the connection's callback executor can still
-	 * tell its caller, instead of running on after the connection closed. Waits up to 5 s in all for the channels to
-	 * terminate. A retired channel is never forced before this (R46-1): its calls end as they do.
+	 * without a deadline on a leader channel, current or former, fails now, while the connection's callback executor
+	 * can still tell its caller, instead of running on after the connection closed. A replayable read failed this way
+	 * is not sent again on the ordinary channel (review of R49, 1): its caller gets the {@code UNAVAILABLE}. Waits up
+	 * to 5 s in all for the channels to terminate. A retired channel is never forced before this (R46-1): its calls end
+	 * as they do.
 	 */
 	@Override
 	public void close() {

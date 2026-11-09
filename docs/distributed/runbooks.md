@@ -68,11 +68,11 @@ unit's `User=`), not as root through `sudo`. They create and rewrite files in `D
 `LOG`, `OPTIONS`, `MANIFEST` and WAL files), `repair-log` rewrites a log segment, and `export-seed` and a `repair-log`
 that is not a dry run create `raft/<group>/in_use.lock`, which stays. Each file gets the owner and the umask of whoever
 ran the command, and a node of another user then fails to start on a denied permission that names the file. If that
-happened, give the data directory back to the node's user (`chown -R rockserver: /srv/rockserver/data`) before the
-start.
+happened, give the data directory back to the node's user (`chown -R <node user>: /srv/rockserver/data`, with the
+unit's `User=`) before the start.
 
-and `PEERS` for the peer list of the cluster, one `--peer` per member, the same on every node and in every `admin`
-command:
+The commands below use `PEERS` for the peer list of the cluster, one `--peer` per member, the same on every node and
+in every `admin` command:
 
 ```bash
 PEERS="--peer n1=10.0.0.1:9001/10.0.0.1:5333 --peer n2=10.0.0.2:9001/10.0.0.2:5333 --peer n3=10.0.0.3:9001/10.0.0.3:5333"
