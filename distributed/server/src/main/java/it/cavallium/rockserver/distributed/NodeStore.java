@@ -83,6 +83,8 @@ import org.slf4j.LoggerFactory;
  *   {@link CommittedConfigurations}</li>
  *   <li>{@link #CONFIGURATION_HISTORY}: the first index from which those are complete and the applied index written
  *   with it (two longs), see {@link #configurationHistoryFrom}</li>
+ *   <li>{@link #BACKUP_REQUEST} + request id: the log index of the first {@link LogEntry.Backup} entry of that
+ *   request, see {@link #backupRequestIndex}</li>
  * </ul>
  *
  * <p>The meta column is created locally when a database is first opened, before any log entry is applied, so it
@@ -119,6 +121,8 @@ final class NodeStore implements Closeable {
 	static final byte CONFIGURATION = 41;
 	/** The first index from which every applied configuration is recorded, see {@link #configurationHistoryFrom}. */
 	static final byte CONFIGURATION_HISTORY = 42;
+	/** The log index of the first {@link LogEntry.Backup} entry of a backup request id, see {@link #backupRequestIndex}. */
+	static final byte BACKUP_REQUEST = 43;
 
 	private static final int META_KEY_BYTES = 1 + 2 * Long.BYTES;
 	private static final ColumnSchema META_SCHEMA = ColumnSchema.of(IntList.of(META_KEY_BYTES), ObjectList.of(), true);
@@ -660,6 +664,23 @@ final class NodeStore implements Closeable {
 	}
 
 	/**
+	 * The log index of the first {@link LogEntry.Backup} entry applied for the backup request {@code requestId} (R41-3),
+	 * null if none was: the same request proposed again (admin's first answer was lost) names the backup taken at that
+	 * index, on every replica, also on one that installed a snapshot past it and never applied it (the meta column is in
+	 * snapshots). A database a version without it wrote (a snapshot of an older leader) has no index for its requests.
+	 */
+	@Nullable Long backupRequestIndex(long requestId) {
+		Buf value = db().get(0, metaColumnId, metaKey(BACKUP_REQUEST, requestId, 0), RequestType.<Buf>current());
+		return value == null || value.size() != Long.BYTES ? null : ByteBuffer.wrap(value.toByteArray()).getLong();
+	}
+
+	/** Records {@code index} as the first backup entry of {@code requestId}, see {@link #backupRequestIndex}. */
+	void writeBackupRequestIndex(long requestId, long index) {
+		db().put(0L, metaColumnId, metaKey(BACKUP_REQUEST, requestId, 0),
+				Buf.wrap(ByteBuffer.allocate(Long.BYTES).putLong(index).array()), RequestType.none());
+	}
+
+	/**
 	 * The cluster version ({@link Capabilities}) applied here: written by {@link LogEntry.Genesis} and raised by
 	 * {@link LogEntry.ClusterVersion}. 0 on a cluster created before the version existed, until a leader raises it.
 	 */
@@ -739,7 +760,11 @@ final class NodeStore implements Closeable {
 		return lines.isEmpty() ? null : lines.getFirst();
 	}
 
-	/** The seed digest, then, once {@link #noteSeedOpened} ran, {@code opened <digest>}. Empty if there is no file. */
+	/**
+	 * The seed digest, then, once {@link #noteSeedOpened} ran (or restore-backup prepared the directory),
+	 * {@code opened <digest>}; while the start-up check has the database open, also {@value #OPENING} and the
+	 * {@code table} lines of {@link #noteSeedOpening}. Empty if there is no file.
+	 */
 	private static List<String> readSeedDigestLines(Path dbDir) throws IOException {
 		Path file = seedDigestFile(dbDir);
 		if (!Files.exists(file)) {
@@ -747,6 +772,12 @@ final class NodeStore implements Closeable {
 		}
 		return Files.readString(file, StandardCharsets.UTF_8).strip().lines().map(String::strip).toList();
 	}
+
+	private static final String OPENED_LINE = "opened ";
+	/** See {@link #noteSeedOpening}. */
+	static final String OPENING = "opening";
+	private static final String TABLE_LINE = "table ";
+	private static final String IDENTITY_LINE = "identity ";
 
 	/** Next to the database directory, so that a restore, which swaps the database directory, keeps it. */
 	private static Path seedDigestFile(Path dbDir) {
@@ -766,10 +797,19 @@ final class NodeStore implements Closeable {
 	 * and the info logs ({@code LOG*}) are skipped.</p>
 	 *
 	 * <p>A first start can fail after the digest is recorded: before the database opens (a partial copy that RocksDB
-	 * refuses, a refused config), or after the start-up check opened and closed it ({@link #noteSeedOpened}) but before
+	 * refuses, a refused config), while the start-up check has it open (killed during a WAL replay by a start timeout,
+	 * OOM, a power loss: R41-1), or after the start-up check opened and closed it ({@link #noteSeedOpened}) but before
 	 * Raft made its group directory. A recorded digest is kept only while the files are those it was taken from, or
-	 * those the start-up check left: otherwise the database was replaced since (the operator copied the seed again) and
-	 * the digest is taken again. Once Raft has its group directory the node no longer calls this.</p>
+	 * those the start-up check left, or, when the check was stopped during its open ({@value #OPENING}, written by
+	 * {@link #noteSeedOpening} before it), files that only that open can have changed: every table or blob file the
+	 * marker listed that is still there is the same file (same inode and change time, same size), and at least one of
+	 * them is still there (a seed without table files cannot be compared, and is not kept), and IDENTITY, if the seed had
+	 * one, is the same file with the same content (Review of R41, 1: another database copied over {@code db/} without
+	 * deleting it first leaves the seed's table files next to its own, with other numbers, but brings its IDENTITY).
+	 * Otherwise the database was replaced since (the operator copied the seed again) and the digest is taken again. Not
+	 * found: a later copy of the seed's own source database (same IDENTITY) copied over {@code db/} by {@code rsync}
+	 * without {@code --delete}, which skips the unchanged IDENTITY; the runbooks say to delete {@code db/} and the digest
+	 * file before copying again. Once Raft has its group directory the node no longer calls this.</p>
 	 *
 	 * <p>The seed's files are fsynced first ({@link #syncSeed}, R34-1).</p>
 	 *
@@ -784,13 +824,25 @@ final class NodeStore implements Closeable {
 		syncSeed(dbDir);
 		String digest = databaseFilesDigest(dbDir);
 		if (recorded != null) {
-			String opened = lines.size() > 1 && lines.get(1).startsWith("opened ")
-					? lines.get(1).substring("opened ".length()) : null;
+			String opened = openedDigest(lines);
 			if (digest.equals(recorded) || digest.equals(opened)) {
 				return recorded;
 			}
-			LOG.warn("The database in {} changed since its seed digest was recorded by an earlier first start that failed:"
-					+ " recording the digest of the files it holds now", dbDir);
+			if (lines.contains(OPENING)) {
+				String changed = tablesChangedSinceOpening(dbDir, lines);
+				if (changed == null) {
+					LOG.warn("An earlier first start stopped while its start-up check had the database in {} open (killed,"
+							+ " timed out, a power loss): that open changed its files, so the seed digest recorded before it"
+							+ " is kept. If another database was copied into {} since, delete {} before the next start",
+							dbDir, dbDir, seedDigestFile(dbDir));
+					return recorded;
+				}
+				LOG.warn("The database in {} was replaced after an earlier first start stopped during its start-up check"
+						+ " ({}): recording the digest of the files it holds now", dbDir, changed);
+			} else {
+				LOG.warn("The database in {} changed since its seed digest was recorded by an earlier first start that"
+						+ " failed: recording the digest of the files it holds now", dbDir);
+			}
 		}
 		writeSeedDigestFile(dbDir, digest + "\n");
 		return digest;
@@ -812,6 +864,172 @@ final class NodeStore implements Closeable {
 		syncDirectory(absolute.getParent());
 	}
 
+	/** The digest of the {@code opened} line, null if there is none. */
+	private static @Nullable String openedDigest(List<String> lines) {
+		return lines.stream().skip(1).filter(line -> line.startsWith(OPENED_LINE)).findFirst()
+				.map(line -> line.substring(OPENED_LINE.length())).orElse(null);
+	}
+
+	/**
+	 * Marks, next to the recorded seed digest (and the {@code opened} line, kept), that the start-up check is about to
+	 * open the database: {@value #OPENING}, then one {@code table <size> <identity> <path>} line per table and blob file
+	 * under {@code dbDir}, durably, before the open changes anything (R41-1). Opening a database writes a new MANIFEST,
+	 * OPTIONS and CURRENT, replays and flushes its WAL, may compact: a first start killed during that open leaves files
+	 * that match neither the seed digest nor an {@code opened} line, and {@link #recordSeedDigest} would otherwise take
+	 * the digest of those files, which no other copy of the seed has. With the marker it keeps the seed digest as long
+	 * as the files listed here that are still there are the same files, and one at least is: the open adds and deletes
+	 * table files but never rewrites one, while a copy made again ({@code cp}, {@code rsync}, restore-backup) makes new
+	 * ones. It also lists IDENTITY ({@code identity <size> <identity> <sha-256>}, or {@code identity none}), which the
+	 * open keeps and another database copied over this one replaces. Does nothing
+	 * when no seed digest was recorded or {@code dbDir} holds no database; {@link #noteSeedOpened} drops the marker.
+	 */
+	static void noteSeedOpening(Path dbDir) throws IOException {
+		var lines = readSeedDigestLines(dbDir);
+		if (lines.isEmpty() || !Files.isRegularFile(dbDir.resolve("CURRENT"))) {
+			return;
+		}
+		var content = new StringBuilder(lines.getFirst()).append('\n');
+		String opened = openedDigest(lines);
+		if (opened != null) {
+			content.append(OPENED_LINE).append(opened).append('\n');
+		}
+		content.append(OPENING).append('\n');
+		content.append(IDENTITY_LINE).append(identityFile(dbDir)).append('\n');
+		for (var table : tableFiles(dbDir).entrySet()) {
+			content.append(TABLE_LINE).append(table.getValue()).append(' ').append(table.getKey()).append('\n');
+		}
+		writeSeedDigestFile(dbDir, content.toString());
+	}
+
+	/**
+	 * Null if every table or blob file that {@code lines} (the marker of {@link #noteSeedOpening}) listed and that is
+	 * still under {@code dbDir} is the same file, with the same size, at least one of them is still there, and IDENTITY
+	 * is the file the marker listed; otherwise what differs.
+	 */
+	private static @Nullable String tablesChangedSinceOpening(Path dbDir, List<String> lines) throws IOException {
+		var listed = new HashMap<String, String>();
+		for (String line : lines) {
+			if (line.startsWith(TABLE_LINE)) {
+				var parts = line.substring(TABLE_LINE.length()).split(" ", 3);
+				if (parts.length == 3) {
+					listed.put(parts[2], parts[0] + " " + parts[1]);
+				}
+			}
+		}
+		String identityBefore = lines.stream().filter(line -> line.startsWith(IDENTITY_LINE)).findFirst()
+				.map(line -> line.substring(IDENTITY_LINE.length())).orElse(null);
+		// IDENTITY (the database id) is the seed's, the same file: the open keeps an IDENTITY that matches its MANIFEST,
+		// another database copied over db/ brings its own (in place with cp, renamed over it with rsync). A seed without
+		// one (none) gets one from the open.
+		if (identityBefore != null && !identityBefore.equals("none")) {
+			String identityNow = identityFile(dbDir);
+			var before = identityBefore.split(" ", 3);
+			var now = identityNow.split(" ", 3);
+			if (now.length != 3 || before.length != 3 || !before[2].equals(now[2])
+					|| !sameTable(before[0] + " " + before[1], now[0] + " " + now[1])) {
+				return "IDENTITY is not the file it was before the open";
+			}
+		}
+		int same = 0;
+		for (var table : tableFiles(dbDir).entrySet()) {
+			String before = listed.get(table.getKey());
+			if (before == null) {
+				continue;
+			}
+			if (!sameTable(before, table.getValue())) {
+				return table.getKey() + " is another file than before the open";
+			}
+			same++;
+		}
+		// Nothing to compare (a seed whose data is all in its WAL, which the open flushed and deleted): not kept.
+		return same > 0 ? null : "none of the table files listed before the open is there";
+	}
+
+	/**
+	 * The inode number of {@code file} and its status change time, without spaces; {@code -} if the file system has
+	 * neither. Not the device number ({@code fileKey()} on Linux is device and inode): on btrfs subvolumes, NFS, overlayfs
+	 * and some LVM or md setups it is assigned at mount time and can change across the reboot after a power loss during
+	 * the start-up check's open, which would make every listed file look like another one (Review of R41, 2). An inode number is reused once its file is deleted, so a copy made again
+	 * after {@code rm -r} can get the inode of the file it replaces, with its size and (rsync) its modification time; its
+	 * change time is the moment it was made, which no copy tool sets. Opening a database neither links nor rewrites a
+	 * table file, so the identity of one it keeps does not change.
+	 */
+	private static String fileIdentity(Path file, BasicFileAttributes attributes) {
+		Object inode;
+		Object changed;
+		try {
+			var unix = Files.readAttributes(file, "unix:ino,ctime", LinkOption.NOFOLLOW_LINKS);
+			inode = unix.get("ino");
+			changed = unix.get("ctime");
+		} catch (IOException | UnsupportedOperationException | IllegalArgumentException e) {
+			inode = null;
+			changed = null;
+		}
+		if (inode == null && changed == null) {
+			return "-";
+		}
+		return (inode + "@" + changed).replaceAll("\\s", "");
+	}
+
+	/**
+	 * {@code <size> <identity> <SHA-256 of the content>} of the {@code IDENTITY} file of {@code dbDir} (the database id),
+	 * {@code none} if there is none.
+	 */
+	private static String identityFile(Path dbDir) throws IOException {
+		Path file = dbDir.resolve("IDENTITY");
+		BasicFileAttributes attributes;
+		byte[] content;
+		try {
+			attributes = Files.readAttributes(file, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+			content = Files.readAllBytes(file);
+		} catch (NoSuchFileException missing) {
+			return "none";
+		}
+		try {
+			var sha = java.security.MessageDigest.getInstance("SHA-256").digest(content);
+			return attributes.size() + " " + fileIdentity(file, attributes) + " " + java.util.HexFormat.of().formatHex(sha);
+		} catch (java.security.NoSuchAlgorithmException e) {
+			throw new IllegalStateException(e);
+		}
+	}
+
+	/** Two {@code <size> <identity>} values: same size, and same identity unless one of them is unknown ({@code -}). */
+	private static boolean sameTable(String before, String now) {
+		var a = before.split(" ", 2);
+		var b = now.split(" ", 2);
+		return a[0].equals(b[0]) && (a.length < 2 || b.length < 2 || a[1].equals("-") || b[1].equals("-")
+				|| a[1].equals(b[1]));
+	}
+
+	/**
+	 * The table and blob files under {@code dbDir}, by path relative to it: {@code <size> <identity>}, see
+	 * {@link #fileIdentity}.
+	 */
+	private static Map<String, String> tableFiles(Path dbDir) throws IOException {
+		Path root = dbDir.toAbsolutePath().normalize();
+		var tables = new java.util.TreeMap<String, String>();
+		try (Stream<Path> walk = Files.walk(root)) {
+			for (Path file : walk.toList()) {
+				String name = file.getFileName().toString();
+				if (!name.endsWith(".sst") && !name.endsWith(".blob")) {
+					continue;
+				}
+				BasicFileAttributes attributes;
+				try {
+					attributes = Files.readAttributes(file, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+				} catch (NoSuchFileException gone) {
+					continue;
+				}
+				if (!attributes.isRegularFile()) {
+					continue;
+				}
+				tables.put(root.relativize(file).toString().replace('\\', '/'),
+						attributes.size() + " " + fileIdentity(file, attributes));
+			}
+		}
+		return tables;
+	}
+
 	/**
 	 * Notes, next to the recorded seed digest, the digest of the files as the start-up check left them after it opened and
 	 * closed the database: a first start that fails after this point still keeps the seed digest (see
@@ -822,7 +1040,7 @@ final class NodeStore implements Closeable {
 		if (recorded == null || !Files.isRegularFile(dbDir.resolve("CURRENT"))) {
 			return;
 		}
-		writeSeedDigestFile(dbDir, recorded + "\nopened " + databaseFilesDigest(dbDir) + "\n");
+		writeSeedDigestFile(dbDir, recorded + "\n" + OPENED_LINE + databaseFilesDigest(dbDir) + "\n");
 	}
 
 	/**

@@ -144,6 +144,129 @@ class StartupChecksTest {
 		assertEquals(digest, NodeStore.readSeedDigest(node));
 	}
 
+	/**
+	 * R41-1: the marker a start-up check writes before its open keeps the seed digest only for files that open can have
+	 * changed. After a killed check, files the open left keep the digest; a copy made again after it (here a partial one,
+	 * then one of another seed) gets the digest of what it holds, as without the marker, so that genesis still finds it.
+	 */
+	@Test
+	void theOpeningMarkerKeepsTheDigestOnlyForTheFilesThatOpenLeft() throws IOException {
+		var seed = tempDir.resolve("seed");
+		var other = tempDir.resolve("other");
+		for (var dir : List.of(seed, other)) {
+			try (var store = NodeStore.open(dir, null, "seed")) {
+				long column = store.db().createColumn(NodeStoreTest.DATA_COLUMN, NodeStoreTest.DATA_SCHEMA);
+				for (int i = 0; i < (dir == seed ? 100 : 101); i++) {
+					NodeStoreTest.put(store, column, i, "v" + i);
+				}
+			}
+		}
+		var node = tempDir.resolve("node/db");
+		copy(seed, node);
+		var digest = NodeStore.recordSeedDigest(node);
+		NodeStore.noteSeedOpening(node);
+		// The check's open, cut before noteSeedOpened: the files changed, the seed's table files are the same ones.
+		NodeStore.open(node, null, "node").close();
+		assertNotEquals(digest, NodeStore.databaseFilesDigest(node));
+		assertEquals(digest, NodeStore.recordSeedDigest(node));
+		assertEquals(digest, NodeStore.recordSeedDigest(node), "kept again by a retry");
+
+		// The operator copies the seed again, partially: other files, with another digest.
+		NodeStore.noteSeedOpening(node);
+		deleteTree(node);
+		copy(seed, node);
+		Files.delete(largestFile(node, ".sst"));
+		var partial = NodeStore.recordSeedDigest(node);
+		assertNotEquals(digest, partial);
+
+		// Another seed copied in after a killed check: another digest too.
+		NodeStore.noteSeedOpening(node);
+		deleteTree(node);
+		copy(other, node);
+		assertNotEquals(partial, NodeStore.recordSeedDigest(node));
+		assertNotEquals(digest, NodeStore.readSeedDigest(node));
+
+		// The same seed copied again matches its digest, marker or not.
+		NodeStore.noteSeedOpening(node);
+		deleteTree(node);
+		copy(seed, node);
+		assertEquals(digest, NodeStore.recordSeedDigest(node));
+	}
+
+	/**
+	 * Review of R41, 1: after a killed start-up check, another database copied over {@code db/} without deleting it
+	 * first ({@code cp -r other/. db/}, {@code rsync -a other/ db/} without {@code --delete}). Its table files have other
+	 * numbers, so the seed's listed table files stay untouched next to them, and CURRENT, MANIFEST and IDENTITY are the
+	 * other database's. It is not the seed: a new digest is recorded, and genesis stops it.
+	 */
+	@Test
+	void anotherDatabaseCopiedOverTheSeedAfterAKilledCheckGetsANewDigest() throws IOException {
+		var seed = tempDir.resolve("seed");
+		var other = tempDir.resolve("other");
+		try (var store = NodeStore.open(seed, null, "seed")) {
+			long column = store.db().createColumn(NodeStoreTest.DATA_COLUMN, NodeStoreTest.DATA_SCHEMA);
+			for (int i = 0; i < 100; i++) {
+				NodeStoreTest.put(store, column, i, "v" + i);
+			}
+		}
+		// A longer history: its files have higher numbers than any of the seed's.
+		for (int round = 0; round < 6; round++) {
+			NodeStore.open(other, null, "other").close();
+		}
+		try (var store = NodeStore.open(other, null, "other")) {
+			long column = store.db().createColumn(NodeStoreTest.DATA_COLUMN, NodeStoreTest.DATA_SCHEMA);
+			for (int i = 0; i < 100; i++) {
+				NodeStoreTest.put(store, column, i, "w" + i);
+			}
+			store.db().flush();
+		}
+		for (boolean inPlace : List.of(true, false)) {
+			var node = tempDir.resolve((inPlace ? "in-place" : "renamed") + "/db");
+			copy(seed, node);
+			var digest = NodeStore.recordSeedDigest(node);
+			NodeStore.noteSeedOpening(node);
+			NodeStore.open(node, null, "node").close();
+			assertEquals(digest, NodeStore.recordSeedDigest(node), "the killed check alone");
+			var seedTables = fileNames(node, ".sst");
+			var otherTables = fileNames(other, ".sst");
+			assertFalse(otherTables.isEmpty());
+			assertTrue(seedTables.stream().noneMatch(otherTables::contains), seedTables + " " + otherTables);
+
+			NodeStore.noteSeedOpening(node);
+			copyOver(other, node, inPlace);
+			assertTrue(fileNames(node, ".sst").containsAll(seedTables), "the seed's table files are still there");
+			assertNotEquals(digest, NodeStore.recordSeedDigest(node), (inPlace ? "cp" : "rsync") + " of another database");
+		}
+	}
+
+	/** The names of the files under {@code root} that end with {@code suffix}. */
+	private static List<String> fileNames(Path root, String suffix) throws IOException {
+		try (Stream<Path> walk = Files.walk(root)) {
+			return walk.map(path -> path.getFileName().toString()).filter(name -> name.endsWith(suffix)).toList();
+		}
+	}
+
+	/**
+	 * Copies {@code source} over {@code target} without deleting what it holds: in place, as {@code cp} (same inode), or
+	 * as {@code rsync} (a new file renamed over the old one).
+	 */
+	private static void copyOver(Path source, Path target, boolean inPlace) throws IOException {
+		try (Stream<Path> walk = Files.walk(source)) {
+			for (Path path : walk.toList()) {
+				Path destination = target.resolve(source.relativize(path).toString());
+				if (Files.isDirectory(path)) {
+					Files.createDirectories(destination);
+				} else if (inPlace) {
+					Files.write(destination, Files.readAllBytes(path));
+				} else {
+					Path temporary = destination.resolveSibling("." + destination.getFileName() + ".tmp");
+					Files.copy(path, temporary, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+					Files.move(temporary, destination, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+				}
+			}
+		}
+	}
+
 	/** DD-19: a replica's database becomes a seed: same data, no replication metadata, so a new cluster accepts it. */
 	@Test
 	void anExportedReplicaSeedsANewCluster() throws IOException {

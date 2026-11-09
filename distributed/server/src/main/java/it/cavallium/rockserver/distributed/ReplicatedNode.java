@@ -190,6 +190,9 @@ public final class ReplicatedNode implements AutoCloseable {
 			// Before anything opens the database: copies of a seed are the same only until then. It fsyncs the seed's
 			// files first, which an operator copied into place and nothing fsynced (R34-1).
 			NodeStore.recordSeedDigest(config.dbDir());
+			// Durably, before the check's open changes the files: a start killed during that open keeps the seed digest
+			// at the next first start (R41-1).
+			NodeStore.noteSeedOpening(config.dbDir());
 			requireNoClusterData(config);
 			NodeStore.noteSeedOpened(config.dbDir());
 		} else if (config.join() && startedOutsideJoin()) {
@@ -1242,6 +1245,12 @@ public final class ReplicatedNode implements AutoCloseable {
 	}
 
 	/**
+	 * Tests only: called inside the start-up check's open of the database of a first start, once it is open; what it
+	 * throws stops the start there, as a kill during that open would (the files are changed already, R41-1).
+	 */
+	static volatile java.util.function.@Nullable Consumer<NodeConfig> startupCheckOpenedForTesting;
+
+	/**
 	 * A node without Raft state starts a fresh member (term 0, no vote). Its database must then not belong to the
 	 * cluster already: a member that lost its Raft state but kept its id could vote twice in one term. Such a node
 	 * must be replaced: wipe it and add it back under a new id.
@@ -1251,6 +1260,10 @@ public final class ReplicatedNode implements AutoCloseable {
 			return;
 		}
 		try (var store = NodeStore.open(config.dbDir(), config.rockserverConfig(), config.nodeId())) {
+			var opened = startupCheckOpenedForTesting;
+			if (opened != null) {
+				opened.accept(config);
+			}
 			if (store.clusterId() != null) {
 				throw new IOException("Node " + config.nodeId() + " has the database of cluster " + store.clusterId()
 						+ " but no Raft state in " + config.raftDir() + ": it cannot rejoin under the same id."

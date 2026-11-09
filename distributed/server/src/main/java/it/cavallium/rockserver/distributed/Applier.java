@@ -133,8 +133,12 @@ final class Applier {
 		/** A {@link LogEntry.Checksum} at {@code position}. */
 		default void checksum(TermIndex position, NodeStore store) {}
 
-		/** A {@link LogEntry.Backup} at {@code position}. */
-		default void backup(String name, long requestId, TermIndex position, NodeStore store) {}
+		/**
+		 * A {@link LogEntry.Backup} at {@code position}. {@code firstIndex} is the log index of the first entry of the
+		 * same request ({@link NodeStore#backupRequestIndex}): this entry's own index, unless the request was proposed
+		 * again after its first answer was lost (R41-3).
+		 */
+		default void backup(String name, long requestId, TermIndex position, long firstIndex, NodeStore store) {}
 	}
 
 	private volatile Maintenance maintenance = Maintenance.NONE;
@@ -1323,7 +1327,19 @@ final class Applier {
 			case LogEntry.Backup backup -> {
 				requireNoTransaction(tx, entry);
 				var position = Objects.requireNonNull(alonePosition, "position");
-				maintenance.backup(backup.name(), backup.requestId(), position, store);
+				// The first entry of a request decides where its backup is, on every replica: the index travels in the
+				// meta column, so a replica that installed a snapshot past that entry knows it too (R41-3). Request id 0
+				// (an admin without ids) names no request.
+				long firstIndex = position.getIndex();
+				if (backup.requestId() != 0) {
+					Long recorded = store.backupRequestIndex(backup.requestId());
+					if (recorded == null) {
+						store.writeBackupRequestIndex(backup.requestId(), firstIndex);
+					} else {
+						firstIndex = recorded;
+					}
+				}
+				maintenance.backup(backup.name(), backup.requestId(), position, firstIndex, store);
 				yield position.getIndex();
 			}
 		};

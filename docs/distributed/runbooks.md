@@ -77,6 +77,14 @@ the check of step 3 finds.
    only.
 4. Start every node as for an empty cluster. The first leader proposes a seeded genesis; every replica then takes a
    snapshot of the seed (the log says `snapshot taken`).
+   A first start that fails or is stopped before the node joins (a refused config, or a kill or a start timeout while
+   it opens a large seed to check it) can simply be started again: it keeps the digest it recorded before it opened the
+   database (R41-1; the log says `the seed digest recorded before it is kept`). If you copy the seed again in between,
+   delete `<data-dir>/db` and `<data-dir>/db.seed-digest` first (or use `rsync -a --delete`): the node then records
+   the digest of the new copy. A copy made over the old files without deleting them (`cp -r`, `rsync` without
+   `--delete`) is found when it brings another database's `IDENTITY`, but not when it is a later copy of the seed's own
+   source database, which `rsync` leaves the same `IDENTITY`. If the log says it kept the digest and you put another
+   database in place after such a stop, delete `<data-dir>/db.seed-digest` before the next start.
 5. Check: `rs admin $PEERS checksum` prints `OK` and the same digest for every node.
 6. Only then point clients at the cluster.
 
@@ -256,8 +264,11 @@ one. `export-seed` likewise leaves neither its target nor `<target>.tmp` when it
 
 Then, for each backup:
 
-1. Copy one node's `<data-dir>/backups/<name>` off the cluster (all of them hold the same data; `backup.properties`
-   says the log index and cluster).
+1. Copy one node's `<data-dir>/backups/<name>` off the cluster (all of them hold the same data, that of one log
+   position; `backup.properties` says the log index and cluster). A backup that `admin` proposed twice (after a lost
+   answer) is the copy taken at the first entry on every node: the nodes that have it say `DONE` with `taken at log
+   index <first>`, and a node that installed a snapshot past that entry says it holds no copy, which makes the command
+   fail naming it; copy the backup from a node that has it, or take one under another name to have it everywhere.
 2. Delete `<data-dir>/backups/<name>` on every node once it is copied: until then the hard links keep the replaced
    files on the node's disk.
 3. Now and then, check a copy by restoring it (below) on a spare host.
@@ -338,7 +349,8 @@ within `--timeout-ms`, plus at most 1 s when the proposal itself used the limit 
 results once more for that long), and the time to close its connections. A node that took the `checksum` request is waited for
 up to `--timeout-ms`, since it bounds the request itself with its own `--request-timeout-ms` and an answer cut short
 would leave open whether the digest runs; `backup` waits at most 30 s per node and then proposes the same backup through
-the next one, which is harmless (its request id makes the second proposal a no-op if the first commits).
+the next one, which is harmless (its request id makes the second proposal a no-op if the first commits: every node
+keeps the copy taken at the first entry, see Backups).
 `--allow-skipped` accepts nodes that skipped the position (it is refused with any other command, as
 `--unsafe-multi-voter-change` is with any command but `add-peer` and `remove-peer`). The digest reads every key of the
 database on every node at once, holding a snapshot meanwhile: run it at a quiet time on large databases. With

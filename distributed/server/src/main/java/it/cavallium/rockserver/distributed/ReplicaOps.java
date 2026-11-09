@@ -78,8 +78,10 @@ import org.slf4j.LoggerFactory;
  * could not write (disk full, a name used before) is logged, recorded in {@code replica-ops.log} and reported by
  * {@code admin backup} and {@code admin backup-status}, and does not stop the replica: the entry's result is its log
  * index on every replica. Results are kept by log index, so a name used again later is never answered with an older
- * result. The same request proposed twice ({@link LogEntry.Backup#requestId}, after a lost answer) finds its own backup
- * and reports it done. Restoring one starts a new cluster seeded from it, see {@link #restore}. The runbook is
+ * result. The same request proposed twice ({@link LogEntry.Backup#requestId}, after a lost answer) keeps the position
+ * of its first entry on every replica ({@link NodeStore#backupRequestIndex}, R41-3): a replica with the copy taken there
+ * reports it done, naming that index; one without it (it installed a snapshot past that entry) reports that it holds
+ * none, and takes no copy at the later entry. Restoring one starts a new cluster seeded from it, see {@link #restore}. The runbook is
  * {@code docs/distributed/runbooks.md}.</p>
  */
 final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
@@ -499,10 +501,23 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 
 	// Backups
 
+	/** {@link #backup(String, long, TermIndex, long, NodeStore)} of the first entry of its request. Tests only. */
+	void backup(String name, long requestId, TermIndex position, NodeStore store) {
+		backup(name, requestId, position, position.getIndex(), store);
+	}
+
+	/**
+	 * Writes the backup {@code name} at {@code position}, or, for the same request proposed again ({@code firstIndex}
+	 * below the entry's index, R41-3), reports the copy taken at {@code firstIndex}: DONE where it is, FAILED where it is
+	 * not (a replica that installed a snapshot past that entry, or whose copy failed there), never a new copy at this
+	 * entry, so that every copy of one request holds the same log position. The result is kept under the entry's index,
+	 * the one admin asks about, and its detail names the index of the copy when it is not the entry's.
+	 */
 	@Override
-	public void backup(String name, long requestId, TermIndex position, NodeStore store) {
+	public void backup(String name, long requestId, TermIndex position, long firstIndex, NodeStore store) {
 		long index = position.getIndex();
-		Path dir = config.dataDir().resolve(BACKUPS_DIR).resolve(name);
+		Path backups = config.dataDir().resolve(BACKUPS_DIR);
+		Path dir = backups.resolve(name);
 		Result result;
 		// Set once this attempt owns the directory: an existing backup of that name was refused before.
 		boolean writing = false;
@@ -522,14 +537,36 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 					record(name, result);
 					return;
 				}
+				if (requestId != 0 && String.valueOf(requestId).equals(existing.getProperty("request"))
+						&& Long.parseLong(existing.getProperty("index", "-1")) != firstIndex) {
+					// The copy of this request is not at the request's first entry as this node knows it (Review of R41,
+					// 3): mixed versions only, a database from a snapshot of an older leader, which records no first index
+					// (this node then took this entry for the first), or a copy an older version took. Other nodes may hold
+					// a copy at another index under this name: FAILED, not DONE, so that admin does not report OK.
+					throw new IOException("The backup " + name + " of this request here was taken at log index "
+							+ existing.getProperty("index") + ", but this node has log index " + firstIndex + " for the"
+							+ " request's first entry (a snapshot of an older version's leader, or a copy an older version"
+							+ " took): the copies of this request on the nodes may be at different log positions. Check the"
+							+ " index in each node's backup.properties, or take a backup under another name");
+				}
 				if (requestId != 0 && String.valueOf(requestId).equals(existing.getProperty("request"))) {
-					// The same request proposed again, after its first answer was lost: that backup is this one.
+					// The same request proposed again, after its first answer was lost: that backup is this one, at the
+					// index where it was taken, which the result says (R41-3).
 					LOG.info("{}: backup {} at log index {} is the one written at index {} for the same request",
 							config.nodeId(), name, index, existing.getProperty("index"));
-					record(name, new Result(State.DONE, index, 0, dir.toString()));
+					record(name, new Result(State.DONE, index, 0, dir + " (taken at log index " + existing.getProperty("index")
+							+ ": the same request, proposed again at " + index + ")"));
 					return;
 				}
 				throw new IOException("A backup named " + name + " exists already, at index " + existing.getProperty("index"));
+			}
+			if (firstIndex != index) {
+				// The request's backup was taken at its first entry, on every replica that applied it: a copy here, at this
+				// entry, would hold another log position under the same name (R41-3).
+				throw new IOException("The backup " + name + " of this request was taken at log index " + firstIndex
+						+ " (the same request was proposed again at " + index + "), and this node holds no copy of it: it"
+						+ " installed a snapshot past that index, or its copy failed there. The other nodes' copies are at index "
+						+ firstIndex + "; take a backup under another name to have one on every node");
 			}
 			long start = System.nanoTime();
 			writing = true;
@@ -554,6 +591,10 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 			NodeStore.syncFile(temporary);
 			Files.move(temporary, dir.resolve(BACKUP_PROPERTIES));
 			NodeStore.syncDirectory(dir);
+			// The entries this backup may have made: <name> in backups/, and backups in the data directory at the first
+			// backup. Before DONE, so that a power loss cannot take back a backup reported written (R41-2).
+			NodeStore.syncDirectory(backups);
+			NodeStore.syncDirectory(config.dataDir());
 			result = new Result(State.DONE, index, 0, dir.toString());
 			LOG.info("{}: backup {} at log index {} written to {} in {} ms", config.nodeId(), name, index, dir,
 					(System.nanoTime() - start) / 1_000_000);
