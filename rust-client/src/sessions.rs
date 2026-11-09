@@ -37,6 +37,8 @@ const MAX_PAUSE: Duration = Duration::from_secs(1);
 /// How long an update id is remembered: longer than any update lease.
 const UPDATE_MEMORY: Duration = Duration::from_secs(600);
 const MAX_REMEMBERED_UPDATES: usize = 1 << 16;
+/// Stale entries of the order queue beyond the live ones before it is compacted (R50-4).
+const ORDER_SLACK: usize = 1024;
 const ERROR_PREFIX: &str = "RocksDBError: [uid:";
 
 /// The Rockserver error type a failed call carries in its message (`RocksDBError: [uid:TYPE] ...`), if any.
@@ -186,7 +188,8 @@ impl Drop for Number {
 /// Update ids returned by `get_for_update`, remembered so that the write ending the update is numbered.
 #[derive(Default)]
 struct Updates {
-    /// Id and the time it is forgotten, oldest first; an entry whose time differs from `ids` is stale.
+    /// Id and the time it is forgotten, oldest first; an entry whose time differs from `ids` is stale. At most
+    /// `2 * ids.len() + ORDER_SLACK` entries (R50-4), so `MAX_REMEMBERED_UPDATES` bounds it too.
     order: VecDeque<(i64, Instant)>,
     ids: HashMap<i64, Instant>,
     forgotten: u64,
@@ -307,6 +310,14 @@ impl SessionWrites {
         let forget_at = now + UPDATE_MEMORY;
         updates.ids.insert(update_id, forget_at);
         updates.order.push_back((update_id, forget_at));
+        // Only the front is trimmed above, and it stops at the first open update: one that stays open (an ending write
+        // dropped, a `get_for_update` never followed by a write) would keep every later entry for up to
+        // `UPDATE_MEMORY`. The stale ones go once they outnumber the live ones by `ORDER_SLACK` (R50-4); each
+        // compaction removes at least as many entries as it keeps, so its cost is amortized over the pushes.
+        if updates.order.len() > 2 * updates.ids.len() + ORDER_SLACK {
+            let Updates { order, ids, .. } = &mut *updates;
+            order.retain(|(id, at)| ids.get(id) == Some(at));
+        }
     }
 
     /// Forgets an update: it ended (its final write has an answer, or it was closed as failed).
@@ -330,6 +341,12 @@ impl SessionWrites {
     #[cfg(test)]
     fn forgotten_updates(&self) -> u64 {
         self.updates.lock().unwrap().forgotten
+    }
+
+    /// Entries of the order queue, stale ones included (R50-4).
+    #[cfg(test)]
+    fn update_order_len(&self) -> usize {
+        self.updates.lock().unwrap().order.len()
     }
 
     /// The current session, opened if there is none. Opening is retried, within this write's deadline, after an
@@ -1046,6 +1063,24 @@ mod tests {
         writes.update_opened(43);
         writes.update_ended(43);
         assert!(!writes.numbers(43), "re-observing an id does not leave a stale copy behind");
+        assert_eq!(writes.forgotten_updates(), 0);
+    }
+
+    /// R50-4: one update that stays open (its ending write dropped, or a `get_for_update` never followed by a write)
+    /// kept every later entry of the order queue, since only its front was ever trimmed: the queue grew with every
+    /// update opened, for up to `UPDATE_MEMORY`. It stays bounded by the open updates now.
+    #[test]
+    fn the_order_queue_stays_bounded_while_one_update_stays_open() {
+        let writes = SessionWrites::new(true);
+        writes.update_opened(1);
+        for id in 2..200_000 {
+            writes.update_opened(id);
+            writes.update_ended(id);
+            let len = writes.update_order_len();
+            assert!(len <= 2 * 2 + ORDER_SLACK, "{len} entries for one open update after {id} ids");
+        }
+        assert!(writes.numbers(1), "the open update is still remembered");
+        assert!(!writes.numbers(199_999));
         assert_eq!(writes.forgotten_updates(), 0);
     }
 

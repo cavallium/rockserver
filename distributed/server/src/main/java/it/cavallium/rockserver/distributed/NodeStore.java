@@ -934,8 +934,10 @@ final class NodeStore implements Closeable {
 	 * log assumes the seed is in every replica's database, and no entry holds it. The seed snapshot taken after genesis
 	 * hard-links the same inodes, which {@link #syncTree(Path)} skips. Runs at every first start (no Raft group
 	 * directory yet, see {@link #recordSeedDigest}), so once per node unless a first start fails: one fsync per file of
-	 * the seed, which forces out what writeback has not flushed yet and is cheap for what it has. Volumes or a WAL
-	 * directory configured outside {@code dbDir} are not reached: the runbooks' {@code sync} after the copy covers them.
+	 * the seed, which forces out what writeback has not flushed yet and is cheap for what it has. A node that starts
+	 * has every column volume and its WAL directory under {@code dbDir}: one configured outside makes the open that
+	 * follows refuse the start ({@link #checkVolumesInside}, {@code walDir}), so nothing of a seed in use is left out
+	 * (R50-2).
 	 */
 	static void syncSeed(Path dbDir) throws IOException {
 		Path absolute = dbDir.toAbsolutePath().normalize();
