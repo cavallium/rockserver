@@ -785,8 +785,9 @@ public final class ReplicatedServerMain {
 		record Answer(PeerConfig peer, @Nullable String silence) {}
 		// The members that took the request without telling whether it was proposed (R39-1), over every round.
 		var took = new LinkedHashSet<String>();
+		// The last answer of any round (R39 review 3): the final round can end at the deadline before any answer.
+		String last = null;
 		while (true) {
-			String last = null;
 			int answering = 0;
 			var versionRefusals = new ArrayList<String>();
 			var answered = new LinkedBlockingQueue<Answer>();
@@ -843,13 +844,14 @@ public final class ReplicatedServerMain {
 						+ " caught up. Otherwise upgrade every member first");
 			}
 			if (System.nanoTime() - deadlineNanos > 0) {
+				var lastAnswer = last != null ? "; last answer " + last : "";
 				if (!took.isEmpty()) {
 					failIncomplete("no member answered with the log index of the request within the time limit"
-							+ " (--timeout-ms); last answer " + last + ". " + String.join(", ", took) + " took the request"
+							+ " (--timeout-ms)" + lastAnswer + ". " + String.join(", ", took) + " took the request"
 							+ " and gave no answer in time: it may have been proposed, and may still be applied. "
 							+ (ifTaken != null ? ifTaken : "Look for it in the logs of the members"));
 				}
-				failIncomplete("no member took the request within the time limit (--timeout-ms); last answer " + last
+				failIncomplete("no member took the request within the time limit (--timeout-ms)" + lastAnswer
 						+ ". Nothing was proposed: run the command again");
 			}
 			Thread.sleep(SEED_SNAPSHOT_POLL_MS);
