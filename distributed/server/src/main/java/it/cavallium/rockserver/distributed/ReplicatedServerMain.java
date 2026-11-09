@@ -760,7 +760,8 @@ public final class ReplicatedServerMain {
 	 * answer of a non-idempotent one leaves open whether it was proposed: nothing was compared or written for sure, and
 	 * the command can be run again. An idempotent one ({@code backup}) that a member took (it answered the capabilities
 	 * question, and its call then ended with a status other than {@link #notProposed}: cut by the time limit or by
-	 * {@link #proposalWait}, CANCELLED, UNKNOWN, INTERNAL; a proposer's not-applied refusal is UNAVAILABLE, see
+	 * {@link #proposalWait}, CANCELLED, UNKNOWN, INTERNAL, or a bare UNAVAILABLE of a transport that broke mid-call
+	 * (R40-1); a proposer's not-applied refusal is a marked UNAVAILABLE that is notProposed, see
 	 * {@link ReplicaOps#notAppliedAsStatus}) and that no member then answered with its log index in time
 	 * ends with {@link #EXIT_INCOMPLETE} too, but names those members and says that it may have been proposed and may
 	 * still be applied, followed by {@code ifTaken} (R39-1): a slow leader may have appended it, and a rerun has a new
@@ -826,12 +827,12 @@ public final class ReplicatedServerMain {
 							|| status.getCode() == Status.Code.UNIMPLEMENTED) {
 						fail(peer.id() + " refused: " + status.getDescription());
 					}
-					if (!idempotent && !notProposed(status.getCode())) {
+					if (!idempotent && !notProposed(status)) {
 						failIncomplete("the answer of " + peer.id() + " (" + status + ") does not tell whether the operation"
 								+ " was proposed: look for it in the logs of the members, or run the command again");
 					}
 					last = peer.id() + ": " + status;
-					if (!notProposed(status.getCode())) {
+					if (!notProposed(status)) {
 						took.add(peer.id());
 					}
 				}
@@ -903,11 +904,17 @@ public final class ReplicatedServerMain {
 	}
 
 	/**
-	 * Whether a failed call to propose an operation certainly proposed nothing: the node was not there (UNAVAILABLE: no
-	 * connection, or the node is starting) or serves no such group (NOT_FOUND).
+	 * Whether a failed call to propose an operation certainly proposed nothing: the member says so itself
+	 * ({@link ReplicaOps#provesNotProposed}: UNAVAILABLE beginning with {@link ReplicaOps#NOT_PROPOSED}, because the node
+	 * is starting or its proposer refused the entry as not applied, an older member's "The node is starting", or
+	 * NOT_FOUND, no such group). A bare UNAVAILABLE does not (R40-1): grpc-java answers it also when the transport breaks
+	 * after the member received the call (a kill, a restart, a reset, a GOAWAY), when its proposer may have sent the
+	 * entry already, so it counts as a member that took the request ({@code backup}) or as an answer that does not tell
+	 * ({@code checksum}). An older member's not-applied refusal has no mark and counts so too, the safe direction. The
+	 * capabilities question ({@link #answers}) still reads any failure as not answered: it proposes nothing.
 	 */
-	static boolean notProposed(Status.Code code) {
-		return code == Status.Code.UNAVAILABLE || code == Status.Code.NOT_FOUND;
+	static boolean notProposed(Status status) {
+		return ReplicaOps.provesNotProposed(status);
 	}
 
 	/** Exit code of {@code checksum} and {@code backup} when a member gave no final result, or no usable one. */

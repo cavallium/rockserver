@@ -289,7 +289,8 @@ class ProposerQueueTest {
 
 	/**
 	 * R39 review 1: a backup proposal that the node's proposer refuses as not applied (no leader accepted it in time;
-	 * likewise a full admission or a caller deadline before it was sent) is answered UNAVAILABLE, which {@code admin}
+	 * likewise a full admission or a caller deadline before it was sent) is answered UNAVAILABLE, marked with
+	 * {@link ReplicaOps#NOT_PROPOSED} (R40-1, unlike a transport UNAVAILABLE), which {@code admin}
 	 * reads as nothing proposed ({@link ReplicatedServerMain#notProposed}), so that it does not say the backup "may have
 	 * been proposed". Before, it reached the caller as a RocksDBException that the ops service turned into ABORTED. A
 	 * failure without the not-applied flag (the node is stopping) still goes through as it was.
@@ -326,7 +327,7 @@ class ProposerQueueTest {
 			var error = assertThrows(ExecutionException.class, () -> ops.answer(request).get(10, TimeUnit.SECONDS));
 			var refused = assertInstanceOf(StatusRuntimeException.class, ReplicatedConnection.unwrap(error), error.toString());
 			assertEquals(Status.Code.UNAVAILABLE, refused.getStatus().getCode(), refused.toString());
-			assertTrue(ReplicatedServerMain.notProposed(refused.getStatus().getCode()));
+			assertTrue(ReplicatedServerMain.notProposed(refused.getStatus()));
 			assertTrue(refused.getStatus().getDescription().contains("not applied"), refused.toString());
 			// R40-1: marked as the member's own proof that nothing was proposed, unlike a transport UNAVAILABLE.
 			assertTrue(refused.getStatus().getDescription().startsWith("Not proposed: "), refused.toString());

@@ -110,13 +110,21 @@ class ReplicaOpsTest {
 				Map.of("n0", done("d"), "n2", done("d"))).exitCode());
 	}
 
-	/** Only an answer that proves nothing was proposed lets admin propose a checksum again. */
+	/**
+	 * Only an answer that proves nothing was proposed lets admin propose a checksum again: a member's own marked
+	 * UNAVAILABLE (also an older member's "The node is starting") or NOT_FOUND, not a bare UNAVAILABLE of a transport
+	 * that broke mid-call (R40-1).
+	 */
 	@Test
 	void retriedOnlyWhenNothingWasProposed() {
-		assertTrue(ReplicatedServerMain.notProposed(Status.Code.UNAVAILABLE));
-		assertTrue(ReplicatedServerMain.notProposed(Status.Code.NOT_FOUND));
-		assertFalse(ReplicatedServerMain.notProposed(Status.Code.ABORTED));
-		assertFalse(ReplicatedServerMain.notProposed(Status.Code.DEADLINE_EXCEEDED));
+		assertTrue(ReplicatedServerMain.notProposed(Status.UNAVAILABLE.withDescription(ReplicaOps.NOT_PROPOSED + "x")));
+		assertTrue(ReplicatedServerMain.notProposed(Status.UNAVAILABLE.withDescription("The node is starting")));
+		assertTrue(ReplicatedServerMain.notProposed(Status.NOT_FOUND.withDescription("No group x")));
+		assertFalse(ReplicatedServerMain.notProposed(Status.UNAVAILABLE));
+		assertFalse(ReplicatedServerMain.notProposed(Status.UNAVAILABLE.withDescription("Network closed for unknown reason")));
+		assertFalse(ReplicatedServerMain.notProposed(Status.UNAVAILABLE.withDescription("shutdownNow invoked")));
+		assertFalse(ReplicatedServerMain.notProposed(Status.ABORTED.withDescription(ReplicaOps.NOT_PROPOSED + "x")));
+		assertFalse(ReplicatedServerMain.notProposed(Status.DEADLINE_EXCEEDED));
 	}
 
 	/**
@@ -132,6 +140,7 @@ class ReplicaOpsTest {
 					() -> ops.answer(ReplicaOps.request(ReplicaOps.OP_PROPOSE_CHECKSUM, new byte[0])).join());
 			var status = Status.fromThrowable(error.getCause());
 			assertEquals(Status.Code.UNAVAILABLE, status.getCode(), status.toString());
+			assertTrue(ReplicatedServerMain.notProposed(status), status.toString());
 			assertTrue(status.getDescription().startsWith("Not proposed: "), status.toString());
 		}
 	}

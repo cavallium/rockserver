@@ -1095,10 +1095,39 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 				&& status.getDescription().startsWith(VERSION_REFUSAL);
 	}
 
+	/**
+	 * How the description of this member's own UNAVAILABLE answer to {@link #OP_PROPOSE_CHECKSUM} or
+	 * {@link #OP_PROPOSE_BACKUP} begins when it proves that nothing was proposed (R40-1): the node is starting (no
+	 * proposer yet), or its proposer refused the entry as not applied ({@link #notAppliedAsStatus}). grpc-java answers
+	 * UNAVAILABLE also when the transport breaks after the member received the call (a kill, a restart, a reset, a
+	 * GOAWAY), when its proposer may have sent the entry already; that UNAVAILABLE has no such description, and
+	 * {@code admin} does not read it as nothing proposed ({@link ReplicatedServerMain#notProposed}).
+	 */
+	static final String NOT_PROPOSED = "Not proposed: ";
+	/**
+	 * The whole description of a starting node's refusal in the versions before {@link #NOT_PROPOSED} (R40-1), which
+	 * {@code admin} still reads as nothing proposed during a rolling upgrade.
+	 */
+	static final String OLD_STARTING = "The node is starting";
+
+	/**
+	 * Whether {@code status}, the answer to a proposal call, is a member's own proof that nothing was proposed: UNAVAILABLE
+	 * with {@link #NOT_PROPOSED} (or an older member's {@link #OLD_STARTING}), or NOT_FOUND (no such group on that
+	 * node: gRPC itself never answers NOT_FOUND).
+	 */
+	static boolean provesNotProposed(Status status) {
+		if (status.getCode() == Status.Code.NOT_FOUND) {
+			return true;
+		}
+		var description = status.getDescription();
+		return status.getCode() == Status.Code.UNAVAILABLE && description != null
+				&& (description.startsWith(NOT_PROPOSED) || description.equals(OLD_STARTING));
+	}
+
 	private CompletableFuture<byte[]> propose(long capability, LogEntry entry) {
 		var proposer = this.proposer;
 		if (proposer == null) {
-			return failed(Status.UNAVAILABLE, "The node is starting");
+			return failed(Status.UNAVAILABLE, NOT_PROPOSED + "the node is starting");
 		}
 		if (!clusterHas(capability)) {
 			// Before anything is proposed: see versionRefusal.
@@ -1114,8 +1143,9 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 
 	/**
 	 * R39 review 1: a proposal that the proposer refused as not applied ({@link RocksDBException#isNotApplied()}: no
-	 * leader accepted it in time, a full write admission, a deadline before it was sent) becomes UNAVAILABLE, which
-	 * {@code admin} reads as nothing proposed ({@link ReplicatedServerMain#notProposed}): so a backup that no leader
+	 * leader accepted it in time, a full write admission, a deadline before it was sent) becomes UNAVAILABLE, its
+	 * description beginning with {@link #NOT_PROPOSED} (R40-1), which {@code admin} reads as nothing proposed
+	 * ({@link ReplicatedServerMain#notProposed}), unlike a bare UNAVAILABLE of a broken transport: so a backup that no leader
 	 * accepted does not end with "it may have been proposed", and a checksum is asked of the next member. One that
 	 * could not be encoded becomes INVALID_ARGUMENT, a refusal. Any other failure is left as it is, and the ops
 	 * service turns it into ABORTED: it does not tell whether the entry was appended.
@@ -1125,9 +1155,10 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 		if (!(cause instanceof RocksDBException rocks) || !rocks.isNotApplied()) {
 			return error;
 		}
-		var status = rocks.getErrorUniqueId() == RocksDBErrorType.INVALID_REQUEST ? Status.INVALID_ARGUMENT
-				: Status.UNAVAILABLE;
-		return status.withDescription(rocks.getMessage()).asRuntimeException();
+		if (rocks.getErrorUniqueId() == RocksDBErrorType.INVALID_REQUEST) {
+			return Status.INVALID_ARGUMENT.withDescription(rocks.getMessage()).asRuntimeException();
+		}
+		return Status.UNAVAILABLE.withDescription(NOT_PROPOSED + rocks.getMessage()).asRuntimeException();
 	}
 
 	private static CompletableFuture<byte[]> failed(Status status, String message) {
