@@ -127,6 +127,11 @@ public final class GrpcConnection extends BaseConnection {
 	public static final String SESSION_WRITES_PROPERTY = "it.cavallium.rockserver.grpc.client.session-writes";
 
 	private static final Logger SESSION_LOG = LoggerFactory.getLogger(GrpcConnection.class);
+	/**
+	 * How long {@link #close()} waits for the numbered writes in flight before it closes the channels (R51-3): as long
+	 * as the ordinary channel's graceful shutdown waits for its calls.
+	 */
+	private static final long CLOSE_DRAIN_SECONDS = 60;
 	private final GrpcConnectionDelegate delegate;
 	/** Numbered writes, on a replicated server that has client sessions and a connection that retries. */
 	private final @Nullable SessionWrites sessionWrites;
@@ -327,6 +332,17 @@ public final class GrpcConnection extends BaseConnection {
 			// Before the channel (R50-3): a numbered write started while it shuts down, which can take minutes, is not
 			// sent and fails not applied; copies already in flight still drain.
 			writes.closing();
+			// R51-3: drained here, before the delegate forces the leader channels of a multi-address connection (R49-1),
+			// which would cut a numbered write in flight on one of them and end it OUTCOME_UNKNOWN. Bounded as the
+			// ordinary channel's graceful wait; a copy still in flight then is cut, and ends unknown.
+			try {
+				if (!writes.awaitInFlight(TimeUnit.SECONDS.toNanos(CLOSE_DRAIN_SECONDS))) {
+					SESSION_LOG.warn("Numbered writes were still in flight {} s after the close began: they end OUTCOME_UNKNOWN",
+							CLOSE_DRAIN_SECONDS);
+				}
+			} catch (InterruptedException e) {
+				Thread.currentThread().interrupt();
+			}
 		}
 		try {
 			delegate.close();

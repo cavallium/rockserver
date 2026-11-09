@@ -16,6 +16,7 @@ import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
 import it.cavallium.rockserver.core.common.RocksDBRetryException;
 import it.cavallium.rockserver.core.common.UpdateContext;
 import it.unimi.dsi.fastutil.longs.LongRBTreeSet;
+import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -310,6 +311,40 @@ final class SessionWrites {
 	 */
 	void closing() {
 		closed = true;
+	}
+
+	/**
+	 * After {@link #closing}: waits, up to {@code timeoutNanos}, until no copy of a numbered write is in flight any more
+	 * (R51-3), so that the close can then force the channels, the leader channels of a multi-address connection
+	 * included (R49-1), without cutting a copy whose answer was on its way. A copy that ends without an answer from now
+	 * on ends its write as {@link Call#failClosed}, never as a resend. Returns whether every copy ended in time; one
+	 * still in flight at the limit is cut by the forcing that follows and ends {@code OUTCOME_UNKNOWN}.
+	 */
+	boolean awaitInFlight(long timeoutNanos) throws InterruptedException {
+		long deadline = System.nanoTime() + timeoutNanos;
+		while (true) {
+			var copies = new ArrayList<CompletableFuture<?>>();
+			for (var call : live) {
+				var copy = call.inFlight;
+				if (copy != null && !copy.isDone()) {
+					copies.add(copy);
+				}
+			}
+			if (copies.isEmpty()) {
+				return true;
+			}
+			long left = deadline - System.nanoTime();
+			if (left <= 0) {
+				return false;
+			}
+			try {
+				CompletableFuture.allOf(copies.toArray(CompletableFuture[]::new)).get(left, TimeUnit.NANOSECONDS);
+			} catch (ExecutionException ended) {
+				// One of them failed; the others are looked at again.
+			} catch (TimeoutException late) {
+				return false;
+			}
+		}
 	}
 
 	/**
