@@ -632,10 +632,14 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 		return applied;
 	}
 
-	/** Copies the backup's database to {@code db} and drops its replication metadata; returns its applied entry. */
+	/**
+	 * Copies the backup's database to {@code db} and drops its replication metadata; returns its applied entry. The
+	 * files linked from the backup are fsynced: an operator copied it with {@code cp}, {@code rsync} or {@code scp},
+	 * which do not fsync, and its files and the restored ones are the same inodes (R34-1).
+	 */
 	private static TermIndex restoreDatabase(Path backupDir, Path db, @Nullable Path rockserverConfig)
 			throws IOException {
-		NodeStore.restore(backupDir.resolve(BACKUP_DB_DIR), db);
+		NodeStore.restore(backupDir.resolve(BACKUP_DB_DIR), db, false);
 		TermIndex applied;
 		long version;
 		try (var store = NodeStore.open(db, rockserverConfig, "restore")) {
