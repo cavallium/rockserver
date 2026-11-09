@@ -974,6 +974,35 @@ class CommandLineTest {
 	}
 
 	/**
+	 * R35-1: {@code restore-backup --data-dir /x/link/..}, with {@code link} pointing to {@code /real/a/b}, restores into
+	 * {@code /x/db}, the directory a {@code run} with the same {@code --data-dir} opens, and says so. Every command
+	 * normalizes {@code --data-dir} once, as export-seed does. Before, the backup went to {@code /real/a/db}, an empty
+	 * {@code /x/db} was opened, and the command printed OK with the raw path.
+	 */
+	@Test
+	void restoreBackupNormalizesTheDataDirectoryOnce() throws IOException {
+		Path source = temp.resolve("source");
+		NodeStoreTest.writeDatabaseOfVersion(source.resolve("db"), Capabilities.SUPPORTED);
+		Path backup = temp.resolve("backup");
+		try (var store = NodeStore.open(source.resolve("db"), null, "source")) {
+			store.checkpoint(backup.resolve(ReplicaOps.BACKUP_DB_DIR));
+		}
+		Files.writeString(backup.resolve(ReplicaOps.BACKUP_PROPERTIES), "name=b\nindex=7\ncluster=c\n");
+		Path real = Files.createDirectories(temp.resolve("real").resolve("a"));
+		Path x = Files.createDirectories(temp.resolve("x"));
+		Files.createSymbolicLink(x.resolve("link"), Files.createDirectories(real.resolve("b")));
+
+		var restore = run("restore-backup", "--backup", backup.toString(), "--data-dir",
+				x.resolve("link").resolve("..").toString());
+
+		assertEquals(0, restore.code(), restore.toString());
+		Path normalized = x.toAbsolutePath().normalize();
+		assertTrue(restore.out().startsWith("OK: " + normalized + " holds the data up to log index 7 "), restore.out());
+		assertTrue(Files.isRegularFile(normalized.resolve("db").resolve("CURRENT")));
+		assertTrue(Files.notExists(real.resolve("db")), "restored where the OS resolves the data directory");
+	}
+
+	/**
 	 * R31-2: {@code export-seed} of a stopped node whose {@code db/} is behind the snapshot in its Raft directory (a
 	 * crash during a snapshot installation) restores the snapshot first, as the node's start would, and prints the
 	 * snapshot's index. A node of another group needs {@code --group-id}, as {@code run} and {@code repair-log} do:

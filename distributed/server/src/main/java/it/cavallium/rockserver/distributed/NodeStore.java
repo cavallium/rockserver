@@ -1526,7 +1526,8 @@ final class NodeStore implements Closeable {
 	private record RestoreDirs(Path dbDir, Path parent, Path building, Path ready, Path old) {
 
 		static RestoreDirs of(Path dbDir) {
-			Path absolute = dbDir.toAbsolutePath();
+			// Normalized as open() normalizes dbDir: the swap must fill the directory the open then reads (R35-1).
+			Path absolute = dbDir.toAbsolutePath().normalize();
 			String name = absolute.getFileName().toString();
 			return new RestoreDirs(absolute,
 					absolute.getParent(),
