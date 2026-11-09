@@ -26,6 +26,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.function.IntConsumer;
 import org.apache.ratis.thirdparty.io.grpc.Server;
 import org.apache.ratis.thirdparty.io.grpc.ServerServiceDefinition;
+import org.apache.ratis.thirdparty.io.grpc.Status;
 import org.apache.ratis.thirdparty.io.grpc.netty.NettyServerBuilder;
 import org.apache.ratis.thirdparty.io.grpc.stub.ServerCalls;
 import org.jetbrains.annotations.Nullable;
@@ -122,6 +123,10 @@ class CommandLineTest {
 		for (long i = 0; i < KEYS; i++) {
 			api.put(0, column, key(i), value("v" + i), RequestType.none());
 		}
+		// R32-3: the puts commit on a majority, so the third member may not have applied the genesis yet; the test
+		// checks the commands, not a lagging member's refusal (see aLaggingMemberThatAnswersFirstDoesNotStopTheCommand).
+		InProcessCluster.await(TIMEOUT, () -> cluster.runningNodes().stream().allMatch(node ->
+				Capabilities.has(node.stateMachine().ops().clusterVersion(), Capabilities.CHECKSUM | Capabilities.BACKUP)));
 		var admin = new ArrayList<String>(List.of("admin"));
 		for (var peer : leader.config().peers()) {
 			admin.add("--peer");
@@ -577,6 +582,149 @@ class CommandLineTest {
 	}
 
 	/**
+	 * R32-4: a member that has not applied the cluster version that the leader committed (it lags: a member added with
+	 * add-peer that is still catching up, a slow disk, right after a start) refuses {@code checksum} and {@code backup}
+	 * from its own view, which is behind the cluster's, and here it answers first. Its refusal proposed nothing, so the
+	 * command goes on with the next member that answered and succeeds; it says that the member refused. Before, the
+	 * command ended with 1 on that first refusal ("Upgrade every member first") although every member supports both.
+	 */
+	@Test
+	void aLaggingMemberThatAnswersFirstDoesNotStopTheCommand() throws Exception {
+		cluster = new InProcessCluster(Files.createDirectories(temp.resolve("lagging")), 3, c -> c).startAll();
+		cluster.awaitLeader(TIMEOUT);
+		InProcessCluster.await(TIMEOUT, () -> cluster.runningNodes().stream().allMatch(node ->
+				Capabilities.has(node.stateMachine().ops().clusterVersion(), Capabilities.BACKUP)));
+		var lagging = cluster.anyFollower();
+		var laggingId = lagging.config().nodeId();
+		// Its applied view lacks what checksum and backup need, as if the entry that raised them were still unapplied;
+		// the rest (checksum-schemas among it) stays, so its digest is the others'.
+		var ops = lagging.stateMachine().ops();
+		ops.clusterVersion(ops.clusterVersion() & ~(Capabilities.CHECKSUM | Capabilities.BACKUP));
+		var proxies = new ArrayList<LinkProxy>();
+		try {
+			var args = new ArrayList<String>(List.of("admin", "--peer", lagging.config().self().format()));
+			for (var id : List.of("n0", "n1", "n2")) {
+				if (id.equals(laggingId)) {
+					continue;
+				}
+				// The others answer 800 ms later: the lagging member answers first and gets the proposal first.
+				var self = cluster.config(id).self();
+				var proxy = new LinkProxy(new java.net.InetSocketAddress("127.0.0.1", 0),
+						new java.net.InetSocketAddress(self.raftHost(), self.raftPort()));
+				proxy.shape(LinkProxy.Shaping.latency(Duration.ofMillis(400), Duration.ZERO));
+				proxies.add(proxy);
+				args.add("--peer");
+				args.add(id + "=127.0.0.1:" + proxy.listenAddress().getPort() + "/" + self.apiHost() + ":"
+						+ self.apiPort());
+			}
+			args.addAll(List.of("--timeout-ms", "20000"));
+			for (var command : List.of(List.of("checksum"), List.of("backup", "b9"))) {
+				var result = run(with(args, command.toArray(String[]::new)));
+				assertEquals(0, result.code(), result.toString());
+				assertTrue(result.out().contains(laggingId + " refused"), result.toString());
+				assertTrue(result.out().contains(" at log index "), result.toString());
+				for (var id : List.of("n0", "n1", "n2")) {
+					assertTrue(result.out().contains(id + ": DONE"), result.toString());
+				}
+				assertTrue(result.out().strip().endsWith("OK"), result.toString());
+			}
+		} finally {
+			for (var proxy : proxies) {
+				proxy.close();
+			}
+		}
+	}
+
+	/**
+	 * R32-4: when every member that answered refuses for its cluster version, the command fails with 1 and names each of
+	 * them with the version it gave (here in the words of a member of an older version), having asked each once. A
+	 * member that does not answer is not waited for.
+	 */
+	@Test
+	void everyMemberRefusingForItsVersionFailsNamingThem() throws Exception {
+		var refusal = Status.FAILED_PRECONDITION.withDescription(
+				"Not every member supports checksum yet: the cluster version is none. Upgrade every member first");
+		try (var first = new RefusingMember(Duration.ZERO, refusal);
+				var second = new RefusingMember(Duration.ofMillis(300), refusal);
+				var silent = new java.net.ServerSocket(0, 50, java.net.InetAddress.getLoopbackAddress())) {
+			var result = run("admin", "--peer", first.peer("v1"), "--peer", second.peer("v2"),
+					"--peer", "d1=127.0.0.1:" + silent.getLocalPort() + "/127.0.0.1:" + silent.getLocalPort(),
+					"--timeout-ms", "10000", "checksum");
+			assertEquals(1, result.code(), result.toString());
+			assertEquals(1, first.count(ReplicaOps.OP_PROPOSE_CHECKSUM), result.toString());
+			assertEquals(1, second.count(ReplicaOps.OP_PROPOSE_CHECKSUM), result.toString());
+			var failed = result.out().lines().filter(line -> line.startsWith("FAILED: ")).findFirst().orElseThrow();
+			assertTrue(failed.contains("v1") && failed.contains("v2") && !failed.contains("d1"), failed);
+			assertTrue(failed.contains("the cluster version is none"), failed);
+			assertTrue(failed.contains("every member that answered"), failed);
+		}
+	}
+
+	/**
+	 * R32-4: a refusal that is not about the cluster version (here a made-up precondition) still ends the command with 1
+	 * at once: the next member that answered is not asked.
+	 */
+	@Test
+	void anotherRefusalStillEndsTheCommandAtOnce() throws Exception {
+		try (var first = new RefusingMember(Duration.ZERO,
+				Status.FAILED_PRECONDITION.withDescription("A backup named b1 is in the way"));
+				var second = new RefusingMember(Duration.ofMillis(300), Status.FAILED_PRECONDITION.withDescription(
+						"Not every member supports backup yet: the cluster version is none. Upgrade every member first"))) {
+			var result = run("admin", "--peer", first.peer("r1"), "--peer", second.peer("r2"),
+					"--timeout-ms", "10000", "backup", "b1");
+			assertEquals(1, result.code(), result.toString());
+			assertTrue(result.out().contains("r1 refused: A backup named b1 is in the way"), result.toString());
+			assertEquals(1, first.count(ReplicaOps.OP_PROPOSE_BACKUP), result.toString());
+			assertEquals(0, second.count(ReplicaOps.OP_PROPOSE_BACKUP), result.toString());
+		}
+	}
+
+	/**
+	 * A member that answers the capabilities question after {@code delay} and refuses every proposal with {@code
+	 * refusal}, keeping what it was asked.
+	 */
+	private static final class RefusingMember implements AutoCloseable {
+		final List<byte[]> asked = new CopyOnWriteArrayList<>();
+		final Server server;
+
+		RefusingMember(Duration delay, Status refusal) throws IOException {
+			ServerCalls.UnaryMethod<byte[], byte[]> ops = (request, response) -> {
+				var rest = java.util.Arrays.copyOfRange(request, 16, request.length);
+				if (rest.length > 0 && rest[0] == ReplicaOps.OP_CAPABILITIES) {
+					try {
+						Thread.sleep(delay);
+					} catch (InterruptedException ex) {
+						Thread.currentThread().interrupt();
+					}
+					response.onNext(ByteBuffer.allocate(2 * Long.BYTES).putLong(Capabilities.SUPPORTED).putLong(0).array());
+					response.onCompleted();
+				} else {
+					asked.add(rest);
+					response.onError(refusal.asRuntimeException());
+				}
+			};
+			server = NettyServerBuilder.forAddress(new java.net.InetSocketAddress("127.0.0.1", 0))
+					.addService(ServerServiceDefinition.builder(TermService.SERVICE_NAME)
+							.addMethod(TermService.OPS, ServerCalls.asyncUnaryCall(ops)).build())
+					.build()
+					.start();
+		}
+
+		String peer(String id) {
+			return id + "=127.0.0.1:" + server.getPort() + "/127.0.0.1:" + server.getPort();
+		}
+
+		long count(byte op) {
+			return asked.stream().filter(request -> request[0] == op).count();
+		}
+
+		@Override
+		public void close() throws InterruptedException {
+			server.shutdownNow().awaitTermination(5, TimeUnit.SECONDS);
+		}
+	}
+
+	/**
 	 * A member that answers the capabilities question at once and then never answers anything else, as a leader on a
 	 * hung disk would: it keeps what it was asked.
 	 */
@@ -895,6 +1043,35 @@ class CommandLineTest {
 		assertTrue(exported.out().contains("applied up to index 5 of term 1"), exported.out());
 		assertTrue(exported.out().contains("damaged snapshot at index 40"), exported.out());
 		assertTrue(Files.exists(seed.resolve("CURRENT")));
+	}
+
+	/**
+	 * R32-5: {@code export-seed} of a node that runs (it holds raft/&lt;group&gt;/in_use.lock for its lifetime, also
+	 * while it installs a snapshot with {@code db/} closed) is refused with 1 before anything of the node is touched:
+	 * its {@code db.restore-tmp} that an installation is building, its snapshot ahead of {@code db/}. Before, the open
+	 * of {@code db/} finished or deleted the restore directories first, and the export went on.
+	 */
+	@Test
+	void exportSeedRefusesWhileTheNodeHoldsItsRaftLock() throws IOException {
+		Path dataDir = temp.resolve("node");
+		writeNodeBehindASnapshot(dataDir, NodeConfig.DEFAULT_GROUP_ID);
+		Path building = Files.createDirectories(dataDir.resolve("db.restore-tmp"));
+		Files.writeString(building.resolve("000042.sst"), "being copied");
+		Path lockFile = dataDir.resolve("raft").resolve(NodeConfig.DEFAULT_GROUP_ID).resolve("in_use.lock");
+		Path seed = temp.resolve("seed");
+		try (var channel = java.nio.channels.FileChannel.open(lockFile, java.nio.file.StandardOpenOption.CREATE,
+				java.nio.file.StandardOpenOption.WRITE); var lock = channel.lock()) {
+			var refused = run("export-seed", "--data-dir", dataDir.toString(), "--target", seed.toString());
+			assertEquals(1, refused.code(), refused.toString());
+			assertTrue(refused.thrown() == null, refused.toString());
+			assertTrue(refused.err().contains(lockFile + " is locked: stop the node first"), refused.err());
+			assertTrue(Files.notExists(seed));
+			assertEquals("being copied", Files.readString(building.resolve("000042.sst")));
+		}
+		// Stopped: the export goes on, the snapshot ahead restored first.
+		var exported = run("export-seed", "--data-dir", dataDir.toString(), "--target", seed.toString());
+		assertEquals(0, exported.code(), exported.toString());
+		assertTrue(exported.out().contains("applied up to index 40 of term 4"), exported.out());
 	}
 
 	/**
