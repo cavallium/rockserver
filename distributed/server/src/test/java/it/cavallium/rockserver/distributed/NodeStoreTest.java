@@ -1189,6 +1189,65 @@ class NodeStoreTest {
 		}
 	}
 
+	/**
+	 * R36 review 1: a Rockserver config whose {@code wal-path} is an absolute path inside {@code DATA-DIR/db} (which the
+	 * node's start accepts) restores: the build aside opens its WAL inside {@code db.restore-backup}, not in
+	 * {@code DATA-DIR/db/wal}, which made {@code db/} appear before the renames and the wal-path check refuse the build.
+	 */
+	@Test
+	void restoreBackupWithAnAbsoluteWalPathInsideTheDatabase() throws IOException {
+		assertRestoresWithAnAbsolutePathInsideTheDatabase("wal-path", "wal");
+	}
+
+	/**
+	 * R36 review 1: the same for {@code log-path}: the build's info log went to {@code DATA-DIR/db/logs}, so {@code db/}
+	 * existed before the renames, and the rename of the build to {@code db/} failed on every run.
+	 */
+	@Test
+	void restoreBackupWithAnAbsoluteLogPathInsideTheDatabase() throws IOException {
+		assertRestoresWithAnAbsolutePathInsideTheDatabase("log-path", "logs");
+	}
+
+	private void assertRestoresWithAnAbsolutePathInsideTheDatabase(String key, String child) throws IOException {
+		Path backupDir = tempDir.resolve("backup");
+		checkpointWithData(backupDir.resolve(ReplicaOps.BACKUP_DB_DIR), 10, TermIndex.valueOf(1, 10));
+		Files.writeString(backupDir.resolve(ReplicaOps.BACKUP_PROPERTIES), "name=b\nindex=10\ncluster=c\n");
+		Path dataDir = Files.createDirectories(tempDir.resolve("data")).toAbsolutePath().normalize();
+		Files.writeString(dataDir.resolve("replica-ops.log"), "old cluster\n");
+		Path config = tempDir.resolve("absolute.conf");
+		Files.writeString(config, "database.global.%s = \"%s\"\n".formatted(key, dataDir.resolve("db").resolve(child)));
+
+		assertEquals(TermIndex.valueOf(1, 10), ReplicaOps.restore(backupDir, dataDir, config));
+
+		var names = entryNames(dataDir);
+		assertEquals(3, names.size(), names.toString());
+		assertEquals(List.of("db", "db.seed-digest"), names.subList(0, 2));
+		assertTrue(names.get(2).startsWith("replica-ops.log.before-restore-"), names.toString());
+		assertTrue(Files.isDirectory(dataDir.resolve("db").resolve(child)), "the " + key + " directory is inside db/");
+		try (var store = NodeStore.open(dataDir.resolve("db"), config, "restored")) {
+			assertEquals(10, contents(store, store.db().getColumnId(DATA_COLUMN)).size());
+		}
+	}
+
+	/**
+	 * R36 review 2: after an earlier restore-backup that succeeded (its {@code db/} is there and {@code backups/} was
+	 * renamed), a repeat with the old {@code --backup DATA-DIR/backups/<x>} is refused for the database it would
+	 * overwrite, not told to run again with the moved path, which would be refused for the same database.
+	 */
+	@Test
+	void aRepeatAfterASuccessfulRestoreIsRefusedForTheDatabaseNotSentToTheMovedBackup() throws IOException {
+		Path dataDir = Files.createDirectories(tempDir.resolve("data"));
+		Path moved = dataDir.resolve(ReplicaOps.BACKUPS_DIR + ".before-restore-1").resolve("b1");
+		checkpointWithData(moved.resolve(ReplicaOps.BACKUP_DB_DIR), 10, TermIndex.valueOf(1, 10));
+		Files.writeString(moved.resolve(ReplicaOps.BACKUP_PROPERTIES), "name=b\nindex=10\ncluster=c\n");
+		assertEquals(TermIndex.valueOf(1, 10), ReplicaOps.restore(moved, dataDir, null));
+
+		var refused = assertThrows(IOException.class,
+				() -> ReplicaOps.restore(dataDir.resolve(ReplicaOps.BACKUPS_DIR).resolve("b1"), dataDir, null));
+		assertTrue(refused.getMessage().contains("holds a database"), refused.getMessage());
+		assertFalse(refused.getMessage().contains("run again with"), refused.getMessage());
+	}
+
 	private void assertRestoredWithTheBackupMovedAside(Path dataDir, String name) throws IOException {
 		try (var store = NodeStore.open(dataDir.resolve("db"), null, "restored")) {
 			assertEquals(TermIndex.INITIAL_VALUE, store.applied(), "the replication metadata is dropped");
