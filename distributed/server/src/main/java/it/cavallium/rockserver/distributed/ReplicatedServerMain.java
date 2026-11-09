@@ -706,7 +706,7 @@ public final class ReplicatedServerMain {
 					// A request id makes it safe to propose again after an answer that was lost.
 					long requestId = new SecureRandom().nextLong() | 1;
 					// R39-1: what to do when a member took it and gave no answer in time, so that it may still be written.
-					var ifTaken = "look on the members for <data-dir>/backups/" + name + "/backup.properties holding request="
+					var ifTaken = "Look on the members for <data-dir>/backups/" + name + "/backup.properties holding request="
 							+ requestId + " (its index= is the log index), or for \"backup " + name + " at log index\" in their"
 							+ " logs, and then run backup-status " + name + " <index>; or take the backup under another name: run"
 							+ " again with " + name + ", it is refused (\"A backup named " + name + " exists already\") once this"
