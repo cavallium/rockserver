@@ -576,6 +576,56 @@ class DeferredRockserverConnectionTest {
 		}
 	}
 
+	/**
+	 * Review of R47, 1: a cancel made on the thread that is making the call, while it is being made (a dependent stage
+	 * of another future that the call completes synchronously), is not a cancel "before the call": the call is made,
+	 * the cancel is passed to it once it exists, and this future ends as the call does. A call that refuses the cancel
+	 * (a numbered write that sent a copy) keeps its outcome; one that accepts it ends cancelled.
+	 */
+	@Test
+	void cancelWhileTheCallIsBeingMadeOnTheSameThreadReachesTheCall() throws Exception {
+		for (boolean refuses : new boolean[] {true, false}) {
+			var inner = new CompletableFuture<Object>() {
+				@Override
+				public boolean cancel(boolean mayInterruptIfRunning) {
+					return !refuses && super.cancel(mayInterruptIfRunning);
+				}
+			};
+			var holder = new java.util.concurrent.atomic.AtomicReference<CompletableFuture<?>>();
+			var nestedCancel = new java.util.concurrent.atomic.AtomicReference<Boolean>();
+			var client = client();
+			var api = mock(RocksDBAsyncAPI.class);
+			when(api.requestAsync(any())).thenAnswer(invocation -> {
+				nestedCancel.set(holder.get().cancel(true));
+				return inner;
+			});
+			when(client.getAsyncApi(any())).thenReturn(api);
+			var release = new CountDownLatch(1);
+			try (var deferred = deferred(URL, () -> {
+				assertTrue(release.await(5, TimeUnit.SECONDS));
+				return client;
+			})) {
+				CompletableFuture<?> call = deferred.getAsyncApi(RequestContext.analytical()).getColumnIdAsync("c");
+				holder.set(call);
+				release.countDown();
+				verify(api, timeout(5_000)).requestAsync(any());
+				assertEquals(Boolean.FALSE, nestedCancel.get(), "the call was being made: the cancel cannot be granted yet");
+				if (refuses) {
+					assertFalse(inner.isCancelled());
+					assertFalse(call.isCancelled(), "the call refused the cancel");
+					inner.completeExceptionally(RocksDBException.of(RocksDBErrorType.OUTCOME_UNKNOWN, "lost"));
+					var error = assertThrows(ExecutionException.class, () -> call.get(5, TimeUnit.SECONDS));
+					assertEquals(RocksDBErrorType.OUTCOME_UNKNOWN, rocks(error).getErrorUniqueId());
+				} else {
+					assertTrue(inner.isCancelled(), "the cancel reached the call made after it");
+					assertThrows(CancellationException.class, () -> call.get(5, TimeUnit.SECONDS));
+				}
+			} finally {
+				release.countDown();
+			}
+		}
+	}
+
 	private static CompletableFuture<?> start(int operation, RocksDBConnection deferred) {
 		var api = deferred.getAsyncApi(RequestContext.analytical());
 		return switch (operation) {
