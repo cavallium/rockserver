@@ -936,6 +936,8 @@ class CommandLineTest {
 			assertTrue(taken.out().contains("request=" + requestId), taken.toString());
 			assertTrue(taken.out().contains("backup-status b9 <index>"), taken.toString());
 			assertTrue(taken.out().contains("another name"), taken.toString());
+			// R39 review 3: an answer of an earlier round is kept, and a missing one is not printed as "null".
+			assertTrue(!taken.out().contains("last answer null"), taken.toString());
 		}
 		int closedPort;
 		try (var probe = new java.net.ServerSocket(0)) {
@@ -946,6 +948,7 @@ class CommandLineTest {
 		assertEquals(ReplicatedServerMain.EXIT_INCOMPLETE, none.code(), none.toString());
 		assertTrue(none.out().contains("Nothing was proposed: run the command again"), none.toString());
 		assertTrue(!none.out().contains("may have been proposed"), none.toString());
+		assertTrue(!none.out().contains("last answer null"), none.toString());
 	}
 
 	/**
