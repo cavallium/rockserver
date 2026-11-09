@@ -221,7 +221,7 @@ final class NodeStore implements Closeable {
 	 * JDK's temporary directory (see {@code ReplicatedServerMain}). {@code nodeId} is the metrics node name when the
 	 * config sets none.
 	 */
-	private static Path replicaConfig(@Nullable Path rockserverConfig, Path dbDir, @Nullable Path sourceDbDir,
+	static Path replicaConfig(@Nullable Path rockserverConfig, Path dbDir, @Nullable Path sourceDbDir,
 			String nodeId) throws IOException {
 		var config = ConfigFactory.parseString(REPLICA_OVERRIDES);
 		try {
@@ -843,6 +843,11 @@ final class NodeStore implements Closeable {
 	 * @throws ReplicatedNode.NewerVersionException if the replica's cluster version has capabilities this version lacks:
 	 *                                              nothing is written
 	 */
+	static ExportedSeed exportSeed(Path dbDir, @Nullable Path stateMachineDir, @Nullable Path rockserverConfig,
+			Path target) throws IOException {
+		return exportSeed(dbDir, rockserverConfig, target);
+	}
+
 	static ExportedSeed exportSeed(Path dbDir, @Nullable Path rockserverConfig, Path target) throws IOException {
 		target = target.toAbsolutePath().normalize();
 		if (Files.exists(target)) {
@@ -892,11 +897,12 @@ final class NodeStore implements Closeable {
 			db.flush();
 		}
 		syncTree(target);
-		return new ExportedSeed(applied, clusterId);
+		return new ExportedSeed(applied, clusterId, null, null);
 	}
 
 	/** What {@link #exportSeed} copied: the applied position and the cluster (null if none) of the replica. */
-	record ExportedSeed(TermIndex applied, @Nullable String clusterId) {}
+	record ExportedSeed(TermIndex applied, @Nullable String clusterId, @Nullable TermIndex restoredSnapshot,
+			@Nullable String damagedSnapshot) {}
 
 	private @Nullable Buf readMeta(byte metaKey) {
 		return db().get(0, metaColumnId, key(metaKey), RequestType.<Buf>current());

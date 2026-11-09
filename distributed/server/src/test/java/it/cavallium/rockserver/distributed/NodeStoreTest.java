@@ -22,12 +22,15 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.nio.file.attribute.PosixFilePermission;
+import java.nio.file.attribute.PosixFilePermissions;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import org.apache.ratis.server.protocol.TermIndex;
@@ -833,5 +836,66 @@ class NodeStoreTest {
 		}
 		assertTrue(Files.exists(inUse), inUse + " was deleted");
 		assertFalse(Files.exists(legacy), legacy + " is still there");
+	}
+
+	/**
+	 * R31-1: the config a replica opens its database with holds the resolved Rockserver config, with the InfluxDB token
+	 * and every {@code ${?ENV}} substitution in plain text: it is owner-only (rw-------) as R29-2's
+	 * {@code Files.createTempFile} made it, whatever the umask, and also when it replaces the file a killed open left
+	 * with a wider mode.
+	 */
+	@Test
+	void theReplicaConfigIsOwnerOnly() throws IOException {
+		Assumptions.assumeTrue(posix(tempDir), "a POSIX file system");
+		Path dataDir = Files.createDirectories(tempDir.resolve("node"));
+		Path dbDir = dataDir.resolve("db");
+		Path config = NodeStore.replicaConfig(null, dbDir, null, "n0");
+		assertEquals(NodeStore.replicaConfigFile(dbDir), config);
+		assertEquals("rw-------", mode(config), "a new config");
+		Files.delete(config);
+
+		// What a killed open left, with the mode that round 29 to 30 gave it (the umask's, usually 0644).
+		Files.writeString(config, "{}");
+		Files.setPosixFilePermissions(config, PosixFilePermissions.fromString("rw-r--r--"));
+		NodeStore.replicaConfig(null, dbDir, null, "n0");
+		assertEquals("rw-------", mode(config), "a config that replaced a leftover");
+		assertTrue(Files.readString(config).contains("n0"), Files.readString(config));
+		Files.delete(config);
+	}
+
+	/**
+	 * R31-1: the config of an {@code export-seed} target, which lives next to the target while the source is copied,
+	 * is owner-only too, also when it replaces a leftover with a wider mode.
+	 */
+	@Test
+	void theExportTargetConfigIsOwnerOnly() throws IOException {
+		Assumptions.assumeTrue(posix(tempDir), "a POSIX file system");
+		Path source = tempDir.resolve("node/db");
+		try (var store = NodeStore.open(source, null, "source")) {
+			long column = store.db().createColumn(DATA_COLUMN, DATA_SCHEMA);
+			put(store, column, 1, "v1");
+		}
+		Path target = tempDir.resolve("seed");
+		Path config = NodeStore.replicaConfigFile(target);
+		Files.writeString(config, "{}");
+		Files.setPosixFilePermissions(config, PosixFilePermissions.fromString("rw-rw-r--"));
+		var seen = new AtomicReference<String>();
+		NodeStore.checkpointBuiltForTesting = building -> seen.set(mode(config));
+		try {
+			NodeStore.exportSeed(source, null, target);
+		} finally {
+			NodeStore.checkpointBuiltForTesting = null;
+		}
+		assertEquals("rw-------", seen.get(), "the target's config while the source was copied");
+		assertFalse(Files.exists(config));
+	}
+
+	static boolean posix(Path dir) {
+		return dir.getFileSystem().supportedFileAttributeViews().contains("posix");
+	}
+
+	static String mode(Path file) throws IOException {
+		Set<PosixFilePermission> permissions = Files.getPosixFilePermissions(file);
+		return PosixFilePermissions.toString(permissions);
 	}
 }
