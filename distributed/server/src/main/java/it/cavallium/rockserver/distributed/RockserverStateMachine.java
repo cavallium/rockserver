@@ -1107,6 +1107,9 @@ final class RockserverStateMachine extends BaseStateMachine {
 	private void snapshotByBytes(long appliedBytes) {
 		if (bytesSinceSnapshot.addAndGet(appliedBytes) < config.snapshotEveryBytes()
 				|| snapshotBackoff.waiting(System.nanoTime())
+				// A replay after a start whose seed reached the threshold: takeSnapshot would answer "none" (R48-1). The
+				// next group asks again, at the latest the leader's first entry of its term once the replay is done.
+				|| behindTheDatabase()
 				|| !snapshotByBytesPending.compareAndSet(false, true)) {
 			return;
 		}
@@ -1252,6 +1255,10 @@ final class RockserverStateMachine extends BaseStateMachine {
 	 * and each try drains the apply and flushes every memtable (100-300 ms) before it can fail: after a failure this
 	 * answers "no snapshot taken" ({@code -1}, which Ratis passes over without an error or a purge) until
 	 * {@link SnapshotBackoff} allows the next try, 1 s after the first failure, doubling up to a minute.
+	 *
+	 * <p>It answers the same, without a checkpoint and keeping the byte count, while Ratis has not handed over the log up
+	 * to the database's applied index ({@link #behindTheDatabase}): a snapshot is at that index, and Ratis takes one past
+	 * its own applied index for a bug of the state machine (an ERROR, no purge) (R48-1).</p>
 	 */
 	@Override
 	public long takeSnapshot() throws IOException {
@@ -1259,6 +1266,12 @@ final class RockserverStateMachine extends BaseStateMachine {
 			throw new IOException("Replica failed, not taking a snapshot");
 		}
 		if (snapshotBackoff.waiting(System.nanoTime())) {
+			return RaftLog.INVALID_LOG_INDEX;
+		}
+		if (behindTheDatabase()) {
+			// Ratis asks again after each entry it hands over while a snapshot is due: not worth a line each time.
+			LOG.debug("{}: not taking a snapshot: the database applied {}, Ratis handed over up to {}", config.nodeId(),
+					applied.get(), handedOver);
 			return RaftLog.INVALID_LOG_INDEX;
 		}
 		snapshotAttempts.incrementAndGet();
@@ -1286,6 +1299,24 @@ final class RockserverStateMachine extends BaseStateMachine {
 					snapshotBackoff.failures(), delay / 1_000_000, ex);
 			throw ex;
 		}
+	}
+
+	/**
+	 * True while Ratis has not handed over every log entry up to the database's applied index: after a start, Ratis'
+	 * StateMachineUpdater begins at the log's snapshot index and hands the log over again (the entries this database
+	 * already applied are skipped) only as commits arrive, while the database is already further. A snapshot is at the
+	 * database's index, and Ratis' updater refuses one past its own applied index: it logs "Bug in StateMachine" and
+	 * does not purge the log (R48-1). Ratis' applied index is at least {@link #handedOver} (it counts an entry applied
+	 * when it hands it over) and at least the latest snapshot's index (where it starts, and where an install puts it).
+	 * One volatile read and the snapshot's index: no work per applied entry.
+	 */
+	private boolean behindTheDatabase() {
+		long ratisApplied = handedOver;
+		var latest = storage.getLatestSnapshot();
+		if (latest != null) {
+			ratisApplied = Math.max(ratisApplied, latest.getIndex());
+		}
+		return applied.get() > ratisApplied;
 	}
 
 	/**

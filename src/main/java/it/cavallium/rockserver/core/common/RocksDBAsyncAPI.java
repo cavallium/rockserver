@@ -91,6 +91,12 @@ public interface RocksDBAsyncAPI extends RocksDBAsyncAPIRequestHandler {
 		return requestAsync(new CheckMergeOperator(name, hash));
 	}
 
+	/**
+	 * Uploads the merge operator unless one with the same jar is there ({@link #checkMergeOperatorAsync}, then
+	 * {@link #uploadMergeOperatorAsync}), and answers its version. The future's {@code cancel} reaches the call in flight,
+	 * as a single call's does (R48-3): before the upload is made it stops the check and nothing is uploaded; after, it is
+	 * the upload's own cancel, so an upload whose copy was sent with client sessions refuses it and ends OUTCOME_UNKNOWN.
+	 */
 	default CompletableFuture<Long> ensureMergeOperatorAsync(String name, String className, byte[] jarData) {
 		byte[] hash;
 		try {
@@ -99,13 +105,9 @@ public interface RocksDBAsyncAPI extends RocksDBAsyncAPIRequestHandler {
 		} catch (NoSuchAlgorithmException e) {
 			return CompletableFuture.failedFuture(e);
 		}
-		return checkMergeOperatorAsync(name, hash).thenCompose(existing -> {
-			if (existing != null) {
-				return CompletableFuture.completedFuture(existing);
-			} else {
-				return uploadMergeOperatorAsync(name, className, jarData);
-			}
-		});
+		return ChainedCall.of(checkMergeOperatorAsync(name, hash), existing -> existing != null
+				? CompletableFuture.completedFuture(existing)
+				: uploadMergeOperatorAsync(name, className, jarData));
 	}
 
 	/** See: {@link DeleteColumn}. */

@@ -289,8 +289,7 @@ class DeferredRockserverConnectionTest {
 			assertTrue(entered.await(5, TimeUnit.SECONDS));
 			var failure = assertThrows(ExecutionException.class,
 					() -> pending.get(5, TimeUnit.SECONDS));
-			assertEquals(Status.Code.DEADLINE_EXCEEDED,
-					Status.fromThrowable(failure.getCause()).getCode());
+			assertNotSent(RocksDBErrorType.READ_DEADLINE_EXCEEDED, failure);
 			verify(late, never()).getAsyncApi(any());
 			var retry = deferred.getAsyncApi(RequestContext.analytical()).getColumnIdAsync("retry");
 			assertFalse(retry.isDone());
@@ -337,10 +336,91 @@ class DeferredRockserverConnectionTest {
 				var failure = assertThrows(ExecutionException.class,
 						() -> perform(selectedOperation, deferred.getAsyncApi(RequestContext.analytical(Duration.ofSeconds(1))))
 								.get(5, TimeUnit.SECONDS));
-				assertEquals(Status.Code.DEADLINE_EXCEEDED, Status.fromThrowable(failure.getCause()).getCode());
+				assertNotSent(RocksDBErrorType.READ_DEADLINE_EXCEEDED, failure);
 				verify(client, never()).getAsyncApi(any());
 			}
 		}
+	}
+
+	/**
+	 * R48-4: a call that fails before any connection exists was never sent, and says so as the direct client does
+	 * (GrpcConnection's expired deadline, SessionWrites' closed client): the deadline that came while connecting is a
+	 * not-applied READ_DEADLINE_EXCEEDED, and a closed client a not-applied SERVER_OVERLOADED, for a single call, a
+	 * stream, a WAL flush, a session opening and the synchronous API alike. A raw gRPC DEADLINE_EXCEEDED or an
+	 * IllegalStateException read as an unknown outcome. A failure of the connection itself (the factory, the
+	 * handshake) keeps its own exception: it is a transport failure, which callers classify by its gRPC status.
+	 */
+	@Test
+	void failuresBeforeAnyConnectionAreFlaggedNotApplied() throws Exception {
+		var closed = deferred(URL, DeferredRockserverConnectionTest::client);
+		closed.close();
+		for (int operation = 0; operation < 4; operation++) {
+			int selected = operation;
+			var failure = assertThrows(ExecutionException.class,
+					() -> performAny(selected, closed).get(5, TimeUnit.SECONDS));
+			assertNotSent(RocksDBErrorType.SERVER_OVERLOADED, failure);
+		}
+		assertNotSent(RocksDBErrorType.SERVER_OVERLOADED,
+				assertThrows(RuntimeException.class, () -> closed.getSyncApi(RequestContext.analytical())));
+
+		var entered = new CountDownLatch(1);
+		var release = new CountDownLatch(1);
+		var closing = deferred(URL, () -> {
+			entered.countDown();
+			release.await(5, TimeUnit.SECONDS);
+			return client();
+		});
+		try {
+			var pending = closing.getAsyncApi(RequestContext.analytical()).getColumnIdAsync("pending");
+			assertTrue(entered.await(5, TimeUnit.SECONDS));
+			closing.close();
+			assertNotSent(RocksDBErrorType.SERVER_OVERLOADED,
+					assertThrows(ExecutionException.class, () -> pending.get(5, TimeUnit.SECONDS)));
+		} finally {
+			release.countDown();
+			closing.close();
+		}
+
+		for (int operation = 0; operation < 4; operation++) {
+			var clock = new AtomicLong();
+			int selected = operation;
+			try (var late = deferred(URL, () -> {
+				clock.set(Duration.ofSeconds(2).toNanos());
+				return client();
+			}, clock::get)) {
+				var failure = assertThrows(ExecutionException.class,
+						() -> performAny(selected, late, RequestContext.analytical(Duration.ofSeconds(1)))
+								.get(5, TimeUnit.SECONDS));
+				assertNotSent(RocksDBErrorType.READ_DEADLINE_EXCEEDED, failure);
+			}
+		}
+
+		var offline = Status.UNAVAILABLE.withDescription("offline").asRuntimeException();
+		try (var failing = deferred(URL, () -> { throw offline; })) {
+			var failure = assertThrows(ExecutionException.class,
+					() -> failing.getAsyncApi(RequestContext.analytical()).getColumnIdAsync("c").get(5, TimeUnit.SECONDS));
+			assertEquals(offline, failure.getCause(), "a transport failure keeps its own exception");
+		}
+	}
+
+	private static CompletableFuture<?> performAny(int operation, RocksDBConnection deferred) {
+		return performAny(operation, deferred, RequestContext.analytical());
+	}
+
+	/** A single call, a stream, a WAL flush, a session opening. */
+	private static CompletableFuture<?> performAny(int operation, RocksDBConnection deferred, RequestContext context) {
+		return switch (operation) {
+			case 0, 1 -> perform(operation, deferred.getAsyncApi(context));
+			case 2 -> deferred.getAsyncApi(context).flushWalAsync();
+			case 3 -> deferred.openClientSessionAsync(context);
+			default -> throw new AssertionError(operation);
+		};
+	}
+
+	private static void assertNotSent(RocksDBErrorType type, Throwable failure) {
+		var rocks = rocks(failure);
+		assertEquals(type, rocks.getErrorUniqueId(), rocks.toString());
+		assertTrue(rocks.isNotApplied(), "flagged not applied: " + rocks);
 	}
 
 	private static CompletableFuture<?> perform(int operation, RocksDBAsyncAPI api) {

@@ -48,6 +48,7 @@ import java.util.function.BooleanSupplier;
 import java.util.stream.IntStream;
 import java.util.stream.LongStream;
 import java.util.stream.Stream;
+import java.util.regex.Pattern;
 import org.apache.ratis.client.RaftClient;
 import org.apache.ratis.client.RaftClientConfigKeys;
 import org.apache.ratis.conf.RaftProperties;
@@ -80,6 +81,7 @@ import org.apache.ratis.thirdparty.com.google.protobuf.CodedOutputStream;
 import org.apache.ratis.util.PureJavaCrc32C;
 import org.apache.ratis.util.SizeInBytes;
 import org.apache.ratis.util.TimeDuration;
+import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
@@ -773,6 +775,111 @@ class RaftLogRepairTest {
 		tear(open, start, start + entrySize(8));
 
 		assertEquals(Outcome.REFUSED, RaftLogRepair.run(dir, GROUP, true).outcome());
+	}
+
+	// ---------------------------------------------------------------------------------------------------------
+	// The verdict an operator reads (runbooks.md, "Node does not start after a power loss", step 2)
+
+	/**
+	 * R48-2: every run prints exactly one verdict line, the one that starts with {@code OK: }, {@code WOULD REPAIR },
+	 * {@code REPAIRED: } or {@code REFUSED: }. {@code OK} and {@code REFUSED} end the output; {@code WOULD REPAIR} and
+	 * {@code REPAIRED} are followed by one line, the assumption the repair rests on, so their output does not end on
+	 * the verdict. The runbook names the verdict by its first word, not as the last line.
+	 */
+	@Test
+	void everyRunPrintsOneVerdictLine() throws IOException {
+		assertVerdict(RaftLogRepair.run(dir, GROUP, true), Outcome.REFUSED, "REFUSED: ");
+		var open = writeOpenSegment(0, 9);
+		assertVerdict(RaftLogRepair.run(dir, GROUP, true), Outcome.OK, "OK: every entry is valid");
+		long start = entryStart(0, 9);
+		tear(open, start, start + entrySize(9));
+		assertVerdict(RaftLogRepair.run(dir, GROUP, true), Outcome.WOULD_REPAIR,
+				"WOULD REPAIR (dry run, nothing changed): would drop the torn entry expected to have index 9");
+		assertVerdict(repair(), Outcome.REPAIRED, "REPAIRED: dropped the torn entry expected to have index 9");
+		assertVerdict(repair(), Outcome.OK, "OK: every entry is valid");
+		long last = entryStart(0, 8);
+		flipBit(open, last + 100, 0x01);
+		var damaged = RaftLogRepair.run(dir, GROUP, true);
+		assertVerdict(damaged, Outcome.REFUSED, "REFUSED: ");
+		assertTrue(damaged.lines().getLast().contains("Nothing was changed: replace the node"), text(damaged));
+		var lockFile = current().resolveSibling("in_use.lock");
+		try (var channel = FileChannel.open(lockFile, StandardOpenOption.CREATE, StandardOpenOption.WRITE);
+				var lock = channel.lock()) {
+			assertTrue(lock.isValid());
+			var locked = repair();
+			assertVerdict(locked, Outcome.REFUSED, "REFUSED: ");
+			assertTrue(locked.lines().getLast().endsWith("is locked: stop the node first."), text(locked));
+		}
+		Files.delete(open);
+		writeSegment("log_0-9", 0, 9);
+		assertVerdict(RaftLogRepair.run(dir, GROUP, true), Outcome.OK, "OK: no open segment");
+	}
+
+	/**
+	 * R48-2: a log that cannot be read (a denied permission here; an {@code EIO} the same way) gives no verdict: the run
+	 * throws, which the command prints as a stack trace and exit 1. The runbook's step 2 says what to do then.
+	 */
+	@Test
+	void unreadableLogGivesNoVerdict() throws IOException {
+		writeOpenSegment(0, 9);
+		var current = current();
+		var permissions = Files.getPosixFilePermissions(current);
+		Files.setPosixFilePermissions(current, Set.of());
+		try {
+			Assumptions.assumeFalse(Files.isReadable(current), "running as a user who reads anything");
+			assertThrows(IOException.class, () -> RaftLogRepair.run(dir, GROUP, true));
+		} finally {
+			Files.setPosixFilePermissions(current, permissions);
+		}
+	}
+
+	/** R48-2: the runbook's step 2 names each verdict as {@link #everyRunPrintsOneVerdictLine} pins it. */
+	@Test
+	void runbookReadsTheVerdictLine() throws IOException {
+		var runbook = Files.readString(docs().resolve("runbooks.md"));
+		int from = runbook.indexOf("## Node does not start after a power loss");
+		assertTrue(from >= 0, "section missing");
+		int to = runbook.indexOf("\n## ", from + 1);
+		var section = runbook.substring(from, to > 0 ? to : runbook.length());
+		assertFalse(section.contains("last line"), "the output of WOULD REPAIR does not end on its verdict");
+		for (var verdict : List.of("`WOULD REPAIR (dry run, nothing changed)", "`OK: every entry is valid`",
+				"`OK: no open segment`", "does not exist: wrong --data-dir or --group-id?", "is locked: stop the node first.",
+				"Nothing was changed: replace the node", "`REPAIRED: dropped", "This is safe only if",
+				"No verdict line")) {
+			assertTrue(section.contains(verdict), "step 2 does not name " + verdict);
+		}
+		// Review of R48, 2: a stack trace from the repair can come after the file was cut (the sync or the check).
+		assertFalse(section.contains("a stack trace without a verdict too"), "step 3 reads a stack trace as step 2's");
+		assertTrue(section.contains("after the file was already cut"), "step 3 does not say the file may be cut");
+	}
+
+	private static void assertVerdict(Report report, Outcome outcome, String verdictStart) {
+		var lines = report.lines();
+		var verdicts = lines.stream().filter(line -> VERDICT.matcher(line).lookingAt()).toList();
+		assertEquals(1, verdicts.size(), "one verdict line: " + lines);
+		var verdict = verdicts.getFirst();
+		assertTrue(verdict.startsWith(verdictStart), verdict);
+		assertEquals(outcome, report.outcome(), lines.toString());
+		var after = lines.subList(lines.indexOf(verdict) + 1, lines.size());
+		if (outcome == Outcome.WOULD_REPAIR || outcome == Outcome.REPAIRED) {
+			assertEquals(1, after.size(), lines.toString());
+			assertTrue(after.getFirst().startsWith("This is safe only if that entry was never fsynced"), after.getFirst());
+		} else {
+			assertEquals(List.of(), after, "the verdict ends the output");
+		}
+	}
+
+	private static final Pattern VERDICT = Pattern.compile("OK: |WOULD REPAIR |REPAIRED: |REFUSED: ");
+
+	/** docs/distributed, from the module's directory or any directory above it. */
+	private static Path docs() {
+		for (var at = Path.of("").toAbsolutePath(); at != null; at = at.getParent()) {
+			var candidate = at.resolve("docs").resolve("distributed");
+			if (Files.isRegularFile(candidate.resolve("runbooks.md"))) {
+				return candidate;
+			}
+		}
+		throw new AssertionError("docs/distributed/runbooks.md not found above " + Path.of("").toAbsolutePath());
 	}
 
 	// ---------------------------------------------------------------------------------------------------------

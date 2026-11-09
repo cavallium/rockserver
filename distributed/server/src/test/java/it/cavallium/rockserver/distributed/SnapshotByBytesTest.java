@@ -15,6 +15,11 @@ import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.Objects;
+import java.util.concurrent.TimeUnit;
+import org.apache.ratis.protocol.ClientId;
+import org.apache.ratis.protocol.SnapshotManagementRequest;
+import org.apache.ratis.server.raftlog.RaftLog;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -103,6 +108,70 @@ class SnapshotByBytesTest {
 		}
 		InProcessCluster.await(TIMEOUT, () -> cluster.runningNodes().stream()
 				.allMatch(node -> node.stateMachine().getLatestSnapshot() != null));
+	}
+
+	/**
+	 * R48-1: after a restart, Ratis' StateMachineUpdater starts at the log's snapshot index and hands the log over again
+	 * only as commits arrive; the database is already further. A snapshot taken while the replay has not reached the
+	 * database's position (the byte trigger from a replayed group, or {@code admin snapshot}, with the commit index
+	 * below that position) must not return the database's index: Ratis compares it with its own applied index, logs
+	 * "Bug in StateMachine", and purges nothing, while the byte count was reset and a checkpoint made. It answers "no
+	 * snapshot taken" instead, keeping the count, until Ratis has handed over every entry up to the database's
+	 * position; then it takes one as usual. Ratis' creation gap does not cover the window: Ratis 3.3.1 compares the
+	 * state machine's last applied term-index, which {@code openStore} sets to the database's position, with the latest
+	 * snapshot, so right after a start the gap is the database's position minus the snapshot's, and a request goes
+	 * through before anything is replayed. The test sends one through Ratis ({@code snapshotManagementAsync}, as
+	 * {@code admin snapshot} does) to one node of three restarted alone, so that nothing is committed, then calls
+	 * {@code takeSnapshot} directly as Ratis' updater does.
+	 */
+	@Test
+	void noSnapshotPastWhatRatisHandedOverAfterARestart() throws Exception {
+		cluster = new InProcessCluster(temp, 3, c -> c.withSnapshotEveryEntries(1_000_000)
+				.withSnapshotEveryBytes(1 << 20)).startAll();
+		var leader = cluster.awaitLeader(TIMEOUT);
+		var api = leader.connection().getSyncApi(RequestContext.batch(Duration.ofSeconds(20)));
+		long column = api.createColumn("c", ColumnSchema.of(IntList.of(Long.BYTES), ObjectList.of(), true));
+		var value = Buf.wrap(new byte[256 * 1024]);
+		for (long i = 0; i < 3; i++) {
+			api.put(0, column, new Keys(Buf.wrap(ByteBuffer.allocate(Long.BYTES).putLong(i).array())), value,
+					RequestType.none());
+		}
+		cluster.awaitConverged(TIMEOUT);
+		for (var id : cluster.ids()) {
+			cluster.stop(id);
+		}
+		var first = cluster.ids().getFirst();
+		var stateMachine = cluster.start(first).stateMachine();
+		long databaseApplied = stateMachine.appliedIndex().get();
+		assertTrue(databaseApplied > stateMachine.handedOverForTesting(),
+				"applied " + databaseApplied + ", handed over " + stateMachine.handedOverForTesting());
+		long counted = stateMachine.bytesSinceSnapshotForTesting();
+
+		var division = Objects.requireNonNull(stateMachine.division());
+		var reply = division.getRaftServer().snapshotManagementAsync(SnapshotManagementRequest.newCreate(
+				ClientId.randomId(), division.getId(), division.getGroup().getGroupId(), 1, 20_000))
+				.get(30, TimeUnit.SECONDS);
+		assertTrue(reply.getLogIndex() < databaseApplied, "the request through Ratis took a snapshot at "
+				+ reply.getLogIndex() + ", past what Ratis handed over (" + stateMachine.handedOverForTesting() + ")");
+		assertNull(stateMachine.getLatestSnapshot(), "no checkpoint was made through Ratis");
+		assertEquals(counted, stateMachine.bytesSinceSnapshotForTesting(), "the count is kept through Ratis");
+
+		assertEquals(RaftLog.INVALID_LOG_INDEX, stateMachine.takeSnapshot(), "no snapshot past what Ratis applied");
+		assertNull(stateMachine.getLatestSnapshot(), "no checkpoint was made");
+		assertEquals(counted, stateMachine.bytesSinceSnapshotForTesting(), "the count is kept");
+
+		for (var id : cluster.ids()) {
+			if (!id.equals(first)) {
+				cluster.start(id);
+			}
+		}
+		cluster.awaitLeader(TIMEOUT);
+		cluster.awaitConverged(TIMEOUT);
+		InProcessCluster.await(TIMEOUT, () -> stateMachine.handedOverForTesting() >= databaseApplied);
+		long taken = stateMachine.takeSnapshot();
+		assertTrue(taken >= databaseApplied && taken <= stateMachine.handedOverForTesting(),
+				"snapshot at " + taken + ", database at " + databaseApplied);
+		assertEquals(taken, stateMachine.getLatestSnapshot().getIndex());
 	}
 
 	@Test

@@ -1,9 +1,10 @@
 package it.cavallium.rockserver.core.client;
 
-import io.grpc.Status;
 import it.cavallium.rockserver.core.common.RequestContext;
 import it.cavallium.rockserver.core.common.RocksDBAPICommand;
 import it.cavallium.rockserver.core.common.RocksDBAsyncAPI;
+import it.cavallium.rockserver.core.common.RocksDBException;
+import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
 import it.cavallium.rockserver.core.common.RocksDBSyncAPI;
 import it.cavallium.rockserver.core.common.RockserverCapabilities;
 import java.io.IOException;
@@ -26,7 +27,10 @@ import reactor.core.scheduler.Schedulers;
 /**
  * Defers the SDK's mandatory capability handshake until remote work is requested. The future of a single call, of
  * {@code flushWalAsync} and of {@code openClientSessionAsync} is a {@link DeferredCall}: its cancel and its outcome are
- * those of the real connection's call once that call is made (R47-2).
+ * those of the real connection's call once that call is made (R47-2). A call that fails before then was never sent,
+ * and its failure says so ({@link RocksDBException#isNotApplied()}): {@code READ_DEADLINE_EXCEEDED} for a deadline spent
+ * while connecting, {@code SERVER_OVERLOADED} for a closed client, as the direct client's (R48-4). A failure of the
+ * factory or of the handshake keeps its own exception, a transport failure that callers classify by its gRPC status.
  */
 final class DeferredRockserverConnection implements RocksDBConnection {
 
@@ -115,9 +119,22 @@ final class DeferredRockserverConnection implements RocksDBConnection {
 				Mono.error(deadlineExceeded())));
 	}
 
+	/**
+	 * The deadline came before a connection existed: nothing was sent, so the failure says so (R48-4), as the direct
+	 * client's for a deadline that expired before the call (GrpcConnection).
+	 */
 	private static RuntimeException deadlineExceeded() {
-		return Status.DEADLINE_EXCEEDED.withDescription("Rockserver request deadline expired during connection initialization")
-				.asRuntimeException();
+		return RocksDBException.notApplied(RocksDBErrorType.READ_DEADLINE_EXCEEDED,
+				"Rockserver request deadline expired during connection initialization; the request was not sent");
+	}
+
+	/**
+	 * The client is closed, and no connection carries the call: nothing was sent, so the failure says so (R48-4), as
+	 * SessionWrites' for a write on a closed client.
+	 */
+	private static RuntimeException closedBeforeSent() {
+		return RocksDBException.notApplied(RocksDBErrorType.SERVER_OVERLOADED,
+				"Rockserver connection is closed; the request was not sent");
 	}
 
 	private final class Budget {
@@ -146,7 +163,7 @@ final class DeferredRockserverConnection implements RocksDBConnection {
 			Attempt current;
 			boolean start;
 			synchronized (this) {
-				if (closed) return Mono.error(new IllegalStateException("Rockserver connection is closed"));
+				if (closed) return Mono.error(closedBeforeSent());
 				if (connection != null) return Mono.just(connection);
 				if (attempt != null && attempt.abandoned) {
 					return Mono.fromFuture(attempt.finished, true).then(Mono.defer(this::acquireConnection));
@@ -235,7 +252,7 @@ final class DeferredRockserverConnection implements RocksDBConnection {
 			attempt = null;
 		}
 		if (pending != null) {
-			pending.result.completeExceptionally(new IllegalStateException("Rockserver connection is closed"));
+			pending.result.completeExceptionally(closedBeforeSent());
 			pending.finished.complete(null);
 		}
 		// Interrupts the handshake: nobody needs it now, and it holds a thread and keeps connecting until it ends.
