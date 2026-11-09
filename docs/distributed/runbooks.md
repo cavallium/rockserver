@@ -117,7 +117,8 @@ the check of step 3 finds.
    n1:/srv/rockserver/data/db/`). The data directories must hold nothing else: no `raft/`. Then run `sync` on every
    node (or `sync -f <data-dir>/db`): `rsync`, `cp` and `scp` do not fsync, and a power loss before writeback can
    leave copied table files empty or with holes. The first start fsyncs `db/` too, before it records the digest
-   (R34-1), but not volumes or a WAL directory configured outside `db/`, and not before the start.
+   (R34-1), with every column volume and the WAL (a node refuses to start with either outside `db/`), but not before
+   the start.
 3. Check that the copies are equal, for example `find db -type f -exec sha256sum {} + | sort -k2 | sha256sum` on
    each node, the same result everywhere. Do not skip it: the digest of the first start compares table files by size
    only.

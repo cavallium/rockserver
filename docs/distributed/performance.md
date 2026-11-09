@@ -271,10 +271,11 @@ Other results:
 - **Disks.** Every write waits for an fsync of the Raft log on the leader and on one follower. Consumer SSDs
   without power-loss protection take 1–3 ms per fdatasync when idle and 10–30 ms when RocksDB compaction writes
   heavily to the same disk. Prefer SSDs with power-loss protection. Do not split the data directory over
-  several disks: a node refuses to start if `data/db`, or a column volume under it, is on another file system
-  (a volume outside `data/db` passes the start but makes every snapshot fail), and with
-  `data/raft` on another disk every snapshot copies the whole database (instead of hard-linking it) while the
-  apply waits. Keep `data/raft`, `data/db`, every column volume and the RocksDB WAL on one file system.
+  several disks: a node refuses to start (exit 1) if anything under `data/db`, a column volume included, is on
+  another file system, if a column volume or the RocksDB `wal-path` is outside `data/db` (a volume there would make
+  every snapshot fail), or if `data/raft` is on another file system than the data directory (every snapshot would
+  copy the whole database instead of hard-linking it, while the apply waits). Keep `data/raft`, `data/db`, every
+  column volume and the RocksDB WAL on one file system (see "Disk layout" in the design document).
 - **Power loss.** After any failure reading the Raft log at startup (the failed start prints the command), stop the
   node, run `ReplicatedServerMain repair-log --data-dir DIR --dry-run` (with the node's `--group-id` if it has one)
   and follow its verdict, not the error message: a torn
