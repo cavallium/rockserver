@@ -457,9 +457,13 @@ damage; `repair-log` does, so follow its verdict:
      2 again and follow its verdict.
 3. `rs repair-log --data-dir DATA-DIR` (the same `--group-id`): its verdict line is `REPAIRED: dropped the torn entry
    expected to have index N ...`, followed by the same assumption line. A `REFUSED` here (the log changed since the
-   dry run, or the node was started meanwhile) is read as in step 2, a stack trace without a verdict too, except one
-   whose message is `Truncated ... at offset ..., but Ratis then read ... entries instead of ...`: the file was cut,
-   but Ratis then reads it differently than the tool. Do not start the node; replace it.
+   dry run, or the node was started meanwhile) is read as in step 2: it is printed before anything is written. A stack
+   trace without a verdict is not: the repair cuts the file, syncs it and reads it again with Ratis, so a failure of
+   the sync or of that read (a disk error, `EIO`) can come after the file was already cut. Do not assume nothing
+   changed: fix the cause, then run step 2 again, which shows where the log stands (`OK` if the cut was made and is
+   sound, so start the node; `WOULD REPAIR` if not, so repair again). A stack trace whose message is `Truncated ... at
+   offset ..., but Ratis then read ... entries instead of ...` is different: the file was cut, but Ratis then reads it
+   differently than the tool. Do not start the node; replace it.
 4. Start the node: the leader sends it what it dropped, and `status` shows it catching up.
 
 The repair is safe only if the dropped entry was never fsynced, as its output says: disks that lose fsynced data (a

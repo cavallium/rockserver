@@ -15,6 +15,10 @@ import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.Objects;
+import java.util.concurrent.TimeUnit;
+import org.apache.ratis.protocol.ClientId;
+import org.apache.ratis.protocol.SnapshotManagementRequest;
 import org.apache.ratis.server.raftlog.RaftLog;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
@@ -113,9 +117,12 @@ class SnapshotByBytesTest {
 	 * below that position) must not return the database's index: Ratis compares it with its own applied index, logs
 	 * "Bug in StateMachine", and purges nothing, while the byte count was reset and a checkpoint made. It answers "no
 	 * snapshot taken" instead, keeping the count, until Ratis has handed over every entry up to the database's
-	 * position; then it takes one as usual. The test calls {@code takeSnapshot} as Ratis' updater does, with one node
-	 * of three up so that nothing is committed (Ratis itself skips a request until one entry past the snapshot was
-	 * handed over, its creation gap of 1): the window between is timing the test cannot force.
+	 * position; then it takes one as usual. Ratis' creation gap does not cover the window: Ratis 3.3.1 compares the
+	 * state machine's last applied term-index, which {@code openStore} sets to the database's position, with the latest
+	 * snapshot, so right after a start the gap is the database's position minus the snapshot's, and a request goes
+	 * through before anything is replayed. The test sends one through Ratis ({@code snapshotManagementAsync}, as
+	 * {@code admin snapshot} does) to one node of three restarted alone, so that nothing is committed, then calls
+	 * {@code takeSnapshot} directly as Ratis' updater does.
 	 */
 	@Test
 	void noSnapshotPastWhatRatisHandedOverAfterARestart() throws Exception {
@@ -139,6 +146,15 @@ class SnapshotByBytesTest {
 		assertTrue(databaseApplied > stateMachine.handedOverForTesting(),
 				"applied " + databaseApplied + ", handed over " + stateMachine.handedOverForTesting());
 		long counted = stateMachine.bytesSinceSnapshotForTesting();
+
+		var division = Objects.requireNonNull(stateMachine.division());
+		var reply = division.getRaftServer().snapshotManagementAsync(SnapshotManagementRequest.newCreate(
+				ClientId.randomId(), division.getId(), division.getGroup().getGroupId(), 1, 20_000))
+				.get(30, TimeUnit.SECONDS);
+		assertTrue(reply.getLogIndex() < databaseApplied, "the request through Ratis took a snapshot at "
+				+ reply.getLogIndex() + ", past what Ratis handed over (" + stateMachine.handedOverForTesting() + ")");
+		assertNull(stateMachine.getLatestSnapshot(), "no checkpoint was made through Ratis");
+		assertEquals(counted, stateMachine.bytesSinceSnapshotForTesting(), "the count is kept through Ratis");
 
 		assertEquals(RaftLog.INVALID_LOG_INDEX, stateMachine.takeSnapshot(), "no snapshot past what Ratis applied");
 		assertNull(stateMachine.getLatestSnapshot(), "no checkpoint was made");

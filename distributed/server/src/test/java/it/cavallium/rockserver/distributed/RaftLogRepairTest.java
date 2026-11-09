@@ -848,6 +848,9 @@ class RaftLogRepairTest {
 				"No verdict line")) {
 			assertTrue(section.contains(verdict), "step 2 does not name " + verdict);
 		}
+		// Review of R48, 2: a stack trace from the repair can come after the file was cut (the sync or the check).
+		assertFalse(section.contains("a stack trace without a verdict too"), "step 3 reads a stack trace as step 2's");
+		assertTrue(section.contains("after the file was already cut"), "step 3 does not say the file may be cut");
 	}
 
 	private static void assertVerdict(Report report, Outcome outcome, String verdictStart) {

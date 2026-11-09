@@ -287,7 +287,8 @@ Other results:
   directory (a wrong `--data-dir` or `--group-id`) or a running node says nothing about the log. The verdict is the
   line that starts with `OK:`, `WOULD REPAIR`, `REPAIRED:` or `REFUSED:`, not always the last one (a repair is followed
   by the assumption above); a stack trace instead of a verdict means the command could not read the log (a
-  permission, a disk error): fix that first. If too few nodes are left to elect a leader, which replacing a node needs, see
+  permission, a disk error): fix that first. From the repair itself, not the dry run, a stack trace can come after
+  the file was cut (the sync or the check after it failed): run the dry run again to see where the log stands. If too few nodes are left to elect a leader, which replacing a node needs, see
   "No quorum" in the design document: there is no override. The runbooks have it step by step ("Node does not start
   after a power loss").
 - **Disk space.** Each retained snapshot keeps the table files it links, also after compaction replaced them.
