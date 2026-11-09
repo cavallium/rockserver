@@ -2,8 +2,10 @@ package it.cavallium.rockserver.distributed;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.atomic.AtomicLong;
 import org.junit.jupiter.api.Test;
@@ -153,5 +155,25 @@ class ByteAdmissionTest {
 		assertFalse(admission.tryAcquire(8, new Object()));
 		admission.cancel(cancelled);
 		assertTrue(admission.tryAcquire(8, new Object()), "cancelled: the room is free again");
+	}
+
+	/**
+	 * Review of R50, 2: two refused commit batches came back merged, the later one first, so the batch's first commit
+	 * is not the one that holds the reservation. It asks under the holder, and the holder's bytes are not counted twice.
+	 */
+	@Test
+	void aMergedBatchAsksUnderTheMemberThatHoldsTheReservation() {
+		var admission = new ByteAdmission(32);
+		assertTrue(admission.tryAcquire(24, new Object()));
+		var older = new Object();
+		var newer = new Object();
+		assertFalse(admission.tryAcquire(12, older));
+		assertFalse(admission.tryAcquire(12, newer));
+		admission.release(24);
+		var waiter = admission.waiterAmong(List.of(newer, older));
+		assertTrue(admission.tryAcquire(24, waiter), "24 of 32 fit, with the reserved 12 among them");
+		assertSame(older, waiter);
+		assertTrue(admission.tryAcquire(8, new Object()), "the holder got in: no reservation is left");
+		assertSame(newer, admission.waiterAmong(List.of(newer, older)), "with none held, the first");
 	}
 }

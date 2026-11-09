@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.distributed;
 
+import java.util.List;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
@@ -87,6 +88,13 @@ final class ByteAdmission {
 		if (reserved == null || own) {
 			reservation.compareAndSet(reserved, new Reservation(waiter, bytes, clock.getAsLong() + RESERVATION_NANOS));
 		}
+	}
+
+	/**
+	 * The member of {@code batch} to ask under: the one that holds the reservation, if any does, else the first.
+	 */
+	Object waiterAmong(List<?> batch) {
+		return batch.getFirst();
 	}
 
 	/** {@code waiter} stopped asking: its reservation, if it holds one, is given up. */
