@@ -906,6 +906,11 @@ final class NodeStore implements Closeable {
 	 */
 	static ExportedSeed exportSeed(Path dbDir, @Nullable Path stateMachineDir, @Nullable Path rockserverConfig,
 			Path target) throws IOException {
+		return exportSeed(dbDir, stateMachineDir, rockserverConfig, target, false);
+	}
+
+	static ExportedSeed exportSeed(Path dbDir, @Nullable Path stateMachineDir, @Nullable Path rockserverConfig,
+			Path target, boolean withoutDamagedSnapshot) throws IOException {
 		target = target.toAbsolutePath().normalize();
 		if (Files.exists(target)) {
 			throw new IOException("The target " + target + " already exists");
@@ -977,7 +982,7 @@ final class NodeStore implements Closeable {
 			db.flush();
 		}
 		syncTree(target);
-		return new ExportedSeed(applied, clusterId, restoredSnapshot, damagedSnapshot);
+		return new ExportedSeed(applied, clusterId, restoredSnapshot, damagedSnapshot, -1);
 	}
 
 	/**
@@ -986,7 +991,27 @@ final class NodeStore implements Closeable {
 	 * not be used (null if none was damaged), see {@link #exportSeed(Path, Path, Path, Path)}.
 	 */
 	record ExportedSeed(TermIndex applied, @Nullable String clusterId, @Nullable TermIndex restoredSnapshot,
-			@Nullable String damagedSnapshot) {}
+			@Nullable String damagedSnapshot, long damagedSnapshotIndex) {}
+
+	static final class DamagedSnapshotNotExportedException extends IOException {
+		private final long snapshotIndex;
+		private final TermIndex databaseApplied;
+
+		DamagedSnapshotNotExportedException(String message, long snapshotIndex, TermIndex databaseApplied,
+				Throwable cause) {
+			super(message, cause);
+			this.snapshotIndex = snapshotIndex;
+			this.databaseApplied = databaseApplied;
+		}
+
+		long snapshotIndex() {
+			return snapshotIndex;
+		}
+
+		TermIndex databaseApplied() {
+			return databaseApplied;
+		}
+	}
 
 	private @Nullable Buf readMeta(byte metaKey) {
 		return db().get(0, metaColumnId, key(metaKey), RequestType.<Buf>current());

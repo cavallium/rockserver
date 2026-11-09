@@ -248,21 +248,32 @@ class CheckpointStorageTest {
 	}
 
 	/**
-	 * R31-2: a snapshot that a crash damaged before it was verified cannot be used; {@code export-seed}, the last resort
-	 * without a quorum, still copies what {@code db/} holds, and says that the snapshot was damaged.
+	 * R31-2, R32-1: a snapshot that a crash damaged before it was verified cannot be used. {@code export-seed} refuses
+	 * by default, naming the snapshot's index and the database's, since the replica may have applied entries up to the
+	 * snapshot that its database lacks; told to export without it, it copies what {@code db/} holds and says why.
 	 */
 	@Test
-	void exportSeedWithADamagedInstalledSnapshotExportsTheDatabaseAndSaysSo() throws IOException {
+	void exportSeedWithADamagedInstalledSnapshotRefusesUnlessToldToExportTheDatabase() throws IOException {
 		Path dataDir = tempDir.resolve("node");
 		Path groupDir = writeNodeBehindAnInstalledSnapshot(dataDir);
 		Files.write(firstTable(groupDir.resolve("sm").resolve("snapshots")), new byte[0]);
 
 		Path target = tempDir.resolve("seed");
-		var exported = NodeStore.exportSeed(dataDir.resolve("db"), groupDir.resolve("sm"), null, target);
+		var refused = assertThrows(NodeStore.DamagedSnapshotNotExportedException.class,
+				() -> NodeStore.exportSeed(dataDir.resolve("db"), groupDir.resolve("sm"), null, target));
+		assertEquals(40, refused.snapshotIndex());
+		assertEquals(TermIndex.valueOf(1, 5), refused.databaseApplied());
+		assertTrue(refused.getMessage().contains("index 40") && refused.getMessage().contains("index 5"),
+				refused.getMessage());
+		assertTrue(!refused.getMessage().contains("rebuild it from the other members"), refused.getMessage());
+		assertTrue(Files.notExists(target), "nothing written");
+
+		var exported = NodeStore.exportSeed(dataDir.resolve("db"), groupDir.resolve("sm"), null, target, true);
 		assertEquals(TermIndex.valueOf(1, 5), exported.applied());
 		assertNull(exported.restoredSnapshot());
 		assertNotNull(exported.damagedSnapshot());
 		assertTrue(exported.damagedSnapshot().contains("snapshot-4-40"), exported.damagedSnapshot());
+		assertEquals(40, exported.damagedSnapshotIndex());
 		try (var seed = NodeStore.open(target, null, "seed")) {
 			assertEquals(Map.of(7, "old"), contents(seed, seed.db().getColumnId(DATA_COLUMN)));
 		}
