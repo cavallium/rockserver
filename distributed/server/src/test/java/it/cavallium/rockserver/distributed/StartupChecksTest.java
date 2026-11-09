@@ -461,6 +461,55 @@ class StartupChecksTest {
 	}
 
 	/**
+	 * Review of R44, 2: the variant R44-1 names. An exported seed has no meta column, so the start-up check's own
+	 * {@code createColumn} of it writes a {@code _column_schemas_} row, which the check's close flushes into one more L0
+	 * file: a seed with three such files reaches the L0 trigger (4) at that close. Neither that close nor a second check
+	 * (the first one was killed after recording the marker, or the node stopped before the cluster formed) may compact
+	 * the column and delete the files the marker listed.
+	 */
+	@Test
+	void theStartupCheckOfAnExportedSeedDeletesNoTableFileOfColumnSchemas() throws Exception {
+		var replica = tempDir.resolve("replica");
+		try (var store = NodeStore.open(replica, null, "replica")) {
+			long column = store.db().createColumn(NodeStoreTest.DATA_COLUMN, NodeStoreTest.DATA_SCHEMA);
+			for (int i = 0; i < 100; i++) {
+				NodeStoreTest.put(store, column, i, "v" + i);
+			}
+			NodeStoreTest.setApplied(store, TermIndex.valueOf(1, 5));
+		}
+		var seed = tempDir.resolve("seed");
+		NodeStore.exportSeed(replica, null, seed);
+		int exported = addL0Files(seed, "_column_schemas_", 0).size();
+		assertTrue(exported >= 1 && exported <= 3, "the export left " + exported + " _column_schemas_ files");
+		var schemaTables = addL0Files(seed, "_column_schemas_", 3 - exported);
+		assertEquals(3, schemaTables.size(), schemaTables.toString());
+		var node = tempDir.resolve("node/db");
+		copy(seed, node);
+		var digest = NodeStore.recordSeedDigest(node);
+		NodeStore.noteSeedOpening(node);
+		// The first check creates the meta column; its close flushes the schema row into a fourth L0 file.
+		startupCheckOpen(node);
+		var afterFirst = addL0FilesUnchanged(node);
+		assertTrue(afterFirst.containsAll(schemaTables) && afterFirst.size() == 4,
+				"after the first check's close: " + afterFirst + ", the seed's: " + schemaTables);
+		// A second check, killed while open after its compaction (if any) had the time to run.
+		try (var store = startupCheckStore(node)) {
+			long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(3);
+			while (fileNames(node, ".sst").containsAll(schemaTables) && System.nanoTime() < deadline) {
+				Thread.sleep(20);
+			}
+		}
+		var gone = schemaTables.stream().filter(name -> !fileNamesUnchecked(node, ".sst").contains(name)).toList();
+		assertTrue(gone.isEmpty(), "a start-up check deleted " + gone + " of " + schemaTables);
+		assertEquals(digest, NodeStore.recordSeedDigest(node));
+	}
+
+	/** The names of the {@code _column_schemas_} table files of the closed database {@code dbDir}, nothing written. */
+	private static List<String> addL0FilesUnchanged(Path dbDir) throws RocksDBException {
+		return addL0Files(dbDir, "_column_schemas_", 0);
+	}
+
+	/**
 	 * Writes every entry of the column {@code columnName} of the closed replica database {@code dbDir} again and
 	 * flushes it, {@code times} times, through RocksDB itself with automatic compactions off: one more L0 file each
 	 * time, the entries unchanged. Returns the names of that column's table files.
@@ -474,6 +523,14 @@ class StartupChecksTest {
 				var flushOptions = new FlushOptions().setWaitForFlush(true)) {
 			var descriptors = new ArrayList<ColumnFamilyDescriptor>();
 			OptionsUtil.loadLatestOptions(configOptions, dbDir.toString(), dbOptions, descriptors);
+			// An exported seed's OPTIONS file names the directory export-seed opened it in (<target>.tmp): the same WAL and
+			// info log directories in dbDir.
+			if (!dbOptions.walDir().isEmpty()) {
+				dbOptions.setWalDir(dbDir.resolve(Path.of(dbOptions.walDir()).getFileName()).toString());
+			}
+			if (!dbOptions.dbLogDir().isEmpty()) {
+				dbOptions.setDbLogDir(dbDir.resolve(Path.of(dbOptions.dbLogDir()).getFileName()).toString());
+			}
 			for (var descriptor : descriptors) {
 				descriptor.getOptions().setDisableAutoCompactions(true)
 						.setCfPaths(List.of(new DbPath(dbDir.resolve("volume"), Long.MAX_VALUE)));

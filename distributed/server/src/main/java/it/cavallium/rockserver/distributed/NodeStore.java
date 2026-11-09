@@ -47,6 +47,7 @@ import java.util.HashMap;
 import java.util.HexFormat;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.function.UnaryOperator;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -221,7 +222,8 @@ final class NodeStore implements Closeable {
 		dbDir = dbDir.toAbsolutePath().normalize();
 		RestoreDirs.of(dbDir).recover();
 		deleteLeftConfigs(dbDir.getParent());
-		Path config = replicaConfig(rockserverConfig, dbDir, configuredDbDir, name, noAutoCompactions);
+		Path config = replicaConfig(rockserverConfig, dbDir, configuredDbDir, name,
+				noAutoCompactions ? NodeStore::withoutAutoCompactions : UnaryOperator.identity());
 		EmbeddedConnection connection;
 		try {
 			connection = new EmbeddedConnection(dbDir, name, config);
@@ -277,12 +279,15 @@ final class NodeStore implements Closeable {
 	 */
 	static Path replicaConfig(@Nullable Path rockserverConfig, Path dbDir, @Nullable Path sourceDbDir,
 			String nodeId) throws IOException {
-		return replicaConfig(rockserverConfig, dbDir, sourceDbDir, nodeId, false);
+		return replicaConfig(rockserverConfig, dbDir, sourceDbDir, nodeId, UnaryOperator.identity());
 	}
 
-	/** Like {@link #replicaConfig(Path, Path, Path, String)}, {@link #withoutAutoCompactions} if asked. */
+	/**
+	 * Like {@link #replicaConfig(Path, Path, Path, String)}, with {@code adjust} applied last (for example
+	 * {@link #withoutAutoCompactions} or {@link #withSmallFootprint}).
+	 */
 	private static Path replicaConfig(@Nullable Path rockserverConfig, Path dbDir, @Nullable Path sourceDbDir,
-			String nodeId, boolean noAutoCompactions) throws IOException {
+			String nodeId, UnaryOperator<Config> adjust) throws IOException {
 		var config = ConfigFactory.parseString(REPLICA_OVERRIDES);
 		try {
 			if (rockserverConfig != null) {
@@ -298,9 +303,7 @@ final class NodeStore implements Closeable {
 			if (sourceDbDir != null) {
 				config = withRelativePaths(config, sourceDbDir);
 			}
-			if (noAutoCompactions) {
-				config = withoutAutoCompactions(config);
-			}
+			config = adjust.apply(config);
 		} catch (ConfigException | IllegalArgumentException e) {
 			throw new IOException("Failed to read the Rockserver config " + rockserverConfig, e);
 		}
@@ -441,6 +444,24 @@ final class NodeStore implements Closeable {
 			result = result.withValue(columnsPath, ConfigValueFactory.fromIterable(columns));
 		}
 		return result;
+	}
+
+	/**
+	 * {@code config} for export-seed's open of its copy in {@code <target>.tmp} (Review of R44, 1), which runs while the
+	 * source database is still open and only drops the meta column and flushes: an 8 MiB block cache without a metadata
+	 * reserve (instead of the config's, 512 MiB by default), and a table cache of {@link #EXPORT_COPY_MAX_OPEN_FILES}
+	 * files instead of every table reader opened at once ({@code maximum-open-files: -1}), so without
+	 * {@code open-files-async}, which needs every file open. The block caches are capacity limits, not allocations; what
+	 * the open reads is a few table readers and their index and filter blocks. Named block caches and the write buffer
+	 * budget stay: the copy reads nothing through them and writes almost nothing. Only for the drop: the target's
+	 * owner opens it with its own config, which RocksDB's OPTIONS file in it does not replace.
+	 */
+	static Config withSmallFootprint(Config config) {
+		return config.withValue("database.global.block-cache", ConfigValueFactory.fromAnyRef("8MiB"))
+				.withValue("database.global.block-cache-metadata-size", ConfigValueFactory.fromAnyRef("0B"))
+				.withValue("database.global.maximum-open-files",
+						ConfigValueFactory.fromAnyRef(EXPORT_COPY_MAX_OPEN_FILES))
+				.withValue("database.global.open-files-async", ConfigValueFactory.fromAnyRef(false));
 	}
 
 	/**
@@ -1420,7 +1441,7 @@ final class NodeStore implements Closeable {
 	private static ExportedSeed exportSeedStopped(Path dbDir, @Nullable Path stateMachineDir,
 			@Nullable Path rockserverConfig, Path target, boolean withoutDamagedSnapshot) throws IOException {
 		// The copy's config first: when it is refused, nothing has been written yet.
-		Path config = replicaConfig(rockserverConfig, target, dbDir, "export-target");
+		Path config = replicaConfig(rockserverConfig, target, dbDir, "export-target", NodeStore::withSmallFootprint);
 		var created = new AtomicBoolean();
 		try {
 			return exportSeedInto(dbDir, stateMachineDir, rockserverConfig, target, config, withoutDamagedSnapshot,
@@ -1506,7 +1527,8 @@ final class NodeStore implements Closeable {
 
 	/**
 	 * Opens the export's copy in {@code dir} (its {@code <target>.tmp}) with {@code config}, the copy's config, whose
-	 * volume, WAL and log paths are relative to the database directory, drops {@link #META_COLUMN} and flushes. The
+	 * volume, WAL and log paths are relative to the database directory and whose caches are small
+	 * ({@link #withSmallFootprint}: the source is still open), drops {@link #META_COLUMN} and flushes. The
 	 * checkpoint fsyncs the directory after this.
 	 */
 	private static void dropMetaColumn(Path dir, Path config) throws IOException {
