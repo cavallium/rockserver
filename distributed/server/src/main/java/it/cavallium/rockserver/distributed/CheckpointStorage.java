@@ -124,8 +124,17 @@ final class CheckpointStorage implements StateMachineStorage {
 	}
 
 	@Override
-	public synchronized void init(RaftStorage raftStorage) throws IOException {
-		stateMachineDir = raftStorage.getStorageDir().getStateMachineDir().toPath().toAbsolutePath();
+	public void init(RaftStorage raftStorage) throws IOException {
+		init(raftStorage.getStorageDir().getStateMachineDir().toPath());
+	}
+
+	/**
+	 * Like {@link #init(RaftStorage)}, from the state machine directory ({@code raft/<group>/sm}) of a stopped node:
+	 * {@code export-seed} reads the latest snapshot this way, after the same recovery and verification as a start
+	 * (R31-2).
+	 */
+	synchronized void init(Path stateMachineDir) throws IOException {
+		this.stateMachineDir = stateMachineDir.toAbsolutePath();
 		snapshotsDir = stateMachineDir.resolve(SNAPSHOTS_DIR);
 		Path tmp = stateMachineDir.resolve(TMP_DIR);
 		// No snapshot is being built or installed before the server starts: leftovers are from a crash.

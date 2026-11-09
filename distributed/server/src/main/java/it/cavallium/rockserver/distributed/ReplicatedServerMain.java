@@ -69,7 +69,7 @@ import org.rocksdb.NativeLibraryLoader;
  *       status | transfer-leader ID | add-peer ID=... | remove-peer ID | snapshot ID
  *       | checksum [--allow-skipped] | backup NAME | backup-status NAME INDEX
  * repair-log --data-dir DIR [--group-id UUID] [--dry-run]
- * export-seed --data-dir DIR --target DIR [--rockserver-config FILE]
+ * export-seed --data-dir DIR --target DIR [--rockserver-config FILE] [--group-id UUID]
  * restore-backup --backup DIR --data-dir DIR [--rockserver-config FILE]
  * </pre>
  *
@@ -527,18 +527,52 @@ public final class ReplicatedServerMain {
 		var target = Path.of(options.required("--target"));
 		var rockserverConfig = options.value("--rockserver-config") != null
 				? Path.of(options.value("--rockserver-config")) : null;
+		boolean groupGiven = options.value("--group-id") != null;
+		var groupId = options.uuid("--group-id", NodeConfig.DEFAULT_GROUP_ID).toString();
 		options.requireConsumed();
+		Path groupDir = dataDir.resolve("raft").resolve(groupId);
+		if (!groupGiven && !Files.isDirectory(groupDir)) {
+			// A node of another group: its snapshot, possibly ahead of db/, would be missed without a word (R31-2).
+			var others = groupDirs(dataDir.resolve("raft"));
+			if (!others.isEmpty()) {
+				usage("no Raft state of group " + groupId + " in " + dataDir.resolve("raft") + ", which holds "
+						+ String.join(", ", others) + ": pass the node's --group-id");
+			}
+		}
 		NodeStore.ExportedSeed exported;
 		try {
-			exported = NodeStore.exportSeed(dataDir.resolve("db"), rockserverConfig, target);
+			exported = NodeStore.exportSeed(dataDir.resolve("db"), groupDir.resolve("sm"), rockserverConfig, target);
 		} catch (ReplicatedNode.NewerVersionException e) {
 			System.err.println("Not exported: " + e.getMessage());
 			exit(5);
 			return;
 		}
+		if (exported.damagedSnapshot() != null) {
+			System.err.println("WARNING: the replica's latest snapshot is damaged and was not used: "
+					+ exported.damagedSnapshot());
+		}
 		System.out.println("Exported the database of cluster " + exported.clusterId() + ", applied up to index "
 				+ exported.applied().getIndex() + " of term " + exported.applied().getTerm() + ", to " + target
+				+ (exported.restoredSnapshot() == null ? ""
+						: " (its database was behind its snapshot at index " + exported.restoredSnapshot().getIndex()
+								+ ", restored first as a start of the node would)")
 				+ ". Compare the applied index with the other replicas' before seeding a new cluster with it");
+	}
+
+	/** The names of the group directories (UUIDs) in {@code raftDir}, sorted; none if it does not exist. */
+	private static List<String> groupDirs(Path raftDir) throws IOException {
+		if (!Files.isDirectory(raftDir)) {
+			return List.of();
+		}
+		try (var entries = Files.list(raftDir)) {
+			return entries.filter(Files::isDirectory).map(path -> path.getFileName().toString()).filter(name -> {
+				try {
+					return UUID.fromString(name).toString().equals(name);
+				} catch (IllegalArgumentException ex) {
+					return false;
+				}
+			}).sorted().toList();
+		}
 	}
 
 	private static void admin(Options options) throws IOException, InterruptedException {
@@ -1551,7 +1585,7 @@ public final class ReplicatedServerMain {
 				        status | transfer-leader ID | add-peer ID=... | remove-peer ID | snapshot ID
 				        | checksum [--allow-skipped] | backup NAME | backup-status NAME INDEX
 				  repair-log --data-dir DIR [--group-id UUID] [--dry-run]
-				  export-seed --data-dir DIR --target DIR [--rockserver-config FILE]
+				  export-seed --data-dir DIR --target DIR [--rockserver-config FILE] [--group-id UUID]
 				  restore-backup --backup DIR --data-dir DIR [--rockserver-config FILE]""");
 		exit(2);
 	}

@@ -209,6 +209,26 @@ final class NodeStore implements Closeable {
 	}
 
 	/**
+	 * Returns {@code opened}, or, when the latest snapshot of {@code storage} is ahead of it, the database reopened after
+	 * the snapshot was restored into it ({@code opened} is closed): the replica's start ({@code openStore}) and
+	 * {@code export-seed} both go through here (R31-2). A received snapshot is ahead after a crash between Ratis renaming
+	 * it into place and its restore; {@link CheckpointStorage#init} verified it.
+	 */
+	static NodeStore restoreSnapshotIfAhead(NodeStore opened, CheckpointStorage storage, @Nullable Path rockserverConfig,
+			String name) throws IOException {
+		var snapshot = storage.getLatestSnapshot();
+		if (snapshot == null || snapshot.getIndex() <= opened.applied().getIndex()) {
+			return opened;
+		}
+		LOG.warn("{}: database at {} is behind the snapshot at {}, restoring the snapshot", name, opened.applied(),
+				snapshot.getTermIndex());
+		Path dbDir = opened.dbDir;
+		opened.close();
+		restore(storage.snapshotDbDir(), dbDir);
+		return open(dbDir, rockserverConfig, name);
+	}
+
+	/**
 	 * Writes the config the replica opens its database with to {@link #replicaConfigFile}: {@link #REPLICA_OVERRIDES} over
 	 * the given Rockserver config (HOCON), or over the defaults when there is none.
 	 */
@@ -868,12 +888,21 @@ final class NodeStore implements Closeable {
 	 * @throws ReplicatedNode.NewerVersionException if the replica's cluster version has capabilities this version lacks:
 	 *                                              nothing is written
 	 */
-	static ExportedSeed exportSeed(Path dbDir, @Nullable Path stateMachineDir, @Nullable Path rockserverConfig,
-			Path target) throws IOException {
-		return exportSeed(dbDir, rockserverConfig, target);
+	static ExportedSeed exportSeed(Path dbDir, @Nullable Path rockserverConfig, Path target) throws IOException {
+		return exportSeed(dbDir, null, rockserverConfig, target);
 	}
 
-	static ExportedSeed exportSeed(Path dbDir, @Nullable Path rockserverConfig, Path target) throws IOException {
+	/**
+	 * Like {@link #exportSeed(Path, Path, Path)}, for a replica whose Raft state machine directory
+	 * ({@code raft/<group>/sm}) is {@code stateMachineDir} (when not null and present): when its latest snapshot is ahead
+	 * of the database (a crash after a received snapshot was renamed into place, before it was restored into
+	 * {@code db/}), the snapshot is verified and restored into {@code dbDir} first, exactly as the replica's start would
+	 * ({@link CheckpointStorage#init(Path)}, then {@link #restoreSnapshotIfAhead}), and the copy holds it (R31-2). A
+	 * snapshot damaged by such a crash is not used: the copy holds what {@code dbDir} holds, and
+	 * {@link ExportedSeed#damagedSnapshot} says why.
+	 */
+	static ExportedSeed exportSeed(Path dbDir, @Nullable Path stateMachineDir, @Nullable Path rockserverConfig,
+			Path target) throws IOException {
 		target = target.toAbsolutePath().normalize();
 		if (Files.exists(target)) {
 			throw new IOException("The target " + target + " already exists");
@@ -884,7 +913,7 @@ final class NodeStore implements Closeable {
 		// The copy's config first: when it is refused, nothing has been written yet.
 		Path config = replicaConfig(rockserverConfig, target, dbDir, "export-target");
 		try {
-			return exportSeedInto(dbDir, rockserverConfig, target, config);
+			return exportSeedInto(dbDir, stateMachineDir, rockserverConfig, target, config);
 		} catch (IOException | RuntimeException | Error failure) {
 			// Nothing half-made stays (R29-1): the target did not exist before, and a checkpoint that failed removed its
 			// own temporary copy.
@@ -899,11 +928,31 @@ final class NodeStore implements Closeable {
 		}
 	}
 
-	private static ExportedSeed exportSeedInto(Path dbDir, @Nullable Path rockserverConfig, Path target, Path config)
-			throws IOException {
+	private static ExportedSeed exportSeedInto(Path dbDir, @Nullable Path stateMachineDir,
+			@Nullable Path rockserverConfig, Path target, Path config) throws IOException {
 		TermIndex applied;
 		String clusterId;
-		try (var store = open(dbDir, rockserverConfig, "export-source")) {
+		TermIndex restoredSnapshot = null;
+		String damagedSnapshot = null;
+		var store = open(dbDir, rockserverConfig, "export-source");
+		try {
+			// After the open: it fails while the replica runs, before anything in its Raft directory is touched.
+			if (stateMachineDir != null && Files.isDirectory(stateMachineDir)) {
+				var storage = new CheckpointStorage();
+				try {
+					storage.init(stateMachineDir);
+					var snapshot = storage.getLatestSnapshot();
+					var before = store.applied();
+					store = restoreSnapshotIfAhead(store, storage, rockserverConfig, "export-source");
+					if (snapshot != null && snapshot.getIndex() > before.getIndex()) {
+						restoredSnapshot = snapshot.getTermIndex();
+					}
+				} catch (CheckpointStorage.DamagedSnapshotException damaged) {
+					// A start refuses this replica; the last resort copies what its database holds all the same.
+					LOG.warn("Exporting {} without the damaged snapshot in {}", dbDir, stateMachineDir, damaged);
+					damagedSnapshot = damaged.getMessage();
+				}
+			}
 			// The copy leaves out the cluster version with the rest of the metadata: refuse a newer cluster's database
 			// here, or the new cluster would start at GENESIS with data that a newer version wrote (R18-1).
 			long version = store.clusterVersion();
@@ -913,6 +962,9 @@ final class NodeStore implements Closeable {
 			}
 			clusterId = store.clusterId();
 			applied = store.checkpoint(target);
+		} finally {
+			// A no-op when restoreSnapshotIfAhead failed after closing it.
+			store.close();
 		}
 		try (var copy = new EmbeddedConnection(target, "export-target", config)) {
 			var db = copy.getEmbeddedDB();
@@ -922,10 +974,14 @@ final class NodeStore implements Closeable {
 			db.flush();
 		}
 		syncTree(target);
-		return new ExportedSeed(applied, clusterId, null, null);
+		return new ExportedSeed(applied, clusterId, restoredSnapshot, damagedSnapshot);
 	}
 
-	/** What {@link #exportSeed} copied: the applied position and the cluster (null if none) of the replica. */
+	/**
+	 * What {@link #exportSeed} copied: the applied position and the cluster (null if none) of the replica; the position
+	 * of the snapshot restored into its database first (null if none was ahead), and why a snapshot of the replica could
+	 * not be used (null if none was damaged), see {@link #exportSeed(Path, Path, Path, Path)}.
+	 */
 	record ExportedSeed(TermIndex applied, @Nullable String clusterId, @Nullable TermIndex restoredSnapshot,
 			@Nullable String damagedSnapshot) {}
 

@@ -434,17 +434,14 @@ final class RockserverStateMachine extends BaseStateMachine {
 		}
 	}
 
-	/** Opens the local database, first restoring the snapshot if it is ahead of the database. */
+	/**
+	 * Opens the local database, first restoring the snapshot if it is ahead of the database
+	 * ({@link NodeStore#restoreSnapshotIfAhead}, which {@code export-seed} runs too).
+	 */
 	private void openStore() throws IOException {
-		var opened = NodeStore.open(config.dbDir(), config.rockserverConfig(), config.nodeId());
-		var snapshot = storage.getLatestSnapshot();
-		if (snapshot != null && snapshot.getIndex() > opened.applied().getIndex()) {
-			LOG.warn("{}: database at {} is behind the snapshot at {}, restoring the snapshot",
-					config.nodeId(), opened.applied(), snapshot.getTermIndex());
-			opened.close();
-			NodeStore.restore(storage.snapshotDbDir(), config.dbDir());
-			opened = NodeStore.open(config.dbDir(), config.rockserverConfig(), config.nodeId());
-		}
+		var opened = NodeStore.restoreSnapshotIfAhead(
+				NodeStore.open(config.dbDir(), config.rockserverConfig(), config.nodeId()), storage,
+				config.rockserverConfig(), config.nodeId());
 		var position = opened.applied();
 		raiseVisibleTerm(position.getTerm());
 		this.configurations = new CommittedConfigurations(opened.configurations(), opened.configurationHistoryFrom());
