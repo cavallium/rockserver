@@ -21,6 +21,7 @@ import java.time.Duration;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
@@ -31,11 +32,18 @@ class DiskProbeTest {
 	@TempDir
 	Path temp;
 
+	/**
+	 * R35-3: the probe reads a fake clock, so "not yet" and "hung" are decided by the clock values the test gives, not by
+	 * how soon the test thread wakes up. Before, "not yet" was checked against the real clock and failed whenever the
+	 * test thread woke up more than 200 ms after the second probe started (a GC pause, a loaded host).
+	 */
 	@Test
 	void aProbeThatDoesNotEndWithinTheLimitMeansAHungDisk() throws Exception {
 		var disk = new CountDownLatch(1);
 		var started = new CountDownLatch(2);
 		var probes = new AtomicInteger();
+		long start = 1_000_000;
+		var clock = new AtomicLong(start);
 		try (var probe = new DiskProbe("test", () -> {
 			probes.incrementAndGet();
 			started.countDown();
@@ -46,18 +54,22 @@ class DiskProbeTest {
 					Thread.currentThread().interrupt();
 				}
 			}
-		}, Duration.ofMillis(10), System::nanoTime).start()) {
+		}, Duration.ofMillis(10), clock::get).start()) {
 			assertTrue(started.await(10, TimeUnit.SECONDS));
 			long limit = Duration.ofMillis(200).toNanos();
-			assertFalse(probe.hung(System.nanoTime(), limit), "not yet");
-			Thread.sleep(400);
-			assertTrue(probe.hung(System.nanoTime(), limit), "the second probe hangs");
+			// The second probe started at the clock's value, which has not moved since.
+			assertFalse(probe.hung(start + limit, limit), "not yet");
+			assertTrue(probe.hung(start + limit + 1, limit), "the second probe hangs");
+			long later = start + limit + 1;
+			clock.set(later);
 			disk.countDown();
 			long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
-			while (probe.hung(System.nanoTime(), limit) && System.nanoTime() - deadline < 0) {
+			// The third probe starts once the second ended: at the clock's new value, so it is not hung at that time.
+			while (probes.get() < 3 && System.nanoTime() - deadline < 0) {
 				Thread.sleep(5);
 			}
-			assertFalse(probe.hung(System.nanoTime(), limit), "it answers again");
+			assertTrue(probes.get() >= 3, "the second probe did not end");
+			assertFalse(probe.hung(later, limit), "it answers again");
 		}
 	}
 

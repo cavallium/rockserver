@@ -3,6 +3,7 @@ package it.cavallium.rockserver.distributed;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -971,6 +972,112 @@ class NodeStoreTest {
 		assertTrue(names.contains("CURRENT"), "synced " + synced);
 		assertTrue(synced.contains(db.toAbsolutePath().normalize()), "synced " + synced);
 		assertTrue(synced.contains(dataDir.toAbsolutePath().normalize()), "synced " + synced);
+	}
+
+	/**
+	 * R35-1: {@code restore-backup --data-dir /x/link/..}, with {@code link} pointing to {@code /real/a/b}, restores into
+	 * the directory it then opens, the normalized {@code /x/db}, as the node's start and export-seed do. Before, the
+	 * precondition, the build and the swap resolved the path through the OS and put the backup in {@code /real/a/db},
+	 * while the open normalized it, created an empty {@code /x/db} and returned its (initial) position with OK.
+	 */
+	@Test
+	void restoreBackupRestoresIntoTheDirectoryItOpensWhenTheDataDirHasDotDotAfterALink() throws IOException {
+		Path backupDir = tempDir.resolve("backup");
+		checkpointWithData(backupDir.resolve(ReplicaOps.BACKUP_DB_DIR), 10, TermIndex.valueOf(1, 10));
+		Files.writeString(backupDir.resolve(ReplicaOps.BACKUP_PROPERTIES), "name=b\nindex=10\ncluster=c\n");
+		Path realDataDir = Files.createDirectories(tempDir.resolve("real").resolve("a"));
+		Files.createDirectories(realDataDir.resolve("b"));
+		Path x = Files.createDirectories(tempDir.resolve("x"));
+		Files.createSymbolicLink(x.resolve("link"), realDataDir.resolve("b"));
+		Path dataDir = x.resolve("link").resolve("..");
+
+		assertEquals(TermIndex.valueOf(1, 10), ReplicaOps.restore(backupDir, dataDir, null));
+
+		assertFalse(Files.exists(realDataDir.resolve("db")), "restored where the OS resolves the data directory");
+		assertNotNull(NodeStore.readSeedDigest(x.resolve("db")));
+		try (var store = NodeStore.open(x.resolve("db"), null, "restored")) {
+			assertEquals(TermIndex.INITIAL_VALUE, store.applied(), "the replication metadata is dropped");
+			assertEquals(10, contents(store, store.db().getColumnId(DATA_COLUMN)).size());
+		}
+	}
+
+	/**
+	 * R35-1: the node's start uses one form of {@code --data-dir} for the database and for Ratis' {@code raft/}: the
+	 * normalized one, which {@link NodeStore#open} uses. Before, {@code dbDir()} and {@code raftDir()} were the raw
+	 * path, which Ratis resolves through the OS ({@code /real/a/raft}) while the store's open normalizes
+	 * ({@code /x/db}).
+	 */
+	@Test
+	void theNodeStartUsesTheNormalizedDataDirectoryForTheDatabaseAndTheRaftLog() throws IOException {
+		Path x = Files.createDirectories(tempDir.resolve("x"));
+		Files.createSymbolicLink(x.resolve("link"), Files.createDirectories(tempDir.resolve("real").resolve("a").resolve("b")));
+		var config = NodeConfig.defaults("a", List.of(new PeerConfig("a", "localhost", 1, "localhost", 2)),
+				x.resolve("link").resolve(".."));
+		assertEquals(x.toAbsolutePath().normalize(), config.dataDir());
+		assertEquals(x.toAbsolutePath().normalize().resolve("db"), config.dbDir());
+		assertEquals(x.toAbsolutePath().normalize().resolve("raft"), config.raftDir());
+		assertEquals(x.toAbsolutePath().normalize(), config.withPeers(config.peers()).dataDir());
+	}
+
+	/**
+	 * R35-2: {@code restore-backup} moves the old cluster's results file and backups aside, and fsyncs the data
+	 * directory, before the restored database appears there: whenever {@code db/} is visible, even after a power loss,
+	 * the old results cannot answer for the new cluster. Before, the moves came last and nothing fsynced them: every
+	 * fsync of the data directory during the restore saw them still in place, next to the restored database.
+	 */
+	@Test
+	void restoreBackupMovesTheOldResultsAsideDurablyBeforeTheDatabaseAppears() throws IOException {
+		Path backupDir = tempDir.resolve("backup");
+		checkpointWithData(backupDir.resolve(ReplicaOps.BACKUP_DB_DIR), 10, TermIndex.valueOf(1, 10));
+		Files.writeString(backupDir.resolve(ReplicaOps.BACKUP_PROPERTIES), "name=b\nindex=10\ncluster=c\n");
+		Path dataDir = Files.createDirectories(tempDir.resolve("data"));
+		Files.writeString(dataDir.resolve("replica-ops.log"), "old cluster\n");
+		Files.createDirectories(dataDir.resolve(ReplicaOps.BACKUPS_DIR).resolve("nightly-1"));
+		Path absolute = dataDir.toAbsolutePath().normalize();
+		var observed = new java.util.concurrent.ConcurrentLinkedQueue<String>();
+		NodeStore.syncedForTesting = path -> {
+			if (path.equals(absolute)) {
+				observed.add((Files.exists(absolute.resolve("replica-ops.log")) ? "log " : "")
+						+ (Files.exists(absolute.resolve(ReplicaOps.BACKUPS_DIR)) ? "backups " : "")
+						+ (Files.exists(absolute.resolve("db")) ? "db" : "no db"));
+			}
+		};
+		try {
+			ReplicaOps.restore(backupDir, dataDir, null);
+		} finally {
+			NodeStore.syncedForTesting = null;
+		}
+		assertEquals("no db", observed.peek(), "fsyncs of the data directory: " + observed);
+		assertTrue(observed.stream().noneMatch(state -> state.contains("log") || state.contains("backups")),
+				"fsyncs of the data directory: " + observed);
+		try (var files = Files.list(dataDir)) {
+			var names = files.map(path -> path.getFileName().toString()).toList();
+			assertTrue(names.stream().anyMatch(name -> name.startsWith("replica-ops.log.before-restore-")), "" + names);
+			assertTrue(names.stream().anyMatch(name -> name.startsWith("backups.before-restore-")), "" + names);
+		}
+	}
+
+	/**
+	 * R35-2: a {@code restore-backup} that fails (here: a {@code --rockserver-config} that does not parse, standing in
+	 * for a kill) has already moved the old cluster's results aside, so its rerun, which the failure allows, starts the
+	 * new cluster without them. Before, a kill after the database was restored and before the moves left them in place
+	 * next to {@code db/}, and the rerun was refused.
+	 */
+	@Test
+	void aFailedRestoreBackupHasAlreadyMovedTheOldResultsAside() throws IOException {
+		Path backupDir = tempDir.resolve("backup");
+		checkpointWithData(backupDir.resolve(ReplicaOps.BACKUP_DB_DIR), 10, TermIndex.valueOf(1, 10));
+		Files.writeString(backupDir.resolve(ReplicaOps.BACKUP_PROPERTIES), "name=b\nindex=10\ncluster=c\n");
+		Path dataDir = Files.createDirectories(tempDir.resolve("data"));
+		Files.writeString(dataDir.resolve("replica-ops.log"), "old cluster\n");
+		Path badConfig = tempDir.resolve("bad.conf");
+		Files.writeString(badConfig, "database { this does not parse");
+		assertThrows(Exception.class, () -> ReplicaOps.restore(backupDir, dataDir, badConfig));
+		assertFalse(Files.exists(dataDir.resolve("db")));
+		assertFalse(Files.exists(dataDir.resolve("replica-ops.log")), "the old results are still in place");
+
+		assertEquals(TermIndex.valueOf(1, 10), ReplicaOps.restore(backupDir, dataDir, null));
+		assertFalse(Files.exists(dataDir.resolve("replica-ops.log")));
 	}
 
 	@FunctionalInterface
