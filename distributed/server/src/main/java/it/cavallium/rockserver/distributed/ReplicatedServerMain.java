@@ -278,9 +278,39 @@ public final class ReplicatedServerMain {
 		startAndServe(config, directMemoryWatch);
 	}
 
-	/** R47-1: not yet. */
+	/**
+	 * What to do when the start failed because Ratis could not read the Raft log, else null (R47-1). After a power loss
+	 * the last write of the open segment can be torn, which Ratis refuses with the default corruption policy
+	 * ({@link RaftSettings}); {@code repair-log} tells a torn tail, which it drops, from damage, which it refuses. Ratis'
+	 * error does not tell them apart ({@code Log entry corrupted}, an {@code InvalidProtocolBufferException},
+	 * {@code Read extra bytes}), so the failure is recognised by where it was thrown: a frame of Ratis' segment reader,
+	 * anywhere in its causes or suppressed exceptions. Only a hint is printed: the exit code stays 1.
+	 */
 	static @Nullable String unreadableLogHint(Throwable failure, Path dataDir, String groupId) {
-		return null;
+		if (!readingTheLog(failure, java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>()))) {
+			return null;
+		}
+		String group = NodeConfig.DEFAULT_GROUP_ID.equals(groupId) ? "" : " --group-id " + groupId;
+		return "The node could not read its Raft log. After a power loss or a crash its last write may be torn: with the"
+				+ " node stopped, run `repair-log --data-dir " + dataDir + group + " --dry-run` and follow its verdict,"
+				+ " not this error (runbooks.md, \"Node does not start after a power loss\").";
+	}
+
+	private static boolean readingTheLog(@Nullable Throwable failure, java.util.Set<Throwable> seen) {
+		if (failure == null || !seen.add(failure)) return false;
+		for (var frame : failure.getStackTrace()) {
+			String type = frame.getClassName();
+			if (type.equals("org.apache.ratis.server.raftlog.segmented.SegmentedRaftLogReader")
+					|| type.equals("org.apache.ratis.server.raftlog.segmented.SegmentedRaftLogInputStream")
+					|| (type.equals("org.apache.ratis.server.raftlog.segmented.LogSegment")
+							&& frame.getMethodName().equals("readSegmentFile"))) {
+				return true;
+			}
+		}
+		for (var suppressed : failure.getSuppressed()) {
+			if (readingTheLog(suppressed, seen)) return true;
+		}
+		return readingTheLog(failure.getCause(), seen);
 	}
 
 	/** How {@code run} starts its node: {@link ReplicatedNode#start}, unless a test replaced it. */
@@ -327,6 +357,8 @@ public final class ReplicatedServerMain {
 			started.complete(null);
 			System.err.println("Failed to start node " + config.nodeId() + ":");
 			e.printStackTrace();
+			var hint = unreadableLogHint(e, config.dataDir(), config.groupId());
+			if (hint != null) System.err.println(hint);
 			exit(1);
 			return;
 		}
