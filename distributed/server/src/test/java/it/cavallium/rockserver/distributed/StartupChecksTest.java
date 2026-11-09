@@ -144,6 +144,55 @@ class StartupChecksTest {
 		assertEquals(digest, NodeStore.readSeedDigest(node));
 	}
 
+	/**
+	 * R41-1: the marker a start-up check writes before its open keeps the seed digest only for files that open can have
+	 * changed. After a killed check, files the open left keep the digest; a copy made again after it (here a partial one,
+	 * then one of another seed) gets the digest of what it holds, as without the marker, so that genesis still finds it.
+	 */
+	@Test
+	void theOpeningMarkerKeepsTheDigestOnlyForTheFilesThatOpenLeft() throws IOException {
+		var seed = tempDir.resolve("seed");
+		var other = tempDir.resolve("other");
+		for (var dir : List.of(seed, other)) {
+			try (var store = NodeStore.open(dir, null, "seed")) {
+				long column = store.db().createColumn(NodeStoreTest.DATA_COLUMN, NodeStoreTest.DATA_SCHEMA);
+				for (int i = 0; i < (dir == seed ? 100 : 101); i++) {
+					NodeStoreTest.put(store, column, i, "v" + i);
+				}
+			}
+		}
+		var node = tempDir.resolve("node/db");
+		copy(seed, node);
+		var digest = NodeStore.recordSeedDigest(node);
+		NodeStore.noteSeedOpening(node);
+		// The check's open, cut before noteSeedOpened: the files changed, the seed's table files are the same ones.
+		NodeStore.open(node, null, "node").close();
+		assertNotEquals(digest, NodeStore.databaseFilesDigest(node));
+		assertEquals(digest, NodeStore.recordSeedDigest(node));
+		assertEquals(digest, NodeStore.recordSeedDigest(node), "kept again by a retry");
+
+		// The operator copies the seed again, partially: other files, with another digest.
+		NodeStore.noteSeedOpening(node);
+		deleteTree(node);
+		copy(seed, node);
+		Files.delete(largestFile(node, ".sst"));
+		var partial = NodeStore.recordSeedDigest(node);
+		assertNotEquals(digest, partial);
+
+		// Another seed copied in after a killed check: another digest too.
+		NodeStore.noteSeedOpening(node);
+		deleteTree(node);
+		copy(other, node);
+		assertNotEquals(partial, NodeStore.recordSeedDigest(node));
+		assertNotEquals(digest, NodeStore.readSeedDigest(node));
+
+		// The same seed copied again matches its digest, marker or not.
+		NodeStore.noteSeedOpening(node);
+		deleteTree(node);
+		copy(seed, node);
+		assertEquals(digest, NodeStore.recordSeedDigest(node));
+	}
+
 	/** DD-19: a replica's database becomes a seed: same data, no replication metadata, so a new cluster accepts it. */
 	@Test
 	void anExportedReplicaSeedsANewCluster() throws IOException {
