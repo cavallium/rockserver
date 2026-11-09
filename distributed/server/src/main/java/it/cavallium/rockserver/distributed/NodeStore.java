@@ -1581,6 +1581,9 @@ final class NodeStore implements Closeable {
 	/** Tests only: see {@link CheckpointHook}; null in production. */
 	static volatile @Nullable CheckpointHook checkpointBuiltForTesting;
 
+	/** The table cache of export-seed's open of its copy ({@link #withSmallFootprint}); package-private for tests. */
+	static final int EXPORT_COPY_MAX_OPEN_FILES = 32;
+
 	/**
 	 * Tests only: called with the directory in which {@code export-seed} opens its copy to drop the meta column, before
 	 * the open; null in production.
