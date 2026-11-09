@@ -261,8 +261,12 @@ over (clients open new ones by themselves).
 1. Stop every node of the old cluster, and copy their data directories aside before anything else.
 2. On every node of the new cluster, into an empty data directory, from a copy of the same backup:
    `rs restore-backup --backup /path/to/<name> --data-dir /srv/rockserver/data [--rockserver-config ...]`.
-   It prints `OK` and the log index the data reaches. It refuses a data directory with a `db/` or a Raft log, and
-   renames a `replica-ops.log` and a `backups/` of the old cluster found there (suffix `.before-restore-<time>`).
+   It prints `OK`, the data directory and the log index the data reaches. It refuses a data directory with a `db/` or a
+   Raft log, and first renames a `replica-ops.log` and a `backups/` of the old cluster found there (suffix
+   `.before-restore-<time>`) and fsyncs the directory, before it restores anything, so that their results never answer
+   for the new cluster. Every command takes `--data-dir` absolute and normalized (`/x/link/..` is `/x`, not the parent
+   of the link's target): use the same `--data-dir` for `restore-backup` and for the node's start, and the `OK` line
+   names the directory both use.
    It refuses a backup of a newer cluster version than this binary supports with exit code 5, and leaves no `db/`:
    restore it with the newer version. Run that newer version on every node of the new cluster as well: the restored
    `db/` carries no cluster version, so an older binary started on it is not refused, and would hold data written by a
