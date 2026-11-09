@@ -6,25 +6,44 @@ only says what to do and what to check.
 
 In the commands, `rs` stands for the node's launcher. The build makes no runnable jar: the launcher runs the classes
 of a checkout of the version to run, with the JVM flags the in-repo launchers pass (README.md; the process tests'
-`ProcessCluster`, `BenchNodes` and `distributed/bench/load-bench.sh`). Build them once per version, in its checkout
-(this installs nothing into `~/.m2`; `-o` works once the dependencies are there):
+`ProcessCluster`, `BenchNodes` and `distributed/bench/load-bench.sh`). Build them once per version, in its checkout,
+through the reactor (`-am`): Maven then takes `rockserver-core` from the checkout (`target/library/classes`) and every
+other jar from the checkout's own poms. Run on `distributed/server/pom.xml` alone, it would look for
+`rockserver-core:<version>` and that version's pom in `~/.m2` or a remote repository: it fails where none of that
+version was ever installed, and elsewhere picks the third-party jars of whichever build was. Nothing of the checkout is
+installed into `~/.m2`, but a run without `-o` downloads the third-party jars and the Maven plugins it lacks into
+`~/.m2/repository`; `-o` works once they are there.
 
 ```bash
-mvn -q -f distributed/pom.xml -pl server -am compile
-mvn -q -f distributed/server/pom.xml dependency:build-classpath \
-  -Dmdep.outputFile=distributed/server/target/runtime.classpath -Dmdep.includeScope=runtime
-# The checkout's own core classes, never a rockserver-core jar of another version from ~/.m2:
-RS_CP="$PWD/distributed/server/target/classes:$PWD/target/library/classes:$(tr ':' '\n' \
-  < distributed/server/target/runtime.classpath | grep -v /rockserver-core/ | paste -sd:)"
+mvn -q -f distributed/pom.xml -pl server -am compile dependency:build-classpath \
+  -Dmdep.outputFile=target/runtime.classpath -DincludeScope=runtime
+# The server has no SLF4J provider at runtime (logging would go to a no-op logger): add the process tests' one.
+mvn -q -f distributed/pom.xml -pl server -am compile dependency:build-classpath \
+  -Dmdep.outputFile=target/logging.classpath -DincludeArtifactIds=slf4j-simple
+T=$PWD/distributed/server/target
+RS_CP="$T/classes:$(<"$T/runtime.classpath"):$(<"$T/logging.classpath")"
 alias rs="java -XX:+ExitOnOutOfMemoryError --enable-native-access=ALL-UNNAMED --add-modules jdk.incubator.vector \
   -cp '$RS_CP' it.cavallium.rockserver.distributed.ReplicatedServerMain"
 ```
 
-`rs` without a command prints the usage and exits with 2: a classpath that misses a class fails there, before any
-data is touched. Without `--enable-native-access=ALL-UNNAMED` the JDK warns about RocksDB's native access (a later
+Each module of the reactor writes its own `target/*.classpath`; the server's are the ones read. The scope filter is
+`-DincludeScope`, not `-Dmdep.includeScope`, which the plugin ignores (it would add the test jars). Any SLF4J 2
+provider can replace `slf4j-simple`, which writes to standard error.
+
+`rs` without a command prints the usage and exits with 2. That proves only that the JVM flags are accepted and the main
+class is found: the JVM loads classes when first used, and the usage loads none of RocksDB, gRPC or Netty. A missing
+jar shows when a command first needs it, for `run` possibly part-way through a start (exit 1: an `Error`, a class that does not load). To check the
+classpath, start a throwaway single node on a scratch directory and loopback ports, which loads them all, and stop it
+once it logs `started` and becomes leader:
+
+```bash
+rs run --node-id n1 --peer n1=127.0.0.1:47911/127.0.0.1:47912 --data-dir /tmp/rs-check \
+  --raft-bind-host 127.0.0.1 --api-bind-host 127.0.0.1   # then Ctrl-C; rm -r /tmp/rs-check
+```
+
+Without `--enable-native-access=ALL-UNNAMED` the JDK warns about RocksDB's native access (a later
 JDK may refuse it); `--add-modules jdk.incubator.vector` is the README's command line (no Rockserver code of this
-version needs it). For
-a service unit, put the same `java` command line, with the classpath written out, in `ExecStart`.
+version needs it). For a service unit, put the same `java` command line, with the classpath written out, in `ExecStart`.
 
 `run` extracts the RocksDB library into `DATA-DIR/tmp` by itself, with or without `-Djava.io.tmpdir`, and deletes
 there the 17 MB copies that killed runs leave behind. It also points `java.io.tmpdir` there for libraries that read the

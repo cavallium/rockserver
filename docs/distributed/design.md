@@ -4237,6 +4237,32 @@ install it (`apt-get install gcc libc6-dev`) and run with `-Drockserver.test.req
      core classes, as `load-bench.sh` does) and pass the flags of the in-repo launchers; checked by running `rs`
      without a command (usage, exit 2) and `repair-log --dry-run`. README.md no longer says that hot paths fall back to
      scalar code without the Vector API: no Rockserver code of this version uses it. No packaging plugin was added.
+   - Review of R46, 1 (low, docs): the R46-2 recipe ran `dependency:build-classpath` on `distributed/server/pom.xml`
+     alone, so Maven resolved `rockserver-core:${revision}` and that version's pom from `~/.m2` (or the snapshot
+     repository): `grep -v /rockserver-core/` dropped the jar but kept the third-party jars of that pom, from whichever
+     build was installed, and the step fails where none was (this project never runs `mvn install`). It worked here
+     only because of a stale 2.0.3-SNAPSHOT in `~/.m2`. Both the recipe and `load-bench.sh` now resolve through the
+     reactor (`-f distributed/pom.xml -pl server -am compile|test-compile dependency:build-classpath`), which gives the
+     checkout's `target/library/classes` for the core and the checkout's poms for the rest; `load-bench.sh` reads a
+     new file name (`load-bench-reactor.classpath`) so a classpath written the old way is never reused. Found on the
+     way: `-Dmdep.includeScope` is not a property of the plugin (its user property is `includeScope`), so the R46-2
+     "runtime" classpath held every test jar (JUnit, jqwik, `slf4j-simple`). With the filter honoured, the server has
+     no SLF4J provider at runtime and a node logged nothing (SLF4J's no-op logger); the recipe adds `slf4j-simple`,
+     the provider the process tests log with, by a second `build-classpath -DincludeArtifactIds=slf4j-simple`. The
+     pom is unchanged (a runtime provider there would be one for every embedder). The runbooks say that an online
+     run downloads the dependencies and plugins into `~/.m2/repository` and installs nothing of the checkout.
+     Checked by hand, offline: the reactor classpath names `target/library/classes` and no `rockserver-core` jar, the
+     runtime one has no JUnit, jqwik or Mockito jar, and a single node started with it logs, becomes leader and
+     stops on SIGTERM. Not checked: a machine with no `rockserver-core` in `~/.m2` (this one has one, so the reactor
+     resolution was observed by the classpath entry, not by a failure of the old recipe); `load-bench.sh` itself was
+     not run (no benchmarks), only the `mvn` line it runs.
+   - Review of R46, 2 (low, docs): the runbooks said that `rs` without a command fails on a classpath that misses a
+     class. The usage loads `ReplicatedServerMain` and a few Ratis classes, none of RocksDB, gRPC or Netty
+     (`-Xlog:class+load`; `repair-log --dry-run` on an empty directory neither), and the JVM loads classes lazily, so
+     a missing jar shows when a command reaches it, for `run` possibly part-way through a start (exit 1). The
+     runbooks now say the usage proves only the flags and the main class, and give the check that loads them all: a
+     throwaway single node on loopback ports, stopped once leader (2133 Ratis, 79 RocksDB, 154 gRPC, 463 Netty
+     classes loaded here).
    - The exit status after a start is the same on both paths (R6-2): the main thread's exit is a `System.exit`,
      which runs the shutdown hook, and the hook ends with `Runtime.halt`. The hook used to halt with 3 for any
      failure, which replaced the 4 of a node that found out, while it waited outside the cluster, that it was

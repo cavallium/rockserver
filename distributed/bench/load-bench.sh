@@ -6,14 +6,15 @@
 set -euo pipefail
 here="$(cd "$(dirname "$0")/../.." && pwd)"
 server="$here/distributed/server"
-cpfile="$server/target/load-bench.classpath"
-if [[ ! -f "$cpfile" || "$server/pom.xml" -nt "$cpfile" ]]; then
-	mvn -o -q -f "$server/pom.xml" dependency:build-classpath -Dmdep.outputFile="$cpfile" -Dmdep.includeScope=test >/dev/null
+cpfile="$server/target/load-bench-reactor.classpath"
+if [[ ! -f "$cpfile" || "$server/pom.xml" -nt "$cpfile" || "$here/pom.xml" -nt "$cpfile" ]]; then
+	# Resolved through the reactor (-am), so rockserver-core is this checkout's target/library/classes and the
+	# third-party jars are those of this checkout's poms, never a rockserver-core snapshot or its pom from ~/.m2.
+	# Each module of the reactor writes its own target/load-bench-reactor.classpath; the server's is the one read here.
+	mvn -o -q -f "$here/distributed/pom.xml" -pl server -am test-compile dependency:build-classpath \
+		-Dmdep.outputFile=target/load-bench-reactor.classpath -DincludeScope=test >/dev/null
 fi
-# Use this checkout's core build, never whatever rockserver-core snapshot is in ~/.m2.
-deps="$(tr ':' '\n' < "$cpfile" | grep -v '/rockserver-core/' | paste -sd:)"
-core="$here/target/library/classes"
-[[ -d "$core/it" ]] || core="$(ls "$here"/target/rockserver-core-*.jar | head -1)"
+deps="$(<"$cpfile")"
 exec "${JAVA_HOME:+$JAVA_HOME/bin/}java" --enable-native-access=ALL-UNNAMED --add-modules jdk.incubator.vector -Xms2g -Xmx2g \
-	-cp "$server/target/test-classes:$server/target/classes:$core:$deps" \
+	-cp "$server/target/test-classes:$server/target/classes:$deps" \
 	it.cavallium.rockserver.distributed.bench.LoadBench "$@"
