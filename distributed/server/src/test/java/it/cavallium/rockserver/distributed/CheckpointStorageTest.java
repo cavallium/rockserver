@@ -219,6 +219,84 @@ class CheckpointStorageTest {
 		assertTrue(Files.exists(table), "the damaged snapshot is kept for inspection");
 	}
 
+	/**
+	 * R31-2: a crash after Ratis renamed a received snapshot into place, before the state machine verified it and
+	 * restored it into {@code db/}, leaves {@code db/} behind the snapshot. A start of the node would restore it
+	 * ({@code openStore}); {@code export-seed} on that stopped node does the same (verifying the snapshot first), so it
+	 * copies and reports the snapshot's index, not the older one of {@code db/}.
+	 */
+	@Test
+	void exportSeedRestoresAnInstalledSnapshotAheadOfTheDatabase() throws IOException {
+		Path dataDir = tempDir.resolve("node");
+		Path groupDir = writeNodeBehindAnInstalledSnapshot(dataDir);
+		Path snapshot = groupDir.resolve("sm").resolve("snapshots").resolve("snapshot-4-40");
+		assertTrue(Files.notExists(snapshot.resolve("installed.verified")), "not verified yet");
+
+		Path target = tempDir.resolve("seed");
+		var exported = NodeStore.exportSeed(dataDir.resolve("db"), groupDir.resolve("sm"), null, target);
+		assertEquals(TermIndex.valueOf(4, 40), exported.applied());
+		assertEquals(TermIndex.valueOf(4, 40), exported.restoredSnapshot());
+		assertNull(exported.damagedSnapshot());
+		assertTrue(Files.exists(snapshot.resolve("installed.verified")), "verified as a start verifies it");
+		try (var seed = NodeStore.open(target, null, "seed")) {
+			assertEquals(Map.of(7, "installed"), contents(seed, seed.db().getColumnId(DATA_COLUMN)));
+		}
+		// The node's own database was brought up to the snapshot, as its next start would have.
+		try (var node = NodeStore.open(dataDir.resolve("db"), null, "node")) {
+			assertEquals(TermIndex.valueOf(4, 40), node.applied());
+		}
+	}
+
+	/**
+	 * R31-2, R32-1: a snapshot that a crash damaged before it was verified cannot be used. {@code export-seed} refuses
+	 * by default, naming the snapshot's index and the database's, since the replica may have applied entries up to the
+	 * snapshot that its database lacks; told to export without it, it copies what {@code db/} holds and says why.
+	 */
+	@Test
+	void exportSeedWithADamagedInstalledSnapshotRefusesUnlessToldToExportTheDatabase() throws IOException {
+		Path dataDir = tempDir.resolve("node");
+		Path groupDir = writeNodeBehindAnInstalledSnapshot(dataDir);
+		Files.write(firstTable(groupDir.resolve("sm").resolve("snapshots")), new byte[0]);
+
+		Path target = tempDir.resolve("seed");
+		var refused = assertThrows(NodeStore.DamagedSnapshotNotExportedException.class,
+				() -> NodeStore.exportSeed(dataDir.resolve("db"), groupDir.resolve("sm"), null, target));
+		assertEquals(40, refused.snapshotIndex());
+		assertEquals(TermIndex.valueOf(1, 5), refused.databaseApplied());
+		assertTrue(refused.getMessage().contains("index 40") && refused.getMessage().contains("index 5"),
+				refused.getMessage());
+		assertTrue(!refused.getMessage().contains("rebuild it from the other members"), refused.getMessage());
+		assertTrue(Files.notExists(target), "nothing written");
+
+		var exported = NodeStore.exportSeed(dataDir.resolve("db"), groupDir.resolve("sm"), null, target, true);
+		assertEquals(TermIndex.valueOf(1, 5), exported.applied());
+		assertNull(exported.restoredSnapshot());
+		assertNotNull(exported.damagedSnapshot());
+		assertTrue(exported.damagedSnapshot().contains("snapshot-4-40"), exported.damagedSnapshot());
+		assertEquals(40, exported.damagedSnapshotIndex());
+		try (var seed = NodeStore.open(target, null, "seed")) {
+			assertEquals(Map.of(7, "old"), contents(seed, seed.db().getColumnId(DATA_COLUMN)));
+		}
+	}
+
+	/** A stopped node in {@code dataDir} whose {@code db/} is at 1:5 and whose received snapshot at 4:40 is unverified. */
+	private Path writeNodeBehindAnInstalledSnapshot(Path dataDir) throws IOException {
+		try (var node = NodeStore.open(dataDir.resolve("db"), null, "node")) {
+			long nodeColumn = node.db().createColumn(DATA_COLUMN, DATA_SCHEMA);
+			put(node, nodeColumn, 7, "old");
+			setApplied(node, TermIndex.valueOf(1, 5));
+		}
+		var leader = initStorage(tempDir.resolve("leader"), RaftStorage.StartupOption.FORMAT);
+		put(store, column, 7, "installed");
+		setApplied(store, TermIndex.valueOf(4, 40));
+		leader.take(store);
+		Path groupDir = dataDir.resolve("raft").resolve(NodeConfig.DEFAULT_GROUP_ID);
+		var follower = initStorage(groupDir, RaftStorage.StartupOption.FORMAT);
+		install(leader, leader.getLatestSnapshot(), follower);
+		closeRaftStorages();
+		return groupDir;
+	}
+
 	@Test
 	void installedSnapshotThatLostItsPositionFailsLoudly() throws IOException {
 		var leader = initStorage(tempDir.resolve("leader"), RaftStorage.StartupOption.FORMAT);

@@ -820,6 +820,104 @@ class CommandLineTest {
 		assertTrue(Files.notExists(target.resolve("db")));
 	}
 
+	/**
+	 * R31-2: {@code export-seed} of a stopped node whose {@code db/} is behind the snapshot in its Raft directory (a
+	 * crash during a snapshot installation) restores the snapshot first, as the node's start would, and prints the
+	 * snapshot's index. A node of another group needs {@code --group-id}, as {@code run} and {@code repair-log} do:
+	 * without it, raft/ holding only other groups is wrong usage rather than a silent export of the older {@code db/}.
+	 */
+	@Test
+	void exportSeedRestoresASnapshotAheadOfTheDatabase() throws IOException {
+		Path dataDir = temp.resolve("node");
+		writeNodeBehindASnapshot(dataDir, NodeConfig.DEFAULT_GROUP_ID);
+		Path seed = temp.resolve("seed");
+		var export = run("export-seed", "--data-dir", dataDir.toString(), "--target", seed.toString());
+		assertEquals(0, export.code(), export.toString());
+		assertTrue(export.out().contains("applied up to index 40 of term 4"), export.out());
+		assertTrue(export.out().contains("snapshot at index 40"), export.out());
+
+		String otherGroup = "0f1e2d3c-4b5a-4968-8776-655443322110";
+		Path other = temp.resolve("other");
+		writeNodeBehindASnapshot(other, otherGroup);
+		var withoutGroup = run("export-seed", "--data-dir", other.toString(), "--target", temp.resolve("s2").toString());
+		assertEquals(2, withoutGroup.code(), withoutGroup.toString());
+		assertTrue(withoutGroup.err().contains(otherGroup) && withoutGroup.err().contains("--group-id"),
+				withoutGroup.err());
+		assertTrue(Files.notExists(temp.resolve("s2")));
+		var withGroup = run("export-seed", "--data-dir", other.toString(), "--target", temp.resolve("s3").toString(),
+				"--group-id", otherGroup);
+		assertEquals(0, withGroup.code(), withGroup.toString());
+		assertTrue(withGroup.out().contains("applied up to index 40 of term 4"), withGroup.out());
+	}
+
+	/**
+	 * R32-2: an explicit {@code --group-id} without a directory in raft/, which holds other groups (a typo), is wrong
+	 * usage: exporting {@code db/} would miss the node's snapshot without a word, as R31-2 refuses for the default group.
+	 */
+	@Test
+	void exportSeedRefusesAGroupIdWithoutRaftState() throws IOException {
+		String group = "0f1e2d3c-4b5a-4968-8776-655443322110";
+		String typo = "0f1e2d3c-4b5a-4968-8776-655443322111";
+		Path dataDir = temp.resolve("node");
+		writeNodeBehindASnapshot(dataDir, group);
+		Path seed = temp.resolve("seed");
+		var export = run("export-seed", "--data-dir", dataDir.toString(), "--target", seed.toString(),
+				"--group-id", typo);
+		assertEquals(2, export.code(), export.toString());
+		assertTrue(export.err().contains(typo) && export.err().contains(group), export.err());
+		assertTrue(Files.notExists(seed));
+	}
+
+	/**
+	 * R32-1: a damaged snapshot ahead of {@code db/} makes {@code export-seed} fail with 1 and write nothing, naming the
+	 * snapshot's index; with {@code --without-damaged-snapshot} it exports {@code db/}, exit 0, and stdout says that
+	 * the snapshot at that index was not used.
+	 */
+	@Test
+	void exportSeedRefusesADamagedSnapshotUnlessToldTo() throws IOException {
+		Path dataDir = temp.resolve("node");
+		writeNodeBehindASnapshot(dataDir, NodeConfig.DEFAULT_GROUP_ID);
+		// A digest makes it a received snapshot, and this one matches nothing: damaged by a crash.
+		Path snapshot = dataDir.resolve("raft").resolve(NodeConfig.DEFAULT_GROUP_ID).resolve("sm")
+				.resolve("snapshots").resolve("snapshot-4-40");
+		Files.writeString(snapshot.resolve("snapshot.properties.md5"),
+				"00000000000000000000000000000000 *snapshot.properties\n");
+		Path seed = temp.resolve("seed");
+		var refused = run("export-seed", "--data-dir", dataDir.toString(), "--target", seed.toString());
+		assertEquals(1, refused.code(), refused.toString());
+		assertTrue(refused.err().contains("index 40") && refused.err().contains("--without-damaged-snapshot"),
+				refused.err());
+		assertTrue(Files.notExists(seed));
+
+		var exported = run("export-seed", "--data-dir", dataDir.toString(), "--target", seed.toString(),
+				"--without-damaged-snapshot");
+		assertEquals(0, exported.code(), exported.toString());
+		assertTrue(exported.out().contains("applied up to index 5 of term 1"), exported.out());
+		assertTrue(exported.out().contains("damaged snapshot at index 40"), exported.out());
+		assertTrue(Files.exists(seed.resolve("CURRENT")));
+	}
+
+	/**
+	 * A stopped node in {@code dataDir}: {@code db/} at 1:5, and in raft/{@code group} a snapshot at 4:40 as the node
+	 * takes one (a checkpoint and its position, fsynced before the rename: no digest to verify).
+	 */
+	private static void writeNodeBehindASnapshot(Path dataDir, String group) throws IOException {
+		Path snapshot = dataDir.resolve("raft").resolve(group).resolve("sm").resolve("snapshots")
+				.resolve("snapshot-4-40");
+		try (var node = NodeStore.open(dataDir.resolve("db"), null, "node")) {
+			long column = node.db().createColumn(NodeStoreTest.DATA_COLUMN, NodeStoreTest.DATA_SCHEMA);
+			NodeStoreTest.put(node, column, 7, "old");
+			NodeStoreTest.setApplied(node, org.apache.ratis.server.protocol.TermIndex.valueOf(1, 5));
+			Files.createDirectories(snapshot);
+			NodeStoreTest.put(node, column, 7, "new");
+			NodeStoreTest.setApplied(node, org.apache.ratis.server.protocol.TermIndex.valueOf(4, 40));
+			node.checkpoint(snapshot.resolve("db"));
+			NodeStoreTest.put(node, column, 7, "old");
+			NodeStoreTest.setApplied(node, org.apache.ratis.server.protocol.TermIndex.valueOf(1, 5));
+		}
+		Files.writeString(snapshot.resolve("snapshot.properties"), "term=4\nindex=40\n");
+	}
+
 	private static String[] with(List<String> base, String... more) {
 		var all = new ArrayList<>(base);
 		all.addAll(List.of(more));

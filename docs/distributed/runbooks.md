@@ -23,7 +23,10 @@ host may be loading its copy there. While the database opens, the node keeps the
 long WAL replay) leaves it, and its next start replaces and deletes it. The randomly named
 `rockserver-replica-<digits>.conf` files that older versions left there are deleted at the start too; nothing else is.
 `export-seed` keeps the config of its target next to it, as `rockserver-replica-for-<target name>.conf`, until it ends,
-whatever the target is called (a date such as `DATA-DIR/20261108` is fine).
+whatever the target is called (a date such as `DATA-DIR/20261108` is fine). Both files hold the resolved Rockserver
+config, the InfluxDB token and every `${?ENV}` substitution included, so they are created owner-only (rw-------)
+whatever the umask; RocksDB's and Raft's own files are not, so keep `DATA-DIR` itself at 0700 or 0750
+(`chmod 0750 /srv/rockserver/data`).
 
 and `PEERS` for the peer list of the cluster, one `--peer` per member, the same on every node and in every `admin`
 command:
@@ -128,7 +131,16 @@ Failure branches:
   the new node meanwhile, whatever a re-run says about its log (see the first branch).
 - The lost node was the leader: the same steps, after the election (`status` shows a new leader).
 - Two nodes of three lost: there is no majority, `add-peer` cannot work. See "No quorum" in the design document, and
-  "Restoring a backup" below.
+  "Restoring a backup" below. Without a backup, `rs export-seed --data-dir DATA-DIR --target NEW [--rockserver-config FILE] [--group-id UUID]` on each stopped
+  node prints the index its copy holds; pick the highest. A node that crashed while installing a snapshot can have
+  `db/` behind that snapshot: `export-seed` verifies the snapshot and restores it into `db/` first, as a start of the
+  node would, and its output then says `its database was behind its snapshot at index N, restored first`. If the
+  crash damaged that snapshot, `export-seed` exits 1 with `Not exported: The replica's latest snapshot ... (at index N)
+  is damaged`, the database's index, and writes nothing: that replica may have applied entries up to N that its `db/`
+  lacks. Export the other nodes first; if none reaches N, `--without-damaged-snapshot` exports this `db/` as it is,
+  and the output then says `without its damaged snapshot at index N`. Pass the node's `--group-id` if it runs with
+  one; `export-seed` refuses (exit 2) a group, given or the default, that has no directory in a `raft/` holding other
+  groups (a mistyped `--group-id` included).
 
 ## Removed node
 
@@ -430,8 +442,8 @@ disk problem to look at.
 | Code | `run` | `admin` | `repair-log` | `export-seed`, `restore-backup` |
 |---|---|---|---|---|
 | 0 | Not on a stop by signal: see below | `OK` | The log is valid, or was (with `--dry-run`: could be) repaired | Done |
-| 1 | Did not start: a port in use, a refused data directory (another file system, a cluster's database without its Raft state, a pointless `--join`), any other failure of the start (an `Error` too, such as a class that does not load) | `FAILED: ...`: refused (a change of more than one voter included, or a member refused `checksum`/`backup`: not every member supports it), a change failed, the replicas differ (`checksum`), a member failed (`backup`), a member's answer cannot be read (`<id>: cannot read its answer (...)`: a member of another version, asking again would not help) | Refused: see its output | Failed: see the exception |
-| 2 | Wrong usage, or no `-XX:+ExitOnOutOfMemoryError`: also an unknown option, a word that is no option's value (a flag given a value, `--join false` or `--pipelined-updates false`, which turned the flag on before), a malformed value (a non-numeric number, an `--election-timeout-ms` that is not MIN:MAX, a `--peer` or `--group-id` that does not parse) or one the node's configuration refuses (`--parallel-apply-threads 1`, a node id not among the peers, a minimum election timeout not below the maximum) | Wrong usage: also an unknown option (a misspelled one), an option of another command (`--allow-skipped` without `checksum`, `--unsafe-multi-voter-change` without `add-peer` or `remove-peer`), a word the command does not take (`status now`), a malformed value (`--timeout-ms`, `--peer`, `--group-id`, the index of `backup-status`, the argument of `add-peer`, a member id with `=` for `remove-peer`, `transfer-leader` or `snapshot`) | Wrong usage: also an unknown option or a stray word (`--dry-run yes`) | Wrong usage: also an unknown option or a stray word |
+| 1 | Did not start: a port in use, a refused data directory (another file system, a cluster's database without its Raft state, a pointless `--join`), any other failure of the start (an `Error` too, such as a class that does not load) | `FAILED: ...`: refused (a change of more than one voter included, or a member refused `checksum`/`backup`: not every member supports it), a change failed, the replicas differ (`checksum`), a member failed (`backup`), a member's answer cannot be read (`<id>: cannot read its answer (...)`: a member of another version, asking again would not help) | Refused: see its output | Failed: see the exception; `export-seed` also when the replica's latest snapshot is damaged (`Not exported: ...`, nothing written; see "Replacing a node", `--without-damaged-snapshot`) |
+| 2 | Wrong usage, or no `-XX:+ExitOnOutOfMemoryError`: also an unknown option, a word that is no option's value (a flag given a value, `--join false` or `--pipelined-updates false`, which turned the flag on before), a malformed value (a non-numeric number, an `--election-timeout-ms` that is not MIN:MAX, a `--peer` or `--group-id` that does not parse) or one the node's configuration refuses (`--parallel-apply-threads 1`, a node id not among the peers, a minimum election timeout not below the maximum) | Wrong usage: also an unknown option (a misspelled one), an option of another command (`--allow-skipped` without `checksum`, `--unsafe-multi-voter-change` without `add-peer` or `remove-peer`), a word the command does not take (`status now`), a malformed value (`--timeout-ms`, `--peer`, `--group-id`, the index of `backup-status`, the argument of `add-peer`, a member id with `=` for `remove-peer`, `transfer-leader` or `snapshot`) | Wrong usage: also an unknown option or a stray word (`--dry-run yes`) | Wrong usage: also an unknown option or a stray word; `export-seed` with a group (`--group-id`, or the default without it) that has no directory in a `raft/` holding other groups |
 | 3 | The node stopped after a failure: its replica failed, Raft closed, a JVM pause beyond `--jvm-pause-limit-ms`, out of direct memory on a thread of replication; also a failure that raced a SIGTERM, and out of heap (the JVM's own status for `-XX:+ExitOnOutOfMemoryError`) | - | - | - |
 | 4 | Removed from the cluster, confirmed by a majority of the current configuration: refused at the start, or found out while it heard no leader. Do not start it again (see "Removed node"; until a majority answers, a removed node waits outside instead) | Incomplete: a member gave no result in time (`checksum`, `backup`, `backup-status`), no member took the request in time, or a `checksum` answer that does not tell whether it was proposed: run it again | - | - |
 | 5 | Its database, its log or a snapshot it installed has a cluster version with capabilities this version lacks: run the newer version | - | - | The replica's database (`export-seed`) or the backup (`restore-backup`) has a cluster version with capabilities this version lacks; nothing is written: run the newer version |

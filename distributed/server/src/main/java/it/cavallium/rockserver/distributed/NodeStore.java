@@ -36,6 +36,8 @@ import java.nio.file.SimpleFileVisitor;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.BasicFileAttributes;
+import java.nio.file.attribute.PosixFilePermission;
+import java.nio.file.attribute.PosixFilePermissions;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
@@ -207,8 +209,29 @@ final class NodeStore implements Closeable {
 	}
 
 	/**
+	 * Returns {@code opened}, or, when the latest snapshot of {@code storage} is ahead of it, the database reopened after
+	 * the snapshot was restored into it ({@code opened} is closed): the replica's start ({@code openStore}) and
+	 * {@code export-seed} both go through here (R31-2). A received snapshot is ahead after a crash between Ratis renaming
+	 * it into place and its restore; {@link CheckpointStorage#init} verified it.
+	 */
+	static NodeStore restoreSnapshotIfAhead(NodeStore opened, CheckpointStorage storage, @Nullable Path rockserverConfig,
+			String name) throws IOException {
+		var snapshot = storage.getLatestSnapshot();
+		if (snapshot == null || snapshot.getIndex() <= opened.applied().getIndex()) {
+			return opened;
+		}
+		LOG.warn("{}: database at {} is behind the snapshot at {}, restoring the snapshot", name, opened.applied(),
+				snapshot.getTermIndex());
+		Path dbDir = opened.dbDir;
+		opened.close();
+		restore(storage.snapshotDbDir(), dbDir);
+		return open(dbDir, rockserverConfig, name);
+	}
+
+	/**
 	 * Writes the config the replica opens its database with to {@link #replicaConfigFile}: {@link #REPLICA_OVERRIDES} over
-	 * the given Rockserver config (HOCON), or over the defaults when there is none.
+	 * the given Rockserver config (HOCON), or over the defaults when there is none. The file is owner-only
+	 * ({@link #writeOwnerOnly}, R31-1).
 	 */
 	private static Path replicaConfig(@Nullable Path rockserverConfig, Path dbDir, String nodeId) throws IOException {
 		return replicaConfig(rockserverConfig, dbDir, null, nodeId);
@@ -218,10 +241,11 @@ final class NodeStore implements Closeable {
 	 * Like {@link #replicaConfig(Path, Path, String)}, for a copy in {@code dbDir} of the database in {@code sourceDbDir}
 	 * (when not null): an absolute {@code volume-path} under {@code sourceDbDir} becomes the same path relative to the
 	 * database directory, so that the copy opens its own volumes. The file is made next to {@code dbDir}, not in the
-	 * JDK's temporary directory (see {@code ReplicatedServerMain}). {@code nodeId} is the metrics node name when the
-	 * config sets none.
+	 * JDK's temporary directory (see {@code ReplicatedServerMain}), owner-only since it holds the resolved config with
+	 * its secrets ({@link #writeOwnerOnly}, R31-1). {@code nodeId} is the metrics node name when the config sets none.
+	 * Package-private for tests.
 	 */
-	private static Path replicaConfig(@Nullable Path rockserverConfig, Path dbDir, @Nullable Path sourceDbDir,
+	static Path replicaConfig(@Nullable Path rockserverConfig, Path dbDir, @Nullable Path sourceDbDir,
 			String nodeId) throws IOException {
 		var config = ConfigFactory.parseString(REPLICA_OVERRIDES);
 		try {
@@ -246,12 +270,35 @@ final class NodeStore implements Closeable {
 		Files.createDirectories(file.getParent());
 		try {
 			// Replaces the file that a process killed during an earlier open of this database left (R29-2).
-			Files.writeString(file, config.root().render(ConfigRenderOptions.concise()), StandardCharsets.UTF_8);
+			writeOwnerOnly(file, config.root().render(ConfigRenderOptions.concise()));
 		} catch (IOException | RuntimeException e) {
 			Files.deleteIfExists(file);
 			throw e;
 		}
 		return file;
+	}
+
+	private static final Set<PosixFilePermission> OWNER_READ_WRITE = PosixFilePermissions.fromString("rw-------");
+
+	/**
+	 * Writes {@code content} to {@code file} readable and writable by its owner only (rw-------) on a file system with
+	 * POSIX permissions, whatever the umask: the replica config is the resolved Rockserver config, with the InfluxDB
+	 * token and every {@code ${?ENV}} substitution in plain text (R31-1; R29-2's {@code Files.createTempFile} made it so
+	 * by chance, the fixed name had the umask's mode). An existing file (a killed open's) is deleted first, so that
+	 * neither its mode nor a link in its place is kept, and the file is created with the mode before any byte is
+	 * written. Elsewhere the file system's default applies.
+	 */
+	static void writeOwnerOnly(Path file, String content) throws IOException {
+		Files.deleteIfExists(file);
+		if (file.getFileSystem().supportedFileAttributeViews().contains("posix")) {
+			Files.createFile(file, PosixFilePermissions.asFileAttribute(OWNER_READ_WRITE));
+			// The umask can only remove bits from the mode given at creation: set it again, in case it removed the owner's.
+			Files.setPosixFilePermissions(file, OWNER_READ_WRITE);
+		} else {
+			Files.createFile(file);
+		}
+		Files.writeString(file, content, StandardCharsets.UTF_8, StandardOpenOption.WRITE,
+				StandardOpenOption.TRUNCATE_EXISTING);
 	}
 
 	/**
@@ -837,13 +884,40 @@ final class NodeStore implements Closeable {
 	 * flushed state plus what its RocksDB WAL replays), without the replication metadata ({@link #META_COLUMN}: the
 	 * cluster id, the applied position, results and sessions), whose cluster id would make every node of a new cluster
 	 * refuse it. The source is opened as a replica, which also finishes a restore that a crash interrupted; it must not
-	 * run. Table files are hard-linked when {@code target} is on the same file system.
+	 * run. Table files are hard-linked when {@code target} is on the same file system. This form ignores the Raft
+	 * snapshots: the command passes them, see {@link #exportSeed(Path, Path, Path, Path)} (R31-2).
 	 *
 	 * @return what the copy held: the applied position and cluster of the replica
 	 * @throws ReplicatedNode.NewerVersionException if the replica's cluster version has capabilities this version lacks:
 	 *                                              nothing is written
 	 */
 	static ExportedSeed exportSeed(Path dbDir, @Nullable Path rockserverConfig, Path target) throws IOException {
+		return exportSeed(dbDir, null, rockserverConfig, target);
+	}
+
+	/**
+	 * Like {@link #exportSeed(Path, Path, Path)}, for a replica whose Raft state machine directory
+	 * ({@code raft/<group>/sm}) is {@code stateMachineDir} (when not null and present): when its latest snapshot is ahead
+	 * of the database (a crash after a received snapshot was renamed into place, before it was restored into
+	 * {@code db/}), the snapshot is verified and restored into {@code dbDir} first, exactly as the replica's start would
+	 * ({@link CheckpointStorage#init(Path)}, then {@link #restoreSnapshotIfAhead}), and the copy holds it (R31-2). A
+	 * snapshot damaged by such a crash is not used, and nothing is exported (R32-1): the replica may have applied
+	 * entries up to it that its database lacks, see {@link #exportSeed(Path, Path, Path, Path, boolean)}.
+	 *
+	 * @throws DamagedSnapshotNotExportedException if the latest snapshot is damaged: nothing is written
+	 */
+	static ExportedSeed exportSeed(Path dbDir, @Nullable Path stateMachineDir, @Nullable Path rockserverConfig,
+			Path target) throws IOException {
+		return exportSeed(dbDir, stateMachineDir, rockserverConfig, target, false);
+	}
+
+	/**
+	 * Like {@link #exportSeed(Path, Path, Path, Path)}; with {@code withoutDamagedSnapshot}, a damaged latest snapshot
+	 * does not stop the export: the copy holds what {@code dbDir} holds, and {@link ExportedSeed#damagedSnapshot} and
+	 * {@link ExportedSeed#damagedSnapshotIndex} say which snapshot was left out (R32-1).
+	 */
+	static ExportedSeed exportSeed(Path dbDir, @Nullable Path stateMachineDir, @Nullable Path rockserverConfig,
+			Path target, boolean withoutDamagedSnapshot) throws IOException {
 		target = target.toAbsolutePath().normalize();
 		if (Files.exists(target)) {
 			throw new IOException("The target " + target + " already exists");
@@ -854,7 +928,7 @@ final class NodeStore implements Closeable {
 		// The copy's config first: when it is refused, nothing has been written yet.
 		Path config = replicaConfig(rockserverConfig, target, dbDir, "export-target");
 		try {
-			return exportSeedInto(dbDir, rockserverConfig, target, config);
+			return exportSeedInto(dbDir, stateMachineDir, rockserverConfig, target, config, withoutDamagedSnapshot);
 		} catch (IOException | RuntimeException | Error failure) {
 			// Nothing half-made stays (R29-1): the target did not exist before, and a checkpoint that failed removed its
 			// own temporary copy.
@@ -869,11 +943,48 @@ final class NodeStore implements Closeable {
 		}
 	}
 
-	private static ExportedSeed exportSeedInto(Path dbDir, @Nullable Path rockserverConfig, Path target, Path config)
+	private static ExportedSeed exportSeedInto(Path dbDir, @Nullable Path stateMachineDir,
+			@Nullable Path rockserverConfig, Path target, Path config, boolean withoutDamagedSnapshot)
 			throws IOException {
 		TermIndex applied;
 		String clusterId;
-		try (var store = open(dbDir, rockserverConfig, "export-source")) {
+		TermIndex restoredSnapshot = null;
+		String damagedSnapshot = null;
+		long damagedSnapshotIndex = -1;
+		var store = open(dbDir, rockserverConfig, "export-source");
+		try {
+			// After the open: it fails while the replica runs, before anything in its Raft directory is touched.
+			if (stateMachineDir != null && Files.isDirectory(stateMachineDir)) {
+				var storage = new CheckpointStorage();
+				try {
+					storage.init(stateMachineDir);
+					var snapshot = storage.getLatestSnapshot();
+					var before = store.applied();
+					store = restoreSnapshotIfAhead(store, storage, rockserverConfig, "export-source");
+					if (snapshot != null && snapshot.getIndex() > before.getIndex()) {
+						restoredSnapshot = snapshot.getTermIndex();
+					}
+				} catch (CheckpointStorage.DamagedSnapshotException damaged) {
+					// A start refuses this replica. The database may lack entries up to the snapshot's index that only
+					// the snapshot held: export it only when told to, never with an exit status that looks complete.
+					var databaseApplied = store.applied();
+					long index = damaged.snapshotIndex();
+					String at = index >= 0 ? "at index " + index : "of unknown index";
+					if (!withoutDamagedSnapshot) {
+						throw new DamagedSnapshotNotExportedException("The replica's latest snapshot "
+								+ damaged.dir() + " (" + at + ") is damaged (" + damaged.reason() + "), probably by a"
+								+ " crash while it was installed, and cannot be used; its database is at index "
+								+ databaseApplied.getIndex() + " and may lack entries up to the snapshot's index,"
+								+ " which no tool reads out of the damaged files. Export the other replicas and"
+								+ " compare their indexes; to export this database as it is, pass"
+								+ " --without-damaged-snapshot", index, databaseApplied, damaged);
+					}
+					LOG.warn("Exporting {} at index {} without the damaged snapshot {} in {}", dbDir,
+							databaseApplied.getIndex(), at, stateMachineDir, damaged);
+					damagedSnapshot = damaged.dir() + " (" + damaged.reason() + ")";
+					damagedSnapshotIndex = index;
+				}
+			}
 			// The copy leaves out the cluster version with the rest of the metadata: refuse a newer cluster's database
 			// here, or the new cluster would start at GENESIS with data that a newer version wrote (R18-1).
 			long version = store.clusterVersion();
@@ -883,6 +994,9 @@ final class NodeStore implements Closeable {
 			}
 			clusterId = store.clusterId();
 			applied = store.checkpoint(target);
+		} finally {
+			// A no-op when restoreSnapshotIfAhead failed after closing it.
+			store.close();
 		}
 		try (var copy = new EmbeddedConnection(target, "export-target", config)) {
 			var db = copy.getEmbeddedDB();
@@ -892,11 +1006,43 @@ final class NodeStore implements Closeable {
 			db.flush();
 		}
 		syncTree(target);
-		return new ExportedSeed(applied, clusterId);
+		return new ExportedSeed(applied, clusterId, restoredSnapshot, damagedSnapshot, damagedSnapshotIndex);
 	}
 
-	/** What {@link #exportSeed} copied: the applied position and the cluster (null if none) of the replica. */
-	record ExportedSeed(TermIndex applied, @Nullable String clusterId) {}
+	/**
+	 * What {@link #exportSeed} copied: the applied position and the cluster (null if none) of the replica; the position
+	 * of the snapshot restored into its database first (null if none was ahead); the damaged snapshot left out and why
+	 * (null if none was damaged) and its index (-1 if none, or if its name does not tell), see
+	 * {@link #exportSeed(Path, Path, Path, Path, boolean)}.
+	 */
+	record ExportedSeed(TermIndex applied, @Nullable String clusterId, @Nullable TermIndex restoredSnapshot,
+			@Nullable String damagedSnapshot, long damagedSnapshotIndex) {}
+
+	/**
+	 * {@code export-seed} found the replica's latest snapshot damaged and was not told to export without it: nothing
+	 * was written (R32-1). The message is meant for that command: it names the snapshot's index and the database's.
+	 */
+	static final class DamagedSnapshotNotExportedException extends IOException {
+		private final long snapshotIndex;
+		private final TermIndex databaseApplied;
+
+		DamagedSnapshotNotExportedException(String message, long snapshotIndex, TermIndex databaseApplied,
+				Throwable cause) {
+			super(message, cause);
+			this.snapshotIndex = snapshotIndex;
+			this.databaseApplied = databaseApplied;
+		}
+
+		/** The damaged snapshot's index, -1 if its name does not tell. */
+		long snapshotIndex() {
+			return snapshotIndex;
+		}
+
+		/** The position the replica's database was applied up to. */
+		TermIndex databaseApplied() {
+			return databaseApplied;
+		}
+	}
 
 	private @Nullable Buf readMeta(byte metaKey) {
 		return db().get(0, metaColumnId, key(metaKey), RequestType.<Buf>current());
