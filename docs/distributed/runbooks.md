@@ -262,8 +262,9 @@ over (clients open new ones by themselves).
 2. On every node of the new cluster, into an empty data directory, from a copy of the same backup:
    `rs restore-backup --backup /path/to/<name> --data-dir /srv/rockserver/data [--rockserver-config ...]`.
    It prints `OK`, the data directory and the log index the data reaches. It refuses a data directory with a `db/`, a
-   Raft log, or a restore directory of `db/` (`db.restore-tmp`, `db.restore-ready`, `db.restore-old`, which a snapshot
-   install of the old cluster interrupted by a crash leaves, see "export-seed" above) with exit code 1, before it looks
+   Raft log, or a restore directory of `db/` (`db.restore-tmp`, `db.restore-ready`, `db.restore-old`, which a crash
+   leaves in a restore into `db/`: a snapshot install of the old cluster, see "export-seed" above, or a `restore-backup`
+   of a version before the build aside, which restored straight into `db/`) with exit code 1, before it looks
    at the backup and touching nothing; the message names the directory. "Empty" means without any of these: with the
    copy of step 1 made, delete the named directories (or empty the whole data directory) and run the command again.
    Since the database is built aside, nothing would roll such a directory in before the restore, and the first start

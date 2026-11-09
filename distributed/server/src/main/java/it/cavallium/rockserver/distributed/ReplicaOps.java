@@ -633,8 +633,9 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 		}
 		if (!leftovers.isEmpty()) {
 			throw new IOException(dataDir + " holds " + leftovers.stream().map(Path::toString)
-					.collect(java.util.stream.Collectors.joining(", ")) + ", left by an interrupted restore of the old"
-					+ " cluster's database: the first start would swap it in over the restored database or delete it."
+					.collect(java.util.stream.Collectors.joining(", ")) + ", left by a crash in a restore into db/ (a"
+					+ " snapshot install of the old cluster, or a restore-backup of a version that restored straight into"
+					+ " db/): the first start would swap it in over the restored database or delete it."
 					+ " Copy it aside if it may be needed, then delete it (or empty the data directory) and run again;"
 					+ " restore into an empty data directory");
 		}
