@@ -738,14 +738,21 @@ public final class ReplicatedServerMain {
 	 *
 	 * <p>Ends with {@link #EXIT_INCOMPLETE} (R28-2) when no member took the request within the time limit, or when the
 	 * answer of a non-idempotent one leaves open whether it was proposed: nothing was compared or written for sure, and
-	 * the command can be run again. A refusal (an invalid argument, an operation this version does not know) exits
-	 * with 1.</p>
+	 * the command can be run again. Any other refusal (FAILED_PRECONDITION other than the one for the cluster version
+	 * below, such as a backup name in the way; INVALID_ARGUMENT; UNIMPLEMENTED, an operation that member's version does
+	 * not know) ends the command at once with 1, without asking the next member.</p>
 	 *
 	 * <p>A member refuses for the cluster version ({@link ReplicaOps#versionRefusal}) by its own applied view, which
-	 * lags behind the leader's on a member that is catching up (after a start, an add-peer, at the end of a rolling
-	 * upgrade, on a slow disk): that refusal proposed nothing, so the next member that answered is asked, also for an
-	 * operation that is not idempotent (R32-4). Only when every member that answered refuses for the version does the
-	 * command fail with 1, naming each of them and the version it gave.</p>
+	 * lags behind the leader's on a member that is catching up (an add-peer, a slow disk): that refusal proposed
+	 * nothing, so the next member that answered is asked, also for an operation that is not idempotent (R32-4). Only
+	 * when every member that answered refuses for the version does the command fail with 1, naming each of them and the
+	 * version it gave. That is also what happens while the leader has not raised the cluster version yet (it asks the
+	 * members every {@code VERSION_CHECK_EVERY}, 10 s, and at each new term): right after the last member of a rolling
+	 * upgrade restarts, every member refuses, the leader too, and the command is to be run again in about 10 s (R32
+	 * review 1). Who answered is decided by the capabilities question: a member that has not answered it is waited for
+	 * until it times out ({@link #PEER_ANSWER_TIMEOUT}, 3 s, or the time left), so if the one member that would take the
+	 * proposal answers later than that while all those that answered refuse for the version, the command fails with 1
+	 * rather than asking again within the time limit (R32 review 2).</p>
 	 */
 	private static long proposeOp(List<PeerConfig> peers, RaftGroupId groupId, byte op, byte[] payload,
 			boolean idempotent, long deadlineNanos) throws InterruptedException {
@@ -798,9 +805,11 @@ public final class ReplicatedServerMain {
 			}
 			if (answering > 0 && versionRefusals.size() == answering) {
 				fail("every member that answered refused for the cluster version it has applied: "
-						+ String.join("; ", versionRefusals) + ". If every member runs a version that supports it, some"
-						+ " lag behind the leader: run the command again once they caught up; otherwise upgrade every"
-						+ " member first");
+						+ String.join("; ", versionRefusals) + ". If every member runs a version that supports it, either"
+						+ " the leader has not raised the cluster version yet (it asks the members every 10 s; right after"
+						+ " the last member of an upgrade restarts, every member refuses, the leader too): run the command"
+						+ " again in about 10 s; or those that answered lag behind the leader: run it again once they"
+						+ " caught up. Otherwise upgrade every member first");
 			}
 			if (System.nanoTime() - deadlineNanos > 0) {
 				failIncomplete("no member took the request within the time limit (--timeout-ms); last answer " + last

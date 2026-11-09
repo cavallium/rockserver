@@ -972,7 +972,8 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 	/**
 	 * Whether {@code status} is a member's refusal of a proposal because the cluster version it has applied lacks the
 	 * operation (R32-4). That is the member's own view: a member that lags behind the leader has not applied the
-	 * latest cluster version yet. Nothing was proposed, so {@code admin} asks the next member.
+	 * latest cluster version yet, and right after the last member of an upgrade restarts the leader itself has not
+	 * raised it yet ({@link #VERSION_CHECK_EVERY}). Nothing was proposed, so {@code admin} asks the next member.
 	 */
 	static boolean versionRefusal(Status status) {
 		return status.getCode() == Status.Code.FAILED_PRECONDITION && status.getDescription() != null
@@ -988,8 +989,8 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 			// Before anything is proposed: see versionRefusal.
 			return failed(Status.FAILED_PRECONDITION, VERSION_REFUSAL + Capabilities.describe(capability)
 					+ " yet as far as " + config.nodeId() + " knows: it has applied cluster version "
-					+ Capabilities.describe(clusterVersion) + ", and a member that lags behind the leader has not applied"
-					+ " the latest one yet");
+					+ Capabilities.describe(clusterVersion) + " (the leader raises it within about 10 s of the last"
+					+ " member's upgrade, and a member that lags behind the leader applies it later)");
 		}
 		return proposer.propose(entry).thenApply(index -> ByteBuffer.allocate(Long.BYTES).putLong((Long) index).array());
 	}

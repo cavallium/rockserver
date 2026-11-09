@@ -2385,7 +2385,9 @@ What waits for it:
   without the id: genesis is applied again, and a version without an id answers as before genesis.
 - Checksums and backups (next section): refused until the version has them. Each member decides by the version it
   has applied, so a member that lags behind the leader refuses after the leader raised it; `admin` then asks the next
-  member that answered (R32-4, next section).
+  member that answered (R32-4, next section). Before the leader raised it (up to `VERSION_CHECK_EVERY`, 10 s, after
+  the last member of a rolling upgrade restarts), every member refuses, the leader too, and `admin` fails with 1 and
+  says to retry in about 10 s (R32 review 1).
 - `admin add-peer` refuses a node that lacks a capability of the cluster, or one that every member that answered
   supports: the leader may raise the version to it at any moment, also while the new node catches up and before the
   CLI's check could see it. The leader closes the same race from its side: it also asks every peer it sends the log to,
@@ -2469,15 +2471,25 @@ reported, and stops nothing.
   a frozen member listed first used it all, so the command ended "no member took the request" without asking the
   healthy ones. In answer order, the member asked is no longer the first of `--peer`, so the member asked can be one that has not
   applied the cluster version yet: right after a cluster's start, a member that `add-peer` is bringing in or that
-  catches up on a slow disk, or at the end of a rolling upgrade (up to `VERSION_CHECK_EVERY`, 10 s, plus its apply lag
-  after the last member restarts). It refuses by its own view, which is behind the committed version, and that
+  catches up on a slow disk. It refuses by its own view, which is behind the committed version, and that
   refusal proposed nothing (`ReplicaOps.versionRefusal`: FAILED_PRECONDITION whose description begins `Not every
   member supports `, in this version's words and the older ones'), so `proposeOp` prints it and asks the next member
   that answered, also for `checksum`, which is still proposed at most once (R32-4). Before, it ended with 1 on that
   first refusal and advised `Upgrade every member first`, although the leader would have taken it; which member
   answered first varied, so the same command passed or failed from run to run. Only when every member that answered
   refuses for the version does it fail with 1, naming each with the version it gave; any other refusal (another
-  FAILED_PRECONDITION, INVALID_ARGUMENT, UNIMPLEMENTED) still ends it at once. A member
+  FAILED_PRECONDITION, INVALID_ARGUMENT, UNIMPLEMENTED) still ends it at once. The end of a rolling upgrade is not a
+  case of lag and is not passed over (R32 review 1): until the leader's next version check (`VERSION_CHECK_EVERY`,
+  10 s) after the last member restarts, no member has the new version committed, the leader included, so every
+  member refuses and the command fails with 1; the message names that case apart ("the leader has not raised the
+  cluster version yet ... run the command again in about 10 s") from members that lag ("once they caught up").
+  "Every member that answered" is decided by the capabilities question, which waits for each member until
+  `PEER_ANSWER_TIMEOUT` (3 s, or the time left) runs out (R32 review 2): so the all-refused failure comes no sooner
+  than the slowest member's answer or 3 s, and a member that would take the proposal but answers the question after
+  3 s is left out: if all those that answered refuse for the version, the command fails with 1 rather than asking
+  again within `--timeout-ms`. Asking again would turn the plain "not every member supports it" into a wait until
+  the time limit and exit 4 whenever a member is down, so it stays a failure with 1, which the runbook tells to run
+  again. A member
   that took a `checksum` is waited for as long as the time limit allows (R28 review 2): it bounds the proposal itself
   with its own `--request-timeout-ms`, which `admin` does not know, so the former fixed 30 s ("longer than a node's
   request timeout with an election") held only for the 10 s default, and an answer cut short there exits 4 while the
@@ -3372,8 +3384,9 @@ install it (`apt-get install gcc libc6-dev`) and run with `-Drockserver.test.req
      commands.
    - R32-4: a member that lags behind the leader refused `checksum` and `backup` by the cluster version it had
      applied, and `admin` ended with 1 on that first refusal (see "Checksums and backups"). Now the refusal says the
-     member may lag (`... as far as <id> knows: it has applied cluster version X, and a member that lags behind the
-     leader has not applied the latest one yet`), `proposeOp` asks the next member that answered, and fails with 1
+     member may lag (`... as far as <id> knows: it has applied cluster version X (the leader raises it within about
+     10 s of the last member's upgrade, and a member that lags behind the leader applies it later)`; r32 said only
+     the lag), `proposeOp` asks the next member that answered, and fails with 1
      only when every member that answered refuses for the version. `CommandLineTest.aLaggingMemberThatAnswersFirstDoesNotStopTheCommand`
      (a follower's applied version stubbed without `CHECKSUM | BACKUP`, the others behind 400 ms links, so it answers
      first: both commands exit 0, every member `DONE`) and `everyMemberRefusingForItsVersionFailsNamingThem` (two fake
@@ -3381,6 +3394,16 @@ install it (`apt-get install gcc libc6-dev`) and run with `-Drockserver.test.req
      not the silent one) were red at `d90c2c6` (exit 1 `n1 refused`; the second member never asked);
      `anotherRefusalStillEndsTheCommandAtOnce` (another FAILED_PRECONDITION: exit 1, the next member not asked) guards
      the rest and was green there too.
+   - R32 review 1-3: r32's runbook, this section and the all-refused message listed the end of a rolling upgrade
+     among the cases of a member that lags, as if `admin` went on with the next member; but until the leader's next
+     version check every member refuses, the leader too, and nobody lags. The message now says `either the leader has
+     not raised the cluster version yet (...): run the command again in about 10 s; or those that answered lag behind
+     the leader: run it again once they caught up`, and the docs keep the two apart. The javadoc of
+     `everyMemberRefusingForItsVersionFailsNamingThem` said the silent member is not waited for; it is, until the 3 s
+     capabilities question times out (the test takes about 3.3 s), and the runbook now says what that means for a
+     member slower than that. `proposeOp`'s javadoc lists every refusal that ends at once with 1 (any
+     FAILED_PRECONDITION but the version's, INVALID_ARGUMENT, UNIMPLEMENTED). The test was red at `573820e`
+     (`some lag behind the leader`).
    - R32-5 (review of R31-2): R31-2 said `export-seed`'s open of `db/` fails while the node runs, before the Raft
      directory is touched. But `NodeStore.open` runs `RestoreDirs.recover()` (deleting `<db>.restore-tmp`, swapping in
      `<db>.restore-ready`) and `deleteLeftConfigs` before RocksDB takes its LOCK, and a running node holds no LOCK on
