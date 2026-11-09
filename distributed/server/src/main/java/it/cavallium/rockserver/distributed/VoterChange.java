@@ -68,4 +68,9 @@ record VoterChange(SortedSet<String> added, SortedSet<String> removed) {
 				+ "=... with --peer listing every member, then remove-peer " + oldNode + ". A change of several voters"
 				+ " is done one voter per command. See \"Replacing a node\" in docs/distributed/runbooks.md";
 	}
+
+	/** R51-1, stub of the red test: no address change is seen yet. */
+	static java.util.List<String> addressChanges(Collection<RaftPeer> currentServers, Collection<RaftPeer> newServers) {
+		return java.util.List.of();
+	}
 }
