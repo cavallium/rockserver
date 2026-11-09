@@ -119,6 +119,23 @@ class ReplicaOpsTest {
 		assertFalse(ReplicatedServerMain.notProposed(Status.Code.DEADLINE_EXCEEDED));
 	}
 
+	/**
+	 * R40-1: a node that is starting (no proposer yet) refuses a proposal with UNAVAILABLE and a description that marks
+	 * it as its own proof that nothing was proposed, so that {@code admin} tells it apart from a transport UNAVAILABLE.
+	 */
+	@Test
+	void aStartingNodeMarksItsRefusalAsNotProposed() throws Exception {
+		var config = NodeConfig.defaults("n0", List.of(new PeerConfig("n0", "127.0.0.1", 1, "127.0.0.1", 2)), temp);
+		try (var ops = new ReplicaOps(config, null, new NodeMetrics("n0"))) {
+			ops.clusterVersion(Capabilities.SUPPORTED);
+			var error = assertThrows(CompletionException.class,
+					() -> ops.answer(ReplicaOps.request(ReplicaOps.OP_PROPOSE_CHECKSUM, new byte[0])).join());
+			var status = Status.fromThrowable(error.getCause());
+			assertEquals(Status.Code.UNAVAILABLE, status.getCode(), status.toString());
+			assertTrue(status.getDescription().startsWith("Not proposed: "), status.toString());
+		}
+	}
+
 	/** add-peer refuses a node lacking a bit that the cluster uses, or that every member supports (about to be used). */
 	@Test
 	void addedNodeNeedsCurrentAndPendingCapabilities() {

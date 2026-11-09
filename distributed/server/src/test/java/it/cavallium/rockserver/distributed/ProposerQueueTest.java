@@ -328,6 +328,8 @@ class ProposerQueueTest {
 			assertEquals(Status.Code.UNAVAILABLE, refused.getStatus().getCode(), refused.toString());
 			assertTrue(ReplicatedServerMain.notProposed(refused.getStatus().getCode()));
 			assertTrue(refused.getStatus().getDescription().contains("not applied"), refused.toString());
+			// R40-1: marked as the member's own proof that nothing was proposed, unlike a transport UNAVAILABLE.
+			assertTrue(refused.getStatus().getDescription().startsWith("Not proposed: "), refused.toString());
 			proposer.close();
 			var stopping = assertThrows(ExecutionException.class, () -> ops.answer(request).get(10, TimeUnit.SECONDS));
 			var cause = assertInstanceOf(RocksDBException.class, ReplicatedConnection.unwrap(stopping), stopping.toString());
