@@ -142,8 +142,9 @@ final class Proposer implements Closeable {
 	 * Bytes of attempts one node has in flight at once. Ratis' pending-request byte limit on the leader
 	 * ({@link RaftSettings}) is a multiple of this, so that the leader's own attempts never reach it, nor those of
 	 * all the nodes of a cluster of up to {@link RaftSettings#NODES_UNDER_PENDING_LIMIT} nodes. At least one entry of
-	 * the largest size must fit, and one that is refused gets in ahead of later attempts that would leave it no room
-	 * (R50-1, see {@link ByteAdmission}).
+	 * the largest size must fit, and the first one refused while no other attempt holds the lane's reservation gets
+	 * in ahead of later attempts that would leave it no room (R50-1, see {@link ByteAdmission}: one reservation, not
+	 * a queue).
 	 */
 	static final long ATTEMPT_BYTES_IN_FLIGHT = 2L * RaftSettings.MAX_ENTRY_BYTES;
 
@@ -805,8 +806,11 @@ final class Proposer implements Closeable {
 		 * node's own decision, and sent again after {@link #NOT_READY_RETRY_MS}, data writes as the same batch,
 		 * commits back through the queue. A local attempt keeps its permit until Ratis answers it, not only until
 		 * this node stops waiting: the entry stays pending in Ratis until then. A refused attempt asks again under
-		 * the name of its batch (data writes: the batch; commits: its first commit), so the oldest one reserves its
-		 * bytes until it gets in (R50-1): in a saturated lane the bytes a finished batch frees would otherwise go to
+		 * the name of its batch (data writes: the batch; commits: the commit holding the reservation if the batch has
+		 * it, else its first), and the first one refused while no reservation is held reserves its bytes until it gets
+		 * in (R50-1). One reservation, not a queue: a waiter refused while another holds it can be overtaken, once the
+		 * holder got in, by a later attempt refused before the waiter asks again, so the order among several large
+		 * waiters is not first come first served; one large waiter gets in. In a saturated lane the bytes a finished batch frees would otherwise go to
 		 * the batch dispatched right after it, and an attempt larger than one release, up to
 		 * {@link RaftSettings#MAX_ENTRY_BYTES} against batches of up to {@link #MAX_BATCH_BYTES}, could be refused
 		 * until its deadline. A batch that stops sending gives its reservation up; one of commits that leaves the queue
@@ -1303,9 +1307,12 @@ final class Proposer implements Closeable {
 		 */
 		private void sendCommits(List<Pending> batch, Message message, @Nullable List<Request> local, long callId,
 				long deadlineNanos, long sentNanos) {
-			// The first commit names the attempts of these commits: one refused for want of a permit comes back first in the
-			// queue (retryLater), heads the next batch and asks again under the same name (R50-1).
-			var waiter = batch.getFirst();
+			// One commit names the attempts of these commits (R50-1): the one holding the reservation if it is among them,
+			// else the first. A batch refused for want of a permit comes back at the head of the queue (retryLater), but
+			// one requeued later goes in front of it, and take() can merge both under the later one's first commit:
+			// asked under that, the reserved bytes of the holder, part of this batch, would be kept free beside it until
+			// the reservation lapsed (review of R50, 2).
+			var waiter = permits.waiterAmong(batch);
 			submitLocal(message, local, callId, deadlineNanos, permits, waiter).handleAsync((answer, error) -> {
 				roundTrip.since(sentNanos);
 				boolean again = false;

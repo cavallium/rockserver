@@ -10,9 +10,13 @@ import java.util.function.LongSupplier;
  * A byte-weighted semaphore that never waits: {@link #tryAcquire} either takes the bytes or refuses at once. Used by
  * {@link Proposer} to bound the bytes of writes a node holds, and the bytes of the attempts it has in flight.
  *
- * <p>A caller that asks again after a refusal names itself ({@link #tryAcquire(long, Object)}), and the oldest such
- * waiter reserves its bytes (R50-1): until it gets in, a request by anyone else is taken only if it leaves room for
- * the reservation. Otherwise, under saturation, bytes freed one release at a time go to whoever asks first, which in
+ * <p>A caller that asks again after a refusal names itself ({@link #tryAcquire(long, Object)}), and the first one
+ * refused while no reservation is held reserves its bytes (R50-1): until it gets in, a request by anyone else is
+ * taken only if it leaves room for the reservation. This is one reservation, not a queue: a waiter refused while
+ * another holds it reserves nothing, and once the holder gets in, the next one refused takes it, which can be a batch
+ * dispatched after that waiter was refused, before the waiter asks again. So the order is not first come first
+ * served among several waiters, and a waiter can be overtaken by later ones, each time by at most one reservation
+ * holder at a time; a single waiter larger than one release, the case it is for, gets in. Otherwise, under saturation, bytes freed one release at a time go to whoever asks first, which in
  * {@link Proposer} is the batch dispatched by the one that just finished, and an attempt larger than one release
  * could be refused until its deadline. A reservation lapses {@link #RESERVATION_NANOS} after its waiter last asked,
  * so a waiter that gave up without {@link #cancel} holds nothing for long. With no reservation, the only cost over a
@@ -26,7 +30,7 @@ final class ByteAdmission {
 	private final long limit;
 	private final AtomicLong used = new AtomicLong();
 	private final LongSupplier clock;
-	/** The oldest refused waiter that asks again, or null. */
+	/** The first waiter refused while none was held, until it gets in, cancels or lapses; or null. */
 	private final AtomicReference<Reservation> reservation = new AtomicReference<>();
 
 	/** {@code bytes} kept for {@code waiter} until it gets in, or until {@code lapsesNanos} on {@link #clock}. */
@@ -51,8 +55,8 @@ final class ByteAdmission {
 	}
 
 	/**
-	 * Takes {@code bytes} as {@link #tryAcquire(long)} does, but leaving room for the oldest refused waiter that still
-	 * asks, unless that is {@code waiter} itself. A refused {@code waiter} that is not null reserves its bytes if no
+	 * Takes {@code bytes} as {@link #tryAcquire(long)} does, but leaving room for the reservation, unless
+	 * {@code waiter} itself holds it. A refused {@code waiter} that is not null reserves its bytes if no
 	 * one does, or renews its own reservation; it gives it up by getting in or by {@link #cancel}. A null
 	 * {@code waiter} never reserves.
 	 */
@@ -91,9 +95,20 @@ final class ByteAdmission {
 	}
 
 	/**
-	 * The member of {@code batch} to ask under: the one that holds the reservation, if any does, else the first.
+	 * The member of {@code batch} to ask under: the one that holds the reservation, if any does, else the first. For
+	 * a batch whose members came back merged from batches refused apart (review of R50, 2): asked under any other
+	 * member, the holder's own bytes, part of the batch, would be kept free beside it as well, and the batch refused
+	 * until the reservation lapses. Scans the batch only while a reservation is held.
 	 */
 	Object waiterAmong(List<?> batch) {
+		var reserved = reservation.get();
+		if (reserved != null) {
+			for (var member : batch) {
+				if (member == reserved.waiter) {
+					return member;
+				}
+			}
+		}
 		return batch.getFirst();
 	}
 

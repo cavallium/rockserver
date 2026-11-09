@@ -113,7 +113,7 @@ class ByteAdmissionTest {
 		assertEquals(32, admission.used());
 	}
 
-	/** R50-1: only the oldest refused attempt reserves; the next one reserves once it got in. */
+	/** R50-1: only the first attempt refused while none is held reserves; the next one reserves once it got in. */
 	@Test
 	void onlyTheOldestRefusedAttemptReserves() {
 		var admission = new ByteAdmission(32);

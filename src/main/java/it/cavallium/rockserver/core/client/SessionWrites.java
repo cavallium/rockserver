@@ -300,7 +300,11 @@ final class SessionWrites {
 	/**
 	 * The connection starts to close (R50-3): from now on no copy is sent, neither of a new write, which fails flagged
 	 * not applied, nor a resend, which ends its write as {@link Call#failClosed}; a copy already in flight keeps its
-	 * answer, so that the channel's graceful shutdown can still drain it. Without it, a write started while the
+	 * answer, so that the channel's graceful shutdown can still drain it. "From now on" is from each send's own check
+	 * of the flag, which comes before the copy is handed to the channel and is not atomic with it: a copy whose check
+	 * passed just before this call can still reach the channel after its shutdown began, be refused there locally and
+	 * end {@code OUTCOME_UNKNOWN}, as before R50-3. That is conservative, never wrong: such a copy has its
+	 * {@code sent} flag set, so its write is never flagged not applied (review of R50, 3). Without it, a write started while the
 	 * channel shut down was sent to a channel that refused it locally ({@code UNAVAILABLE}), a lost call here, and
 	 * ended {@code OUTCOME_UNKNOWN} although nothing left the client.
 	 */
