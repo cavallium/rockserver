@@ -1491,8 +1491,15 @@ final class NodeStore implements Closeable {
 		}
 	}
 
+	/** Tests only: called with the absolute, normalized path of every file and directory {@link #syncFile} fsyncs. */
+	static volatile java.util.function.@Nullable Consumer<Path> syncedForTesting;
+
 	/** Fsyncs a file, or a directory's entries (Linux allows opening a directory for reading). */
 	static void syncFile(Path file) throws IOException {
+		var hook = syncedForTesting;
+		if (hook != null) {
+			hook.accept(file.toAbsolutePath().normalize());
+		}
 		try (var channel = FileChannel.open(file, StandardOpenOption.READ)) {
 			channel.force(true);
 		}
