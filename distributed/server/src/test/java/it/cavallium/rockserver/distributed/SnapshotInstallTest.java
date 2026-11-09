@@ -114,6 +114,9 @@ class SnapshotInstallTest {
 		RockserverStateMachine.installGateForTesting.countDown();
 		RockserverStateMachine.installGateForTesting = null;
 		cluster.awaitConverged(TIMEOUT);
+		// The applied index already reached the snapshot while the install was held, so awaitConverged can return
+		// before the install thread wakes from the gate and publishes the new database with the second bump (R42-1).
+		InProcessCluster.await(TIMEOUT, () -> (lagging.stateMachine().storeGeneration() & 1) == 0);
 		assertEquals(0, lagging.stateMachine().storeGeneration() & 1);
 		assertTrue(lagging.stateMachine().storeGeneration() >= 2, "it installed a snapshot");
 		// RaftTraffic recorded the configuration of the chunks with the leader's term (round-13 review, finding 1).
