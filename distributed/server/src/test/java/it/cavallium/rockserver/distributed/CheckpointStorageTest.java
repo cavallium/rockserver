@@ -359,15 +359,15 @@ class CheckpointStorageTest {
 	}
 
 	/**
-	 * R51-2: the same with {@code CURRENT} gone from the aside's checkpoint, and no file list (a snapshot taken by an
-	 * older version): not promoted either.
+	 * R51-2: the same with {@code CURRENT} gone from the aside's checkpoint, and no file list in its
+	 * {@code snapshot.properties} (a snapshot taken by an older version): not promoted either.
 	 */
 	@Test
 	void anAsideWithoutCurrentIsNotPromoted() throws IOException {
 		Path stateMachineDir = damagedInstallWithTheOldSnapshotsAside();
 		Path aside = stateMachineDir.resolve("snapshots.tmp_installing");
 		Path snapshot = aside.resolve("snapshot-1-5");
-		Files.deleteIfExists(snapshot.resolve("snapshot.files"));
+		Files.writeString(snapshot.resolve("snapshot.properties"), "term=1\nindex=5\n");
 		Files.delete(snapshot.resolve("db").resolve("CURRENT"));
 		closeRaftStorages();
 
@@ -382,8 +382,8 @@ class CheckpointStorageTest {
 	@Test
 	void aWholeAsideWithoutAFileListIsPromoted() throws IOException {
 		Path stateMachineDir = damagedInstallWithTheOldSnapshotsAside();
-		Files.deleteIfExists(stateMachineDir.resolve("snapshots.tmp_installing").resolve("snapshot-1-5")
-				.resolve("snapshot.files"));
+		Files.writeString(stateMachineDir.resolve("snapshots.tmp_installing").resolve("snapshot-1-5")
+				.resolve("snapshot.properties"), "term=1\nindex=5\n");
 		closeRaftStorages();
 
 		var restarted = initStorage(tempDir.resolve("follower"), RaftStorage.StartupOption.RECOVER);

@@ -86,6 +86,8 @@ final class CheckpointStorage implements StateMachineStorage {
 	private static final String INSTALL_PREFIX = "snapshot-";
 	private static final String DB_DIR = "db";
 	private static final String PROPERTIES_FILE = "snapshot.properties";
+	/** Prefix of the keys of {@link #PROPERTIES_FILE} that list the checkpoint's files with their sizes (R51-2). */
+	private static final String FILE_KEY_PREFIX = "file.";
 	/** Written into an installed snapshot once its files matched their digests and were fsynced. */
 	private static final String VERIFIED_FILE = "installed.verified";
 	private static final long NEVER = Long.MIN_VALUE;
@@ -149,7 +151,9 @@ final class CheckpointStorage implements StateMachineStorage {
 			if (asides.isEmpty()) {
 				throw damaged;
 			}
-			// Ratis was still swapping the directories, so it had not reset the log yet: the install did not happen.
+			// Ratis was still swapping the directories, so it had not reset the log yet: the install did not happen. The
+			// old snapshots moved aside may be whole (a crash before the received directory took their place) or partly
+			// deleted (a crash during Ratis' deleteFully of them): usableSnapshot promotes only whole checkpoints (R51-2).
 			LOG.warn("Discarding a snapshot installation interrupted by a crash", damaged);
 			NodeStore.deleteRecursively(snapshotsDir);
 			Files.createDirectories(snapshotsDir);
@@ -182,7 +186,21 @@ final class CheckpointStorage implements StateMachineStorage {
 		}
 	}
 
+	/**
+	 * Whether {@code aside}, old snapshots that Ratis moved aside, holds a snapshot to use. Ratis 3.3.1 deletes the
+	 * aside file by file ({@code FileUtils.deleteFully}), so a crash during that delete leaves snapshots with their
+	 * {@code snapshot.properties} and part of their {@code db/}: each snapshot whose checkpoint is not complete
+	 * ({@link #completeCheckpoint}) is deleted first (R51-2), so that the node never uses, nor streams to a follower, a
+	 * checkpoint that cannot open.
+	 */
 	private static boolean usableSnapshot(Path aside) throws IOException {
+		for (Path dir : snapshotDirs(aside)) {
+			var missing = completeCheckpoint(dir);
+			if (missing != null) {
+				LOG.warn("Ignoring the snapshot {} moved aside: its checkpoint is not complete ({})", dir, missing);
+				NodeStore.deleteRecursively(dir);
+			}
+		}
 		try {
 			return findLatest(aside) != null;
 		} catch (DamagedSnapshotException damaged) {
@@ -223,7 +241,7 @@ final class CheckpointStorage implements StateMachineStorage {
 		TermIndex termIndex;
 		try {
 			termIndex = store.checkpoint(building.resolve(DB_DIR));
-			writeProperties(building.resolve(PROPERTIES_FILE), termIndex);
+			writeProperties(building.resolve(PROPERTIES_FILE), termIndex, checkpointFiles(building));
 			NodeStore.syncDirectory(building);
 			CrashPoints.reach(CrashPoints.Point.SNAPSHOT_BUILT);
 		} catch (IOException | RuntimeException failure) {
@@ -510,10 +528,88 @@ final class CheckpointStorage implements StateMachineStorage {
 		return snapshotFiles(dir).stream().map(path -> new FileInfo(path, null)).toList();
 	}
 
-	private static void writeProperties(Path file, TermIndex termIndex) throws IOException {
-		String content = "term=" + termIndex.getTerm() + "\nindex=" + termIndex.getIndex() + "\n";
+	/**
+	 * Writes the snapshot's position and, from R51-2, the size of every file of its checkpoint, as
+	 * {@code file.<path relative to the snapshot directory>=<bytes>}: {@link #completeCheckpoint} reads them. The file is
+	 * listed and sent to a follower with the checkpoint, whose files it describes there as well; a version before
+	 * R51-2 ignores the extra keys.
+	 */
+	private static void writeProperties(Path file, TermIndex termIndex, Map<String, Long> files) throws IOException {
+		var content = new StringBuilder("term=" + termIndex.getTerm() + "\nindex=" + termIndex.getIndex() + "\n");
+		var listed = new Properties();
+		files.forEach((name, bytes) -> listed.setProperty(FILE_KEY_PREFIX + name, Long.toString(bytes)));
+		var escaped = new java.io.StringWriter();
+		listed.store(escaped, null);
+		escaped.toString().lines().filter(line -> !line.startsWith("#")).sorted()
+				.forEach(line -> content.append(line).append('\n'));
 		Files.writeString(file, content, StandardCharsets.UTF_8);
 		NodeStore.syncFile(file);
+	}
+
+	/** The files of the checkpoint in {@code dir}, by path relative to {@code dir} (with {@code /}), with their sizes. */
+	private static Map<String, Long> checkpointFiles(Path dir) throws IOException {
+		var files = new java.util.TreeMap<String, Long>();
+		try (Stream<Path> walk = Files.walk(dir.resolve(DB_DIR))) {
+			for (Path path : (Iterable<Path>) walk.filter(Files::isRegularFile)
+					.filter(path -> !path.getFileName().toString().endsWith(MD5FileUtil.MD5_SUFFIX))::iterator) {
+				var relative = new StringBuilder();
+				dir.relativize(path).forEach(part -> relative.append(relative.isEmpty() ? "" : "/").append(part));
+				files.put(relative.toString(), Files.size(path));
+			}
+		}
+		return files;
+	}
+
+	/**
+	 * Null if the checkpoint of snapshot {@code dir} is complete, else what is missing (R51-2). With the file list of
+	 * {@link #writeProperties}, every listed file must be there at its size. A snapshot of a version before R51-2 has
+	 * none: its {@code CURRENT} must name a MANIFEST that is there, which catches most but not every partial delete
+	 * (a table file can go first).
+	 */
+	static @Nullable String completeCheckpoint(Path dir) throws IOException {
+		Path file = dir.resolve(PROPERTIES_FILE);
+		if (!Files.isRegularFile(file)) {
+			return "no " + PROPERTIES_FILE;
+		}
+		var properties = new Properties();
+		try {
+			properties.load(new StringReader(Files.readString(file, StandardCharsets.UTF_8)));
+		} catch (IllegalArgumentException damaged) {
+			return PROPERTIES_FILE + " cannot be read";
+		}
+		boolean listed = false;
+		for (String key : properties.stringPropertyNames()) {
+			if (!key.startsWith(FILE_KEY_PREFIX)) {
+				continue;
+			}
+			listed = true;
+			Path listedFile = dir.resolve(key.substring(FILE_KEY_PREFIX.length()));
+			long bytes;
+			try {
+				bytes = Long.parseLong(properties.getProperty(key));
+			} catch (NumberFormatException damaged) {
+				return "the size of " + listedFile + " cannot be read";
+			}
+			if (!listedFile.normalize().startsWith(dir.resolve(DB_DIR)) || !Files.isRegularFile(listedFile)) {
+				return listedFile + " is missing";
+			}
+			if (Files.size(listedFile) != bytes) {
+				return listedFile + " has " + Files.size(listedFile) + " bytes, not " + bytes;
+			}
+		}
+		if (listed) {
+			return null;
+		}
+		Path current = dir.resolve(DB_DIR).resolve("CURRENT");
+		if (!Files.isRegularFile(current)) {
+			return current + " is missing";
+		}
+		String manifest = Files.readString(current, StandardCharsets.UTF_8).strip();
+		if (!manifest.startsWith("MANIFEST-") || manifest.contains("/")
+				|| !Files.isRegularFile(dir.resolve(DB_DIR).resolve(manifest))) {
+			return "the MANIFEST that " + current + " names (" + manifest + ") is missing";
+		}
+		return null;
 	}
 
 	/** The snapshot position stored in {@code dir}, or null if {@code dir} holds no complete snapshot. */
