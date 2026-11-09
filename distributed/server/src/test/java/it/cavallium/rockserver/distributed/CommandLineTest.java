@@ -1008,6 +1008,42 @@ class CommandLineTest {
 	}
 
 	/**
+	 * R38-RESTORE-STALE-RESTORE-READY: {@code restore-backup} into a data directory that has no {@code db/} but the
+	 * {@code db.restore-ready} and {@code db.restore-old} of an interrupted snapshot install (R33-1) exits with 1, names
+	 * the leftover and touches nothing; once the operator deletes the leftovers, the same command restores. Before, it
+	 * printed OK, and the first start swapped the old database over the restored one.
+	 */
+	@Test
+	void restoreBackupRefusesTheLeftoversOfAnInterruptedSwapWithOne() throws IOException {
+		Path source = temp.resolve("source");
+		NodeStoreTest.writeDatabaseOfVersion(source.resolve("db"), Capabilities.SUPPORTED);
+		Path backup = temp.resolve("backup");
+		try (var store = NodeStore.open(source.resolve("db"), null, "source")) {
+			store.checkpoint(backup.resolve(ReplicaOps.BACKUP_DB_DIR));
+		}
+		Files.writeString(backup.resolve(ReplicaOps.BACKUP_PROPERTIES), "name=b\nindex=7\ncluster=c\n");
+		Path dataDir = temp.resolve("node").toAbsolutePath().normalize();
+		NodeStoreTest.writeRestoreInterruptedDuringTheSwap(dataDir, true);
+
+		var refused = run("restore-backup", "--backup", backup.toString(), "--data-dir", dataDir.toString());
+
+		assertEquals(1, refused.code(), refused.toString());
+		assertInstanceOf(IOException.class, refused.thrown());
+		assertTrue(refused.thrown().getMessage().contains(dataDir.resolve("db.restore-ready").toString()),
+				refused.thrown().getMessage());
+		assertTrue(Files.notExists(dataDir.resolve("db")));
+		assertTrue(Files.notExists(dataDir.resolve(ReplicaOps.RESTORE_STAGING_DIR)));
+		assertTrue(Files.isRegularFile(dataDir.resolve("db.restore-ready").resolve("CURRENT")));
+		assertTrue(Files.isRegularFile(dataDir.resolve("db.restore-old").resolve("CURRENT")));
+
+		NodeStore.deleteRecursively(dataDir.resolve("db.restore-ready"));
+		NodeStore.deleteRecursively(dataDir.resolve("db.restore-old"));
+		var restore = run("restore-backup", "--backup", backup.toString(), "--data-dir", dataDir.toString());
+		assertEquals(0, restore.code(), restore.toString());
+		assertTrue(restore.out().startsWith("OK: "), restore.out());
+	}
+
+	/**
 	 * R35-1: {@code restore-backup --data-dir /x/link/..}, with {@code link} pointing to {@code /real/a/b}, restores into
 	 * {@code /x/db}, the directory a {@code run} with the same {@code --data-dir} opens, and says so. Every command
 	 * normalizes {@code --data-dir} once, as export-seed does. Before, the backup went to {@code /real/a/db}, an empty
