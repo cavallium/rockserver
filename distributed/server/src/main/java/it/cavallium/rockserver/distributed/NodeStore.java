@@ -47,6 +47,7 @@ import java.util.HashMap;
 import java.util.HexFormat;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.function.UnaryOperator;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -203,11 +204,14 @@ final class NodeStore implements Closeable {
 
 	/**
 	 * Like {@link #open(Path, Path, String)}, for the start-up check of a first start ({@code requireNoClusterData}):
-	 * without automatic compactions ({@link #withoutAutoCompactions}), so that the open deletes none of the table files
-	 * that {@link #noteSeedOpening} listed before it (R43-2). Its WAL replay and its close still flush, which only adds
-	 * table files. With compactions the open could fold every listed file into new ones (an L0-only seed reaches the
-	 * L0 trigger at once), and a kill after that left nothing to compare: the next first start recorded a digest no
-	 * other copy has and stopped at genesis.
+	 * without automatic compactions in any column ({@link #withoutAutoCompactions}), so that the open deletes none of
+	 * the table files that {@link #noteSeedOpening} listed before it (R43-2), also none of Rockserver's internal
+	 * columns ({@code _column_schemas_}, {@code _merge_operators_}, the legacy {@code _cdc_meta_}), which follow the
+	 * global setting (R44-1). Its WAL replay and its close still flush, which only adds table files (the check's own
+	 * {@code createColumn} of {@link #META_COLUMN} can add one to {@code _column_schemas_}, which nothing compacts).
+	 * With compactions the open could fold every listed file into new ones (an L0-only seed reaches the L0 trigger at
+	 * once), and a kill after that left nothing to compare: the next first start recorded a digest no other copy has
+	 * and stopped at genesis.
 	 */
 	static NodeStore openForStartupCheck(Path dbDir, @Nullable Path rockserverConfig, String name) throws IOException {
 		return open(dbDir, rockserverConfig, null, name, true);
@@ -218,7 +222,8 @@ final class NodeStore implements Closeable {
 		dbDir = dbDir.toAbsolutePath().normalize();
 		RestoreDirs.of(dbDir).recover();
 		deleteLeftConfigs(dbDir.getParent());
-		Path config = replicaConfig(rockserverConfig, dbDir, configuredDbDir, name, noAutoCompactions);
+		Path config = replicaConfig(rockserverConfig, dbDir, configuredDbDir, name,
+				noAutoCompactions ? NodeStore::withoutAutoCompactions : UnaryOperator.identity());
 		EmbeddedConnection connection;
 		try {
 			connection = new EmbeddedConnection(dbDir, name, config);
@@ -274,12 +279,15 @@ final class NodeStore implements Closeable {
 	 */
 	static Path replicaConfig(@Nullable Path rockserverConfig, Path dbDir, @Nullable Path sourceDbDir,
 			String nodeId) throws IOException {
-		return replicaConfig(rockserverConfig, dbDir, sourceDbDir, nodeId, false);
+		return replicaConfig(rockserverConfig, dbDir, sourceDbDir, nodeId, UnaryOperator.identity());
 	}
 
-	/** Like {@link #replicaConfig(Path, Path, Path, String)}, {@link #withoutAutoCompactions} if asked. */
+	/**
+	 * Like {@link #replicaConfig(Path, Path, Path, String)}, with {@code adjust} applied last (for example
+	 * {@link #withoutAutoCompactions} or {@link #withSmallFootprint}).
+	 */
 	private static Path replicaConfig(@Nullable Path rockserverConfig, Path dbDir, @Nullable Path sourceDbDir,
-			String nodeId, boolean noAutoCompactions) throws IOException {
+			String nodeId, UnaryOperator<Config> adjust) throws IOException {
 		var config = ConfigFactory.parseString(REPLICA_OVERRIDES);
 		try {
 			if (rockserverConfig != null) {
@@ -295,9 +303,7 @@ final class NodeStore implements Closeable {
 			if (sourceDbDir != null) {
 				config = withRelativePaths(config, sourceDbDir);
 			}
-			if (noAutoCompactions) {
-				config = withoutAutoCompactions(config);
-			}
+			config = adjust.apply(config);
 		} catch (ConfigException | IllegalArgumentException e) {
 			throw new IOException("Failed to read the Rockserver config " + rockserverConfig, e);
 		}
@@ -416,11 +422,13 @@ final class NodeStore implements Closeable {
 	}
 
 	/**
-	 * {@code config} with automatic compactions off for every column: globally, in {@code fallback-column-options} and in
-	 * every entry of {@code column-options} (a column's own {@code disable-auto-compactions: false} would otherwise win),
-	 * and with {@code adaptive-compaction-io} off, which Rockserver refuses without automatic compactions. RocksDB then
-	 * starts no compaction (and no write slowdown); flushes still run. For the start-up check's open only
-	 * ({@link #openForStartupCheck}): it reads one value and closes, so no compaction is missed.
+	 * {@code config} with automatic compactions off for every column: globally, in {@code fallback-column-options} and
+	 * in every entry of {@code column-options} (a column's own {@code disable-auto-compactions: false} would otherwise
+	 * win), and with {@code adaptive-compaction-io} off, which Rockserver refuses without automatic compactions.
+	 * Rockserver's internal columns read no column config: they follow the global key
+	 * ({@code RocksDBLoader.getCompatibilityColumnOptions}, R44-1). RocksDB then starts no compaction in any column
+	 * (and no write slowdown); flushes still run. For the start-up check's open only ({@link #openForStartupCheck}): it
+	 * reads one value and closes, so no compaction is missed.
 	 */
 	static Config withoutAutoCompactions(Config config) {
 		ConfigValue off = ConfigValueFactory.fromAnyRef(true);
@@ -436,6 +444,24 @@ final class NodeStore implements Closeable {
 			result = result.withValue(columnsPath, ConfigValueFactory.fromIterable(columns));
 		}
 		return result;
+	}
+
+	/**
+	 * {@code config} for export-seed's open of its copy in {@code <target>.tmp} (Review of R44, 1), which runs while the
+	 * source database is still open and only drops the meta column and flushes: an 8 MiB block cache without a metadata
+	 * reserve (instead of the config's, 512 MiB by default), and a table cache of {@link #EXPORT_COPY_MAX_OPEN_FILES}
+	 * files instead of every table reader opened at once ({@code maximum-open-files: -1}), so without
+	 * {@code open-files-async}, which needs every file open. The block caches are capacity limits, not allocations; what
+	 * the open reads is a few table readers and their index and filter blocks. Named block caches and the write buffer
+	 * budget stay: the copy reads nothing through them and writes almost nothing. Only for the drop: the target's
+	 * owner opens it with its own config, which RocksDB's OPTIONS file in it does not replace.
+	 */
+	static Config withSmallFootprint(Config config) {
+		return config.withValue("database.global.block-cache", ConfigValueFactory.fromAnyRef("8MiB"))
+				.withValue("database.global.block-cache-metadata-size", ConfigValueFactory.fromAnyRef("0B"))
+				.withValue("database.global.maximum-open-files",
+						ConfigValueFactory.fromAnyRef(EXPORT_COPY_MAX_OPEN_FILES))
+				.withValue("database.global.open-files-async", ConfigValueFactory.fromAnyRef(false));
 	}
 
 	/**
@@ -924,24 +950,24 @@ final class NodeStore implements Closeable {
 
 	/**
 	 * Marks, next to the recorded seed digest (and the {@code opened} line, kept), that the start-up check is about to
-	 * open the database: {@value #OPENING}, then one {@code table <size> <identity> <path>} line per table and blob file
-	 * under {@code dbDir}, durably, before the open changes anything (R41-1). Opening a database writes a new MANIFEST,
-	 * OPTIONS and CURRENT, replays and flushes its WAL, may compact: a first start killed during that open leaves files
-	 * that match neither the seed digest nor an {@code opened} line, and {@link #recordSeedDigest} would otherwise take
-	 * the digest of those files, which no other copy of the seed has. With the marker it keeps the seed digest as long
-	 * as every file listed here is still there and is the same file, and one at least is listed: the open
-	 * ({@link #openForStartupCheck}, without automatic compactions: R43-2) adds table files but neither deletes nor
-	 * rewrites one that the MANIFEST references, while a copy made again ({@code cp}, {@code rsync}, restore-backup)
-	 * makes new ones, and a later copy of the seed's source lacks those its compactions replaced (R43-1). Files the
-	 * MANIFEST does not reference are another matter: the open deletes them as obsolete, and a recovery output it wrote
-	 * before it was killed and had not committed yet can be deleted or written again under the same number by the next
-	 * open. So when the file already holds a marker (the digest was kept after an earlier killed check), the new marker
-	 * carries over its {@code identity} and {@code table} lines, the seed's own files, instead of listing {@code dbDir}
-	 * again (Review of R43, 1). A seed with table files that its MANIFEST does not reference (copied from a source that
-	 * crashed or was copied while it ran) loses them in the open: such a killed start is not kept, and fails safe at
-	 * genesis; the runbooks ask for a cleanly stopped source (Review of R43, 2). It also lists IDENTITY
-	 * ({@code identity <size> <identity> <sha-256>}, or {@code identity none}), which the open keeps and another database
-	 * copied over this one replaces. Does nothing
+	 * open the database: {@value #OPENING}, then one {@code table <size> <identity> <path>} line per table and blob
+	 * file under {@code dbDir}, durably, before the open changes anything (R41-1). Opening a database writes a new
+	 * MANIFEST, OPTIONS and CURRENT, replays and flushes its WAL, may compact: a first start killed during that open
+	 * leaves files that match neither the seed digest nor an {@code opened} line, and {@link #recordSeedDigest} would
+	 * otherwise take the digest of those files, which no other copy of the seed has. With the marker it keeps the seed
+	 * digest as long as every file listed here is still there and is the same file, and one at least is listed: the
+	 * open ({@link #openForStartupCheck}, without automatic compactions in any column, Rockserver's internal ones
+	 * included: R43-2, R44-1) adds table files but neither deletes nor rewrites one that the MANIFEST references, while
+	 * a copy made again ({@code cp}, {@code rsync}, restore-backup) makes new ones, and a later copy of the seed's
+	 * source lacks those its compactions replaced (R43-1). Files the MANIFEST does not reference are another matter:
+	 * the open deletes them as obsolete, and a recovery output it wrote before it was killed and had not committed yet
+	 * can be deleted or written again under the same number by the next open. So when the file already holds a marker
+	 * (the digest was kept after an earlier killed check), the new marker carries over its {@code identity} and
+	 * {@code table} lines, the seed's own files, instead of listing {@code dbDir} again (Review of R43, 1). A seed with
+	 * table files that its MANIFEST does not reference (copied from a source that crashed or was copied while it ran)
+	 * loses them in the open: such a killed start is not kept, and fails safe at genesis; the runbooks ask for a
+	 * cleanly stopped source (Review of R43, 2). It also lists IDENTITY ({@code identity <size> <identity> <sha-256>},
+	 * or {@code identity none}), which the open keeps and another database copied over this one replaces. Does nothing
 	 * when no seed digest was recorded or {@code dbDir} holds no database; {@link #noteSeedOpened} drops the marker.
 	 */
 	static void noteSeedOpening(Path dbDir) throws IOException {
@@ -1008,9 +1034,10 @@ final class NodeStore implements Closeable {
 		if (listed.isEmpty()) {
 			return "no table file was listed before the open";
 		}
-		// Every listed file, still there and the same: the check's open runs without automatic compactions
-		// (openForStartupCheck, R43-2), so it deletes none; a later copy of the seed's source made with rsync --delete
-		// lacks the ones its own compactions replaced (R43-1). Files the open added are not listed, and allowed.
+		// Every listed file, still there and the same: the check's open runs without automatic compactions in any
+		// column, the internal ones included (openForStartupCheck, R43-2, R44-1), so it deletes none; a later copy of
+		// the seed's source made with rsync --delete lacks the ones its own compactions replaced (R43-1). Files the
+		// open added are not listed, and allowed.
 		var now = tableFiles(dbDir);
 		for (var table : listed.entrySet()) {
 			String current = now.get(table.getKey());
@@ -1414,7 +1441,7 @@ final class NodeStore implements Closeable {
 	private static ExportedSeed exportSeedStopped(Path dbDir, @Nullable Path stateMachineDir,
 			@Nullable Path rockserverConfig, Path target, boolean withoutDamagedSnapshot) throws IOException {
 		// The copy's config first: when it is refused, nothing has been written yet.
-		Path config = replicaConfig(rockserverConfig, target, dbDir, "export-target");
+		Path config = replicaConfig(rockserverConfig, target, dbDir, "export-target", NodeStore::withSmallFootprint);
 		var created = new AtomicBoolean();
 		try {
 			return exportSeedInto(dbDir, stateMachineDir, rockserverConfig, target, config, withoutDamagedSnapshot,
@@ -1486,21 +1513,36 @@ final class NodeStore implements Closeable {
 				throw ReplicatedNode.NewerVersionException.of(version, unknown);
 			}
 			clusterId = store.clusterId();
-			applied = store.checkpoint(target, false);
+			// The meta column is dropped in <target>.tmp, before the rename: target exists only without it, also after
+			// a kill (R44-2). Before, a kill between the rename and the drop left a complete-looking target with the
+			// old cluster's id, sessions and applied position, which every node of the new cluster refused.
+			applied = store.checkpoint(target, false, building -> dropMetaColumn(building, config));
 			created.set(true);
 		} finally {
 			// A no-op when restoreSnapshotIfAhead failed after closing it.
 			store.close();
 		}
-		try (var copy = new EmbeddedConnection(target, "export-target", config)) {
+		return new ExportedSeed(applied, clusterId, restoredSnapshot, damagedSnapshot, damagedSnapshotIndex);
+	}
+
+	/**
+	 * Opens the export's copy in {@code dir} (its {@code <target>.tmp}) with {@code config}, the copy's config, whose
+	 * volume, WAL and log paths are relative to the database directory and whose caches are small
+	 * ({@link #withSmallFootprint}: the source is still open), drops {@link #META_COLUMN} and flushes. The
+	 * checkpoint fsyncs the directory after this.
+	 */
+	private static void dropMetaColumn(Path dir, Path config) throws IOException {
+		var opening = exportCopyOpeningForTesting;
+		if (opening != null) {
+			opening.accept(dir);
+		}
+		try (var copy = new EmbeddedConnection(dir, "export-target", config)) {
 			var db = copy.getEmbeddedDB();
 			if (db.getAllColumnDefinitions().containsKey(META_COLUMN)) {
 				db.deleteColumn(db.getColumnId(META_COLUMN));
 			}
 			db.flush();
 		}
-		syncTree(target);
-		return new ExportedSeed(applied, clusterId, restoredSnapshot, damagedSnapshot, damagedSnapshotIndex);
 	}
 
 	/**
@@ -1561,6 +1603,15 @@ final class NodeStore implements Closeable {
 	/** Tests only: see {@link CheckpointHook}; null in production. */
 	static volatile @Nullable CheckpointHook checkpointBuiltForTesting;
 
+	/** The table cache of export-seed's open of its copy ({@link #withSmallFootprint}); package-private for tests. */
+	static final int EXPORT_COPY_MAX_OPEN_FILES = 32;
+
+	/**
+	 * Tests only: called with the directory in which {@code export-seed} opens its copy to drop the meta column, before
+	 * the open; null in production.
+	 */
+	static volatile java.util.function.@Nullable Consumer<Path> exportCopyOpeningForTesting;
+
 	/**
 	 * Writes a consistent checkpoint of the live database to {@code target} (must not exist): memtables are
 	 * flushed and SST files hard-linked. Returns the applied position contained in the checkpoint.
@@ -1590,6 +1641,15 @@ final class NodeStore implements Closeable {
 	 * snapshot and backup callers pass true: they build inside a directory of their own, where a leftover is theirs.
 	 */
 	TermIndex checkpoint(Path target, boolean replaceLeftover) throws IOException {
+		return checkpoint(target, replaceLeftover, null);
+	}
+
+	/**
+	 * {@link #checkpoint(Path, boolean)}; {@code finish}, when not null, runs on the building directory once the live
+	 * files are in it, before it is fsynced and renamed to {@code target}: what it changes is in {@code target} from
+	 * the moment {@code target} exists. When it fails, the building directory is deleted and nothing is renamed.
+	 */
+	TermIndex checkpoint(Path target, boolean replaceLeftover, @Nullable CheckpointHook finish) throws IOException {
 		target = target.toAbsolutePath();
 		if (Files.exists(target)) {
 			throw new IOException("Checkpoint target already exists: " + target);
@@ -1620,6 +1680,9 @@ final class NodeStore implements Closeable {
 			var hook = checkpointBuiltForTesting;
 			if (hook != null) {
 				hook.built(building);
+			}
+			if (finish != null) {
+				finish.built(building);
 			}
 			syncTree(building);
 			Files.move(building, target);

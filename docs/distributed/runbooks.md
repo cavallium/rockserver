@@ -265,7 +265,11 @@ A node on which the backup failed (a full disk, say) deletes what it had written
 `db/` without `backup.properties`, since those hard-link the live files too. If it cannot, its log says `cannot delete
 ... delete it by hand`: a `<data-dir>/backups/<name>` without `backup.properties` is always a failed or interrupted
 attempt, and can be deleted. A backup of that name that existed already is never touched by the failure of another
-one. `export-seed` likewise leaves neither its target nor `<target>.tmp` when it fails.
+one. `export-seed` likewise leaves neither its target nor `<target>.tmp` when it fails. Its target appears only
+complete, without the old cluster's metadata: an export killed before its last rename (OOM, SIGKILL, power loss)
+leaves only `<target>.tmp`, which a rerun refuses (`The target's temporary directory ... already exists`): delete
+`<target>.tmp` and run the export again. An export killed after it leaves a complete target but printed no applied
+index: delete that target too and export again.
 
 Then, for each backup:
 
