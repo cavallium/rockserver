@@ -23,7 +23,11 @@ import reactor.core.publisher.Mono;
 import reactor.core.publisher.Flux;
 import reactor.core.scheduler.Schedulers;
 
-/** Defers the SDK's mandatory capability handshake until remote work is requested. */
+/**
+ * Defers the SDK's mandatory capability handshake until remote work is requested. The future of a single call, of
+ * {@code flushWalAsync} and of {@code openClientSessionAsync} is a {@link DeferredCall}: its cancel and its outcome are
+ * those of the real connection's call once that call is made (R47-2).
+ */
 final class DeferredRockserverConnection implements RocksDBConnection {
 
 	private static final Duration CONNECT_TIMEOUT = Duration.ofSeconds(50);

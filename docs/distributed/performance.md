@@ -275,14 +275,16 @@ Other results:
   (a volume outside `data/db` passes the start but makes every snapshot fail), and with
   `data/raft` on another disk every snapshot copies the whole database (instead of hard-linking it) while the
   apply waits. Keep `data/raft`, `data/db`, every column volume and the RocksDB WAL on one file system.
-- **Power loss.** After any failure reading the Raft log at startup, stop the node, run
-  `ReplicatedServerMain repair-log --data-dir DIR --dry-run` and follow its verdict, not the error message: a torn
+- **Power loss.** After any failure reading the Raft log at startup (the failed start prints the command), stop the
+  node, run `ReplicatedServerMain repair-log --data-dir DIR --dry-run` (with the node's `--group-id` if it has one)
+  and follow its verdict, not the error message: a torn
   last write can show up as `Log entry corrupted` or as an `InvalidProtocolBufferException`, and damage it refuses
   can show up the same way or as `Read extra bytes`. If it would repair, run it again without `--dry-run` and start
   the node: the leader sends it what it lost. That is safe only if the dropped entry was never fsynced, as the
   command says, so disks that lose fsynced data void it (see Durability in the design document). If it refuses,
   replace the node under a new id. If too few nodes are left to elect a leader, which replacing a node needs, see
-  "No quorum" in the design document: there is no override.
+  "No quorum" in the design document: there is no override. The runbooks have it step by step ("Node does not start
+  after a power loss").
 - **Disk space.** Each retained snapshot keeps the table files it links, also after compaction replaced them.
   Budget the database plus at least one older snapshot's compacted-away files, more while installs run.
 - **Client concurrency.** Throughput is in-flight requests divided by latency. A replicated write takes

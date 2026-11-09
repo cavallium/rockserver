@@ -19,7 +19,11 @@ public class ClientBuilder {
 	private boolean useThrift;
 	private boolean deferred;
 
-	/** Defer remote connection construction and capability validation until first use. */
+	/**
+	 * Defer remote connection construction and capability validation until first use. The futures of the deferred
+	 * client report the call's own outcome: a cancel before the connection exists sends nothing, one after is the
+	 * call's cancel (a numbered write that sent a copy refuses it and ends OUTCOME_UNKNOWN), as without deferral.
+	 */
 	public void setDeferred(boolean deferred) {
 		this.deferred = deferred;
 	}
