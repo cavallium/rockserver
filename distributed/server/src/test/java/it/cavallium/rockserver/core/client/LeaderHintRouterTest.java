@@ -539,6 +539,44 @@ class LeaderHintRouterTest {
 		assertEquals(0, router.retiredOpenForTesting());
 	}
 
+	/**
+	 * Review of R49, 1: {@code close()} forces the leader channels, so a replayable read with no answer yet fails
+	 * {@code UNAVAILABLE} on them. It was then sent again on the ordinary channel, which the connection's close shuts
+	 * down gracefully next (forced only after a minute): the read outlived the close. After the close it must fail, on
+	 * the current leader channel and on a retired one alike, and nothing goes to the ordinary channel.
+	 */
+	@Test
+	void aReadFailedByTheCloseIsNotReplayed() {
+		var router = router(LeaderHintRouter.Mode.LISTED);
+		var routed = router.route(main);
+		router.offer("node-b:5333");
+		var b = opened.getLast();
+		b.state = ConnectivityState.READY;
+		b.holdsCalls = true;
+		var retiredCloses = new ArrayList<Status>();
+		startUnary(routed.newCall(method("getRangePage"), CallOptions.DEFAULT), retiredCloses);
+		assertEquals(1, b.calls);
+		var onRetired = b.lastListener;
+
+		router.offer("node-c:5333");
+		var c = opened.getLast();
+		c.state = ConnectivityState.READY;
+		var currentCloses = new ArrayList<Status>();
+		startUnary(routed.newCall(method("getRangePage"), CallOptions.DEFAULT), currentCloses);
+		assertEquals(1, c.calls);
+		int mainCalls = main.calls;
+
+		router.close();
+		assertTrue(b.forced);
+		assertTrue(c.forced);
+		// What shutdownNow delivers to the calls still running on them.
+		onRetired.onClose(Status.UNAVAILABLE.withDescription("Channel shutdownNow invoked"), new Metadata());
+		c.lastListener.onClose(Status.UNAVAILABLE.withDescription("Channel shutdownNow invoked"), new Metadata());
+		assertEquals(mainCalls, main.calls, "a read failed by the close was sent again on the ordinary channel");
+		assertEquals(List.of(Status.Code.UNAVAILABLE), retiredCloses.stream().map(Status::getCode).toList());
+		assertEquals(List.of(Status.Code.UNAVAILABLE), currentCloses.stream().map(Status::getCode).toList());
+	}
+
 	/** Starts a unary call as grpc's {@code futureUnaryCall} does, collecting how it closes. */
 	private static void startUnary(ClientCall<byte[], byte[]> call, List<Status> closes) {
 		call.start(new ClientCall.Listener<>() {
