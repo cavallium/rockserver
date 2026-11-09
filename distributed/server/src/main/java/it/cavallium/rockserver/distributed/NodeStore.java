@@ -36,6 +36,8 @@ import java.nio.file.SimpleFileVisitor;
 import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.BasicFileAttributes;
+import java.nio.file.attribute.PosixFilePermission;
+import java.nio.file.attribute.PosixFilePermissions;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
@@ -246,12 +248,35 @@ final class NodeStore implements Closeable {
 		Files.createDirectories(file.getParent());
 		try {
 			// Replaces the file that a process killed during an earlier open of this database left (R29-2).
-			Files.writeString(file, config.root().render(ConfigRenderOptions.concise()), StandardCharsets.UTF_8);
+			writeOwnerOnly(file, config.root().render(ConfigRenderOptions.concise()));
 		} catch (IOException | RuntimeException e) {
 			Files.deleteIfExists(file);
 			throw e;
 		}
 		return file;
+	}
+
+	private static final Set<PosixFilePermission> OWNER_READ_WRITE = PosixFilePermissions.fromString("rw-------");
+
+	/**
+	 * Writes {@code content} to {@code file} readable and writable by its owner only (rw-------) on a file system with
+	 * POSIX permissions, whatever the umask: the replica config is the resolved Rockserver config, with the InfluxDB
+	 * token and every {@code ${?ENV}} substitution in plain text (R31-1; R29-2's {@code Files.createTempFile} made it so
+	 * by chance, the fixed name had the umask's mode). An existing file (a killed open's) is deleted first, so that
+	 * neither its mode nor a link in its place is kept, and the file is created with the mode before any byte is
+	 * written. Elsewhere the file system's default applies.
+	 */
+	static void writeOwnerOnly(Path file, String content) throws IOException {
+		Files.deleteIfExists(file);
+		if (file.getFileSystem().supportedFileAttributeViews().contains("posix")) {
+			Files.createFile(file, PosixFilePermissions.asFileAttribute(OWNER_READ_WRITE));
+			// The umask can only remove bits from the mode given at creation: set it again, in case it removed the owner's.
+			Files.setPosixFilePermissions(file, OWNER_READ_WRITE);
+		} else {
+			Files.createFile(file);
+		}
+		Files.writeString(file, content, StandardCharsets.UTF_8, StandardOpenOption.WRITE,
+				StandardOpenOption.TRUNCATE_EXISTING);
 	}
 
 	/**
