@@ -40,6 +40,13 @@ import org.slf4j.LoggerFactory;
  * started is missing from it: its address is then asked to the member itself, through {@link TermService} on its
  * Raft address, which the Raft configuration carries.</p>
  *
+ * <p>For a member in the peer list, its Raft address there is used even when the Raft configuration records another
+ * (R52-4): it is the address that this node's Ratis server uses for that id too, since Ratis 3.3.1 makes its connection
+ * to a peer from the start's group (the peer list) first and never replaces it for the same id while it runs (R52-2).
+ * Preferring the configuration's address here would forward to an address that Raft itself does not use. A member id
+ * therefore keeps its address: a member moves under a new id, which is not in the list and is asked at the
+ * configuration's address (runbooks, "One voter per change").</p>
+ *
  * <p>A request that finds no leader waits for one: {@link #leaderChanged()}, called on every leader change and when
  * this node becomes a ready leader, wakes it at once. A slow poll stays behind as a safety net.</p>
  */

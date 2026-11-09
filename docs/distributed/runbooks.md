@@ -175,6 +175,10 @@ majority and healthy (`status`).
    default: raise it for a large database, about 100 MB/s).
 3. Check: `status` shows `n4` with the others' commit index; `checksum` prints `OK`; the `rockserver-node-missing`
    alert threshold and the clients' address lists include `n4` and not the old node.
+4. Update `PEERS` (every node's `--peer`, and the `admin` commands) to the new members: `n4` added, the old node
+   gone. The running nodes need no restart for it (they learned `n4` from the configuration, and forward to it by
+   asking it at that Raft address); use the new list at their next restart. Never reuse the old id at another
+   address (see "One voter per change").
 
 Failure branches:
 
@@ -194,10 +198,13 @@ Failure branches:
   more than one voter ...`), the same applies.
 - `add-peer` or `remove-peer` says `FAILED: refused: --peer gives members that stay another address than the leader's
   configuration: ...`: a `--peer` address is mistyped, or names another spelling of the host. Nothing was proposed.
-  Fix `--peer` to the addresses printed and run it again; `--change-addresses` is only for a member whose address
-  really changed (see "One voter per change").
+  Fix `--peer` to the addresses printed and run it again; `--change-addresses` is only for a configuration that
+  records a wrong address of a member that stays, on a call that adds or removes a voter (see "One voter per
+  change"); it never moves a member.
 - `add-peer` ends with no result within the limit: the leader goes on with the change. Run the same command again until
-  it says `OK` (once the node is a voter it says `already a voter` and `OK`); `status` shows the progress. Do not wipe
+  it says `OK` (once the node is a voter it says `already a voter` and `OK`); `status` shows the progress. If the id
+  was a member before at another address, it never ends (see "An id keeps its address" in "One voter per change"):
+  check with `status` that it is not a voter, then stop that node, wipe it and add it under a new id. Do not wipe
   the new node meanwhile, whatever a re-run says about its log (see the first branch).
 - The lost node was the leader: the same steps, after the election (`status` shows a new leader).
 - Two nodes of three lost: there is no majority, `add-peer` cannot work. See "No quorum" in the design document, and
@@ -238,7 +245,7 @@ start, `starting, not known to be a member`, with `Membership <reason> (K* ..., 
 
 | Reason | What to do |
 |---|---|
-| `NO_MAJORITY`, `NO_COMMITTED_CONFIGURATION` | Start or repair the pending and unreachable members (a member of a version without `Configuration` counts as unreachable). The node decides by itself once a majority of them answer. If they are gone for good (wiped, replaced), check with `status` on a member: if this node is not in its configuration, stop it, take it out of its supervisor, wipe its data directory, and add it again with `--join` and `add-peer` if you want it back. |
+| `NO_MAJORITY`, `NO_COMMITTED_CONFIGURATION` | Start or repair the pending and unreachable members (a member of a version without `Configuration` counts as unreachable). The node decides by itself once a majority of them answer. If they are gone for good (wiped, replaced), check with `status` on a member: if this node is not in its configuration, stop it, take it out of its supervisor, wipe its data directory, and add it again with `--join` and `add-peer` if you want it back, at its old address (at another one, add it under a new id: see "One voter per change"). |
 | `NEEDS_TERM` | The members that answered run a version without `Configuration2`: upgrade them. Their answers tell no terms, and their committed flag does not confirm a removal unless a member of this version (or the node itself) reports the same configuration committed. Until then judge with `status`, as above. |
 | `MEMBER_LATER_CONFIGURATION` | Clears by itself within seconds. If it lasts, the blocking members are stuck or were removed themselves: look at their logs and `status`. |
 | `OWN_LATER_CONFIGURATION` | Its own log holds a later configuration that includes it and may still commit: normally an `add-peer` of this node in flight (let it finish), or a configuration a leader appended just before it lost leadership, which clears once the next leader's configuration reaches this node. If it persists while a leader runs, check `status` on a member. |
@@ -269,23 +276,32 @@ new read of its configuration does not change (Ratis' own `changes a majority se
 its message (`the leader n2 (term 7) refused, and its configuration did not change since: ...`).
 
 The new configuration is written from `--peer`: the address given there for every member that stays is the address
-the configuration records for it, which the nodes use once they restart and read it (a running leader keeps its
-connection to a member by id, so a wrong address shows only then). `add-peer` and `remove-peer` therefore refuse,
+the configuration records for it, which a node started with `--join` and a node that finds the member missing from its
+own `--peer` use (a running node keeps the address it knows for a member id, so a wrong address shows only then). `add-peer` and `remove-peer` therefore refuse,
 with exit code 1 and before they propose anything, a `--peer` address of a member that stays that differs from its
 address in the leader's configuration: `FAILED: refused: --peer gives members that stay another address than the
 leader's configuration: n3 (at 10.0.0.3:9001 in the configuration, 10.0.0.3:9010 in --peer)`. Addresses are compared
 as written, so `localhost:9001` is not `127.0.0.1:9001`. Fix `--peer` to the addresses the refusal names as those of
-the configuration. To move a member to another address, replace it as in "Replacing a node" (the old node runs: a
-move): start a node under a new id at the new address, with an empty data directory and `--join`, `add-peer` it,
-then `remove-peer` the old id. The member that moves is the one added or removed, never one that stays. Keeping its
-id is possible only as for any removed node ("Removed node"): `remove-peer` it, stop it and take it out of its
-supervisor, wipe its data directory, start it at the new address with `--join` (its own `--peer` entry giving that
-address), then `add-peer` it with that address. Started again with its old data it exits 4 or waits outside the
-cluster, and `add-peer` refuses a node that has a log of its own; until the `add-peer` ends the cluster has one
-voter fewer. Only when the
-configuration itself holds a wrong address of a member that stays (written by an `admin` without this check, say),
-pass `--change-addresses` to an `add-peer` or `remove-peer` call whose `--peer` gives the right one: it prints
-`--change-addresses: this change also moves ...` and writes the `--peer` addresses.
+the configuration.
+
+**An id keeps its address.** To move a member to another address, replace it as in "Replacing a node" (the old node
+runs: a move): start a node under a new id at the new address, with an empty data directory and `--join`, `add-peer`
+it, then `remove-peer` the old id. The member that moves is the one added or removed, never one that stays. Do not
+bring an id back at another address (`remove-peer n3`, n3 wiped and started at a new address with `--join`,
+`add-peer n3=<new address>`) while the other nodes run: Ratis 3.3.1 keeps one connection per member id on every
+node, made from the address it first knew for that id (its `--peer`, then its configuration) and never replaced
+while the node runs, so the leader keeps sending to the old address. n3 gets nothing, `add-peer` ends without `OK` at
+its limit and every re-run does the same, and the cluster stays one voter short; a restart of the other nodes does
+not help while their `--peer` gives the old address, which they read first, and their calls forwarded to n3 as
+leader go there too. A removed id comes back only at its old address ("Removed node"). Only when the configuration
+itself holds a wrong address of a member that stays (written by an `admin` without this check, say), pass
+`--change-addresses` to an `add-peer` or `remove-peer` call that adds or removes a voter and whose `--peer` gives the
+right one: it prints `--change-addresses: this change also moves ...` and writes the `--peer` addresses. That fixes
+the record only (for `--join` nodes and `admin`); the running nodes already use the address of their `--peer`. Ratis
+writes nothing for a configuration whose voters do not change, so `admin` refuses `--change-addresses` on a call
+that adds and removes no voter (a re-run of a `remove-peer`, say) with exit code 1: `FAILED: refused:
+--change-addresses on a call that adds and removes no voter ... Nothing was written.` Wait for the next replacement
+to write it.
 
 `admin` asks every `--peer` at once (a down member delays each round by one request timeout, not one each) and takes the configuration of the leader of the highest term; it waits while a member
 shows a later term than the leader that answered. A leader that has just been deposed answers as the leader for about
