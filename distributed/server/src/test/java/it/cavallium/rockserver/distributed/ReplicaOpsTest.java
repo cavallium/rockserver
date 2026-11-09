@@ -511,4 +511,32 @@ class ReplicaOpsTest {
 		}
 		assertFalse(Files.exists(dirB), "a copy of the request at another log position");
 	}
+
+	/**
+	 * Review of R41, 3 (mixed versions): a node holds the copy of a request at index 100 but takes 200 for the request's
+	 * first entry (its database came from a snapshot of an older leader, which records no first index, or it took the
+	 * copy with an older version). Its copy is not at the request's first entry as this node knows it, and another node
+	 * may hold a copy at 200: FAILED naming both indexes, not DONE, so that admin does not print OK over copies of one
+	 * name at different positions. With the first index it knows (100), the same copy is DONE.
+	 */
+	@Test
+	void aCopyOfTheRequestAtAnotherIndexThanItsFirstIsFailed() throws Exception {
+		var config = NodeConfig.defaults("n0", List.of(new PeerConfig("n0", "127.0.0.1", 1, "127.0.0.1", 2)), temp);
+		Path dir = ReplicaOps.backupsDir(config.dataDir()).resolve("nightly");
+		try (var store = NodeStore.open(temp.resolve("store"), null, "n0");
+				var ops = new ReplicaOps(config, null, new NodeMetrics("n0"))) {
+			ops.backup("nightly", 77, org.apache.ratis.server.protocol.TermIndex.valueOf(1, 100), store);
+			assertEquals(ReplicaOps.State.DONE, ops.backupResult("nightly", 100).state());
+
+			ops.backup("nightly", 77, org.apache.ratis.server.protocol.TermIndex.valueOf(1, 200), 200, store);
+			var result = ops.backupResult("nightly", 200);
+			assertEquals(ReplicaOps.State.FAILED, result.state(), result.detail());
+			assertTrue(result.detail().contains("100") && result.detail().contains("200"), result.detail());
+
+			ops.backup("nightly", 77, org.apache.ratis.server.protocol.TermIndex.valueOf(1, 300), 100, store);
+			result = ops.backupResult("nightly", 300);
+			assertEquals(ReplicaOps.State.DONE, result.state(), result.detail());
+		}
+		assertEquals("100", ReplicaOps.readBackupProperties(dir).getProperty("index"), "the copy is kept");
+	}
 }
