@@ -84,7 +84,8 @@ import org.rocksdb.NativeLibraryLoader;
  * {@code <data-dir>/backups/NAME}; it prints where each member wrote it, and prints {@code OK} only if every member of
  * {@code --peer} wrote it; it exits with 1 if a member failed or gave an answer that cannot be read (a member of
  * another version), and with 4 if a member gave no result in time, or no
- * member took the request in time. Both ask the members at once and propose through one that answers, so that a
+ * member took the request in time, or one took it and gave no log index in time: then it says the backup may have
+ * been proposed, with its request id, instead of "Nothing was proposed" (R39-1). Both ask the members at once and propose through one that answers, so that a
  * frozen member listed first does not hold them (see {@code proposeOp}); a member that refuses by the cluster version
  * it has applied (it may lag behind the leader) proposed nothing, and the next member that answered is asked: only when
  * every member that answered refuses so do they exit with 1, naming each and its version (R32-4). They then ask every
