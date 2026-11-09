@@ -11,7 +11,10 @@ import java.net.URI;
 import java.time.Duration;
 import java.util.Objects;
 import java.util.concurrent.Callable;
+import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
+import java.util.function.Function;
 import java.util.function.LongSupplier;
 import org.slf4j.LoggerFactory;
 import org.reactivestreams.Publisher;
@@ -61,8 +64,7 @@ final class DeferredRockserverConnection implements RocksDBConnection {
 	public CompletableFuture<Long> openClientSessionAsync(RequestContext context) {
 		Objects.requireNonNull(context);
 		var budget = new Budget(context);
-		return acquire(budget).flatMap(client -> Mono.fromFuture(() ->
-				client.openClientSessionAsync(budget.remainingContext()))).toFuture();
+		return DeferredCall.start(acquire(budget), client -> client.openClientSessionAsync(budget.remainingContext()));
 	}
 
 	private RocksDBConnection initialized() {
@@ -79,8 +81,8 @@ final class DeferredRockserverConnection implements RocksDBConnection {
 			@Override
 			public CompletableFuture<Void> flushWalAsync() {
 				var budget = new Budget(context);
-				return acquire(budget).flatMap(client -> Mono.fromFuture(() ->
-						client.getAsyncApi(budget.remainingContext()).flushWalAsync())).toFuture();
+				return DeferredCall.start(acquire(budget),
+						client -> client.getAsyncApi(budget.remainingContext()).flushWalAsync());
 			}
 
 			@Override
@@ -97,9 +99,8 @@ final class DeferredRockserverConnection implements RocksDBConnection {
 			}
 
 			private <R, RS, RA> CompletableFuture<R> single(RocksDBAPICommand<R, RS, RA> request, Budget budget) {
-				return acquire(budget)
-							.flatMap(client -> Mono.fromFuture(() -> (CompletableFuture<R>)
-								client.getAsyncApi(budget.remainingContext()).requestAsync(request))).toFuture();
+				return DeferredCall.start(acquire(budget), client -> (CompletableFuture<R>)
+						client.getAsyncApi(budget.remainingContext()).requestAsync(request));
 			}
 		};
 	}
@@ -236,6 +237,91 @@ final class DeferredRockserverConnection implements RocksDBConnection {
 		// Interrupts the handshake: nobody needs it now, and it holds a thread and keeps connecting until it ends.
 		if (task != null) task.dispose();
 		if (existing != null) existing.close();
+	}
+
+	/**
+	 * The future of a single call made once the connection exists (R47-2). Until then a {@link #cancel} stops the
+	 * acquisition, and nothing is sent. After, it is the call's own cancel, and this future ends as the call does: a
+	 * numbered write that sent a copy refuses the cancel and ends OUTCOME_UNKNOWN (SessionWrites' {@code CallResult}), a
+	 * call that already ended refuses it and its outcome comes through ({@link CancelPropagatingFuture}). A future made
+	 * with {@code Mono.toFuture()} accepted every cancel, ending cancelled ("not applied") whatever the call did.
+	 */
+	private static final class DeferredCall<T> extends CompletableFuture<T> {
+		private final Object lock = new Object();
+		/** Guarded by {@link #lock}. */
+		private Disposable acquisition;
+		/** Guarded by {@link #lock}: the call, once made. */
+		private CompletableFuture<T> call;
+		/** Guarded by {@link #lock}: cancelled before the call was made, which then never is. */
+		private boolean cancelledBeforeCall;
+
+		static <T> CompletableFuture<T> start(Mono<RocksDBConnection> connection,
+				Function<RocksDBConnection, CompletableFuture<T>> call) {
+			var result = new DeferredCall<T>();
+			var subscription = connection.subscribe(client -> result.connected(client, call), result::completeExceptionally);
+			boolean cancelled;
+			synchronized (result.lock) {
+				cancelled = result.cancelledBeforeCall;
+				if (!cancelled) result.acquisition = subscription;
+			}
+			if (cancelled) subscription.dispose();
+			return result;
+		}
+
+		private void connected(RocksDBConnection client, Function<RocksDBConnection, CompletableFuture<T>> function) {
+			CompletableFuture<T> made;
+			synchronized (lock) {
+				if (cancelledBeforeCall) return;
+				// Made under the lock, so that a cancel either comes first (and nothing is sent) or reaches the call.
+				try {
+					made = Objects.requireNonNull(function.apply(client), "call");
+				} catch (Throwable failure) {
+					made = CompletableFuture.failedFuture(failure);
+				}
+				call = made;
+			}
+			var source = made;
+			made.whenComplete((value, error) -> {
+				if (error == null) {
+					complete(value);
+				} else if (source.isCancelled() && unwrap(error) instanceof CancellationException) {
+					cancelOnly();
+				} else {
+					completeExceptionally(unwrap(error));
+				}
+			});
+		}
+
+		@Override
+		public boolean cancel(boolean mayInterruptIfRunning) {
+			if (isDone()) return isCancelled();
+			CompletableFuture<T> made;
+			Disposable pending = null;
+			synchronized (lock) {
+				made = call;
+				if (made == null) {
+					cancelledBeforeCall = true;
+					pending = acquisition;
+				}
+			}
+			if (made == null) {
+				// Nothing was sent: the acquisition stops (its waiter leaves, as before) and this future is cancelled.
+				if (pending != null) pending.dispose();
+			} else if (!made.cancel(mayInterruptIfRunning) && !made.isCancelled()) {
+				// The call refused the cancel (it ended, or a copy of a numbered write was sent): its outcome completes this.
+				return false;
+			}
+			super.cancel(mayInterruptIfRunning);
+			return isCancelled();
+		}
+
+		private void cancelOnly() {
+			super.cancel(false);
+		}
+
+		private static Throwable unwrap(Throwable error) {
+			return error instanceof CompletionException && error.getCause() != null ? error.getCause() : error;
+		}
 	}
 
 	private static final class Attempt {
