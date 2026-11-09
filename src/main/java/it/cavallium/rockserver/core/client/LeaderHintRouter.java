@@ -182,7 +182,10 @@ final class LeaderHintRouter implements AutoCloseable {
 	 * does nothing. Guarded by {@link #lock}.
 	 */
 	private final Set<Hint> retiredOpen = new HashSet<>();
-	/** Written under {@link #lock}; read without it by a failed leader call, which must not replay after the close. */
+	/**
+	 * Set by {@link #stopRouting} or {@link #close}. Written under {@link #lock}; read without it by a failed leader
+	 * call, which must not replay after the close began.
+	 */
 	private volatile boolean closed;
 
 	/**
@@ -614,12 +617,35 @@ final class LeaderHintRouter implements AutoCloseable {
 	}
 
 	/**
+	 * The connection starts to close (review of R51, 1): from now on no call goes to a leader channel and no hint is
+	 * taken. The current hint is retired, as by a new leader: its channel shuts down gracefully once the calls handed
+	 * out on it have started (R46-1; those not started yet go to the ordinary channel, which the close shuts down at the
+	 * same time), so it refuses new calls but keeps those in flight, the numbered writes that
+	 * {@code GrpcConnection.close()} waits for among them, until {@link #close} forces it.
+	 */
+	void stopRouting() {
+		Hint hint;
+		synchronized (lock) {
+			closed = true;
+			hint = current;
+			current = null;
+			if (hint != null) {
+				keepUntilClose(hint);
+			}
+		}
+		if (hint != null) {
+			hint.retire();
+		}
+	}
+
+	/**
 	 * Forces the leader's channel and every retired one whose calls have not ended (R49-1), so that a stream or a call
 	 * without a deadline on a leader channel, current or former, fails now, while the connection's callback executor
 	 * can still tell its caller, instead of running on after the connection closed. A replayable read failed this way
 	 * is not sent again on the ordinary channel (review of R49, 1): its caller gets the {@code UNAVAILABLE}. Waits up
 	 * to 5 s in all for the channels to terminate. A retired channel is never forced before this (R46-1): its calls end
-	 * as they do.
+	 * as they do. {@code GrpcConnection.close()} lets the numbered writes in flight on these channels end first (R51-3),
+	 * so that the forcing does not cut them.
 	 */
 	@Override
 	public void close() {

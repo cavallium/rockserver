@@ -127,6 +127,11 @@ public final class GrpcConnection extends BaseConnection {
 	public static final String SESSION_WRITES_PROPERTY = "it.cavallium.rockserver.grpc.client.session-writes";
 
 	private static final Logger SESSION_LOG = LoggerFactory.getLogger(GrpcConnection.class);
+	/**
+	 * How long {@link #close()} waits for the numbered writes in flight before it closes the channels (R51-3): as long
+	 * as the ordinary channel's graceful shutdown waits for its calls.
+	 */
+	private static final long CLOSE_DRAIN_SECONDS = 60;
 	private final GrpcConnectionDelegate delegate;
 	/** Numbered writes, on a replicated server that has client sessions and a connection that retries. */
 	private final @Nullable SessionWrites sessionWrites;
@@ -327,6 +332,22 @@ public final class GrpcConnection extends BaseConnection {
 			// Before the channel (R50-3): a numbered write started while it shuts down, which can take minutes, is not
 			// sent and fails not applied; copies already in flight still drain.
 			writes.closing();
+		}
+		// Review of R51, 1: no new call from now on, numbered or not, on either channel, as when the close shut the
+		// ordinary channel down at once (before R51-3); the calls in flight go on, and the wait below is for them.
+		delegate.stopTakingCalls();
+		if (writes != null) {
+			// R51-3: drained here, before the delegate forces the leader channels of a multi-address connection (R49-1),
+			// which would cut a numbered write in flight on one of them and end it OUTCOME_UNKNOWN. Bounded as the
+			// ordinary channel's graceful wait; a copy still in flight then is cut, and ends unknown.
+			try {
+				if (!writes.awaitInFlight(TimeUnit.SECONDS.toNanos(CLOSE_DRAIN_SECONDS))) {
+					SESSION_LOG.warn("Numbered writes were still in flight {} s after the close began: they end OUTCOME_UNKNOWN",
+							CLOSE_DRAIN_SECONDS);
+				}
+			} catch (InterruptedException e) {
+				Thread.currentThread().interrupt();
+			}
 		}
 		try {
 			delegate.close();
@@ -2313,6 +2334,22 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 		// ordinary channel would retry again on that channel instead, which fails over to a live node.
 		builder.disableRetry().defaultServiceConfig(Map.of("loadBalancingConfig", PICK_FIRST_IN_ORDER));
 		return builder.intercept(new RetryLoggingInterceptor(), router.hintReader()).build();
+	}
+
+	/**
+	 * The close begins (review of R51, 1): the ordinary channel starts its graceful shutdown and the leader router
+	 * stops handing out its channels ({@link LeaderHintRouter#stopRouting}), so that a new call is refused locally
+	 * while the calls in flight, on either channel, go on until {@link #close}.
+	 */
+	void stopTakingCalls() {
+		if (this.leaderRouter != null) {
+			this.leaderRouter.stopRouting();
+		}
+		try {
+			this.channel.shutdown();
+		} catch (Exception ex) {
+			LOG.error("Failed to close channel", ex);
+		}
 	}
 
 	@Override

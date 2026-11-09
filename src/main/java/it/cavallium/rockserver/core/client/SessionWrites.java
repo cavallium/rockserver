@@ -16,6 +16,7 @@ import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
 import it.cavallium.rockserver.core.common.RocksDBRetryException;
 import it.cavallium.rockserver.core.common.UpdateContext;
 import it.unimi.dsi.fastutil.longs.LongRBTreeSet;
+import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -300,8 +301,11 @@ final class SessionWrites {
 	/**
 	 * The connection starts to close (R50-3): from now on no copy is sent, neither of a new write, which fails flagged
 	 * not applied, nor a resend, which ends its write as {@link Call#failClosed}; a copy already in flight keeps its
-	 * answer, so that the channel's graceful shutdown can still drain it. "From now on" is from each send's own check
-	 * of the flag, which comes before the copy is handed to the channel and is not atomic with it: a copy whose check
+	 * answer, so that the close can still drain it: {@link #awaitInFlight}, before the channels close (R51-3; the
+	 * leader channels of a multi-address connection are forced, not drained, R49-1). The other calls are refused from
+	 * the same moment by the channels themselves, which stop taking new calls before that wait (review of R51, 1:
+	 * {@code GrpcConnectionDelegate.stopTakingCalls}). "From now on" is from each send's
+	 * own check of the flag, which comes before the copy is handed to the channel and is not atomic with it: a copy whose check
 	 * passed just before this call can still reach the channel after its shutdown began, be refused there locally and
 	 * end {@code OUTCOME_UNKNOWN}, as before R50-3. That is conservative, never wrong: such a copy has its
 	 * {@code sent} flag set, so its write is never flagged not applied (review of R50, 3). Without it, a write started while the
@@ -310,6 +314,40 @@ final class SessionWrites {
 	 */
 	void closing() {
 		closed = true;
+	}
+
+	/**
+	 * After {@link #closing}: waits, up to {@code timeoutNanos}, until no copy of a numbered write is in flight any more
+	 * (R51-3), so that the close can then force the channels, the leader channels of a multi-address connection
+	 * included (R49-1), without cutting a copy whose answer was on its way. A copy that ends without an answer from now
+	 * on ends its write as {@link Call#failClosed}, never as a resend. Returns whether every copy ended in time; one
+	 * still in flight at the limit is cut by the forcing that follows and ends {@code OUTCOME_UNKNOWN}.
+	 */
+	boolean awaitInFlight(long timeoutNanos) throws InterruptedException {
+		long deadline = System.nanoTime() + timeoutNanos;
+		while (true) {
+			var copies = new ArrayList<CompletableFuture<?>>();
+			for (var call : live) {
+				var copy = call.inFlight;
+				if (copy != null && !copy.isDone()) {
+					copies.add(copy);
+				}
+			}
+			if (copies.isEmpty()) {
+				return true;
+			}
+			long left = deadline - System.nanoTime();
+			if (left <= 0) {
+				return false;
+			}
+			try {
+				CompletableFuture.allOf(copies.toArray(CompletableFuture[]::new)).get(left, TimeUnit.NANOSECONDS);
+			} catch (ExecutionException ended) {
+				// One of them failed; the others are looked at again.
+			} catch (TimeoutException late) {
+				return false;
+			}
+		}
 	}
 
 	/**

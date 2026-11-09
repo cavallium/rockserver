@@ -156,7 +156,8 @@ majority and healthy (`status`).
    It prints `READY` and waits for as long as it takes.
 2. From any host, change one voter per command. `admin` reads the leader's configuration first (it waits while a change
    is under way) and refuses, with exit code 1 and before it proposes anything, a call that would add and remove
-   voters together or change two of them: see "One voter per change" below. Old node `n1`:
+   voters together or change two of them, or whose `--peer` gives a member that stays another address than the
+   configuration (the addresses in `--peer` are written into the new configuration): see "One voter per change" below. Old node `n1`:
    - **The old node is down (lost):** remove it first, with `--peer` listing all current members, then add the new one
      with `--peer` listing the members that stay:
      `rs admin --peer n1=... --peer n2=... --peer n3=... remove-peer n1`, then
@@ -191,6 +192,10 @@ Failure branches:
   and change one voter per call as in step 2. If the leader itself refused it (`FAILED: the leader refused: changes
   more than one voter ...`; an `admin` of an older version prints `FAILED: ... or the leader refused: refused: changes
   more than one voter ...`), the same applies.
+- `add-peer` or `remove-peer` says `FAILED: refused: --peer gives members that stay another address than the leader's
+  configuration: ...`: a `--peer` address is mistyped, or names another spelling of the host. Nothing was proposed.
+  Fix `--peer` to the addresses printed and run it again; `--change-addresses` is only for a member whose address
+  really changed (see "One voter per change").
 - `add-peer` ends with no result within the limit: the leader goes on with the change. Run the same command again until
   it says `OK` (once the node is a voter it says `already a voter` and `OK`); `status` shows the progress. Do not wipe
   the new node meanwhile, whatever a re-run says about its log (see the first branch).
@@ -252,8 +257,8 @@ adds [...] and removes [...]`). A call that changes more than one voter is refus
 keeps only the new half of a joint configuration and commits with it alone, so a change of several voters at once can
 lose committed entries if the leader changes in the middle (see "Replacing a node" and the residuals of "Removal and
 waiting outside" in the design document). A voter that becomes a listener, or the reverse, counts as one change;
-listeners, addresses and priorities count nothing. The change is sent as a compare-and-set against the configuration
-read: if another change commits first, `admin` reads it again and checks again. The leader refuses the same on its
+listeners, addresses and priorities count nothing toward that rule (addresses are checked on their own, below). The
+change is sent as a compare-and-set against the configuration read: if another change commits first, `admin` reads it again and checks again. The leader refuses the same on its
 own, at once (`FAILED: the leader refused: changes more than one voter ...`), also for an `admin` of an older version
 (which prints `FAILED: ... or the leader refused: refused: changes more than one voter ...`) or the Ratis tools, but
 only a leader of this version does: during a rolling upgrade a leader of an older version has no such check, and an
@@ -262,6 +267,25 @@ voter per call with every `admin` (see "Upgrades"). Several dead nodes are remov
 that succeeded prints `OK` again (for `add-peer`, `already a voter`). If the leader refuses for another reason that a
 new read of its configuration does not change (Ratis' own `changes a majority set`, say), `admin` fails at once with
 its message (`the leader n2 (term 7) refused, and its configuration did not change since: ...`).
+
+The new configuration is written from `--peer`: the address given there for every member that stays is the address
+the configuration records for it, which the nodes use once they restart and read it (a running leader keeps its
+connection to a member by id, so a wrong address shows only then). `add-peer` and `remove-peer` therefore refuse,
+with exit code 1 and before they propose anything, a `--peer` address of a member that stays that differs from its
+address in the leader's configuration: `FAILED: refused: --peer gives members that stay another address than the
+leader's configuration: n3 (at 10.0.0.3:9001 in the configuration, 10.0.0.3:9010 in --peer)`. Addresses are compared
+as written, so `localhost:9001` is not `127.0.0.1:9001`. Fix `--peer` to the addresses the refusal names as those of
+the configuration. To move a member to another address, replace it as in "Replacing a node" (the old node runs: a
+move): start a node under a new id at the new address, with an empty data directory and `--join`, `add-peer` it,
+then `remove-peer` the old id. The member that moves is the one added or removed, never one that stays. Keeping its
+id is possible only as for any removed node ("Removed node"): `remove-peer` it, stop it and take it out of its
+supervisor, wipe its data directory, start it at the new address with `--join` (its own `--peer` entry giving that
+address), then `add-peer` it with that address. Started again with its old data it exits 4 or waits outside the
+cluster, and `add-peer` refuses a node that has a log of its own; until the `add-peer` ends the cluster has one
+voter fewer. Only when the
+configuration itself holds a wrong address of a member that stays (written by an `admin` without this check, say),
+pass `--change-addresses` to an `add-peer` or `remove-peer` call whose `--peer` gives the right one: it prints
+`--change-addresses: this change also moves ...` and writes the `--peer` addresses.
 
 `admin` asks every `--peer` at once (a down member delays each round by one request timeout, not one each) and takes the configuration of the leader of the highest term; it waits while a member
 shows a later term than the leader that answered. A leader that has just been deposed answers as the leader for about
@@ -623,8 +647,8 @@ disk problem to look at.
 | Code | `run` | `admin` | `repair-log` | `export-seed`, `restore-backup` |
 |---|---|---|---|---|
 | 0 | Not on a stop by signal: see below | `OK` | The log is valid, or was (with `--dry-run`: could be) repaired | Done |
-| 1 | Did not start: a port in use, a refused data directory (another file system, a cluster's database without its Raft state, a pointless `--join`), a Raft log that Ratis cannot read (after a power loss: see "Node does not start after a power loss"; the output then names the `repair-log` command), any other failure of the start (an `Error` too, such as a class that does not load) | `FAILED: ...`: refused (a change of more than one voter included, or every member that answered refused `checksum`/`backup` for the cluster version it has applied: not every member supports it, the leader has not raised the version yet (retry in about 10 s), or they lag behind the leader, see "Upgrades"), a change failed, the replicas differ (`checksum`), a member failed (`backup`), a member's answer cannot be read (`<id>: cannot read its answer (...)`: a member of another version, asking again would not help) | Refused: see its output (also while the node runs: its `in_use.lock` is locked) | Failed: see the exception; `export-seed` also while the node runs (`Not exported: ... in_use.lock is locked: stop the node first.`, nothing touched) and when the replica's latest snapshot is damaged (`Not exported: ...`, nothing written; see "Replacing a node", `--without-damaged-snapshot`); `restore-backup` also for a data directory that is not empty (`FAILED: ...`: a `db/`, a Raft log, or a `db.restore-tmp`, `db.restore-ready` or `db.restore-old` it names; nothing touched, see "Restoring a backup") |
-| 2 | Wrong usage, or no `-XX:+ExitOnOutOfMemoryError`: also an unknown option, a word that is no option's value (a flag given a value, `--join false` or `--pipelined-updates false`, which turned the flag on before), a malformed value (a non-numeric number, an `--election-timeout-ms` that is not MIN:MAX, a `--peer` or `--group-id` that does not parse) or one the node's configuration refuses (`--parallel-apply-threads 1`, a node id not among the peers, a minimum election timeout not below the maximum) | Wrong usage: also an unknown option (a misspelled one), an option of another command (`--allow-skipped` without `checksum`, `--unsafe-multi-voter-change` without `add-peer` or `remove-peer`), a word the command does not take (`status now`), a malformed value (`--timeout-ms`, `--peer`, `--group-id`, the index of `backup-status`, the argument of `add-peer`, a member id with `=` for `remove-peer`, `transfer-leader` or `snapshot`) | Wrong usage: also an unknown option or a stray word (`--dry-run yes`), a `--group-id` that is not a UUID (any case is accepted, as by `run`) | Wrong usage: also an unknown option or a stray word; `export-seed` with a group (`--group-id`, or the default without it) that has no directory in a `raft/` holding other groups |
+| 1 | Did not start: a port in use, a refused data directory (another file system, a cluster's database without its Raft state, a pointless `--join`), a Raft log that Ratis cannot read (after a power loss: see "Node does not start after a power loss"; the output then names the `repair-log` command), any other failure of the start (an `Error` too, such as a class that does not load) | `FAILED: ...`: refused (a change of more than one voter included, a `--peer` address of a member that stays that differs from the leader's configuration without `--change-addresses`, or every member that answered refused `checksum`/`backup` for the cluster version it has applied: not every member supports it, the leader has not raised the version yet (retry in about 10 s), or they lag behind the leader, see "Upgrades"), a change failed, the replicas differ (`checksum`), a member failed (`backup`), a member's answer cannot be read (`<id>: cannot read its answer (...)`: a member of another version, asking again would not help) | Refused: see its output (also while the node runs: its `in_use.lock` is locked) | Failed: see the exception; `export-seed` also while the node runs (`Not exported: ... in_use.lock is locked: stop the node first.`, nothing touched) and when the replica's latest snapshot is damaged (`Not exported: ...`, nothing written; see "Replacing a node", `--without-damaged-snapshot`); `restore-backup` also for a data directory that is not empty (`FAILED: ...`: a `db/`, a Raft log, or a `db.restore-tmp`, `db.restore-ready` or `db.restore-old` it names; nothing touched, see "Restoring a backup") |
+| 2 | Wrong usage, or no `-XX:+ExitOnOutOfMemoryError`: also an unknown option, a word that is no option's value (a flag given a value, `--join false` or `--pipelined-updates false`, which turned the flag on before), a malformed value (a non-numeric number, an `--election-timeout-ms` that is not MIN:MAX, a `--peer` or `--group-id` that does not parse) or one the node's configuration refuses (`--parallel-apply-threads 1`, a node id not among the peers, a minimum election timeout not below the maximum) | Wrong usage: also an unknown option (a misspelled one), an option of another command (`--allow-skipped` without `checksum`, `--unsafe-multi-voter-change` or `--change-addresses` without `add-peer` or `remove-peer`), a word the command does not take (`status now`), a malformed value (`--timeout-ms`, `--peer`, `--group-id`, the index of `backup-status`, the argument of `add-peer`, a member id with `=` for `remove-peer`, `transfer-leader` or `snapshot`) | Wrong usage: also an unknown option or a stray word (`--dry-run yes`), a `--group-id` that is not a UUID (any case is accepted, as by `run`) | Wrong usage: also an unknown option or a stray word; `export-seed` with a group (`--group-id`, or the default without it) that has no directory in a `raft/` holding other groups |
 | 3 | The node stopped after a failure: its replica failed, Raft closed, a JVM pause beyond `--jvm-pause-limit-ms`, out of direct memory on a thread of replication; also a failure that raced a SIGTERM, and out of heap (the JVM's own status for `-XX:+ExitOnOutOfMemoryError`) | - | - | - |
 | 4 | Removed from the cluster, confirmed by a majority of the current configuration: refused at the start, or found out while it heard no leader. Do not start it again (see "Removed node"; until a majority answers, a removed node waits outside instead) | Incomplete: a member gave no result in time (`checksum`, `backup`, `backup-status`), no member took the request in time (`Nothing was proposed`), or a `checksum` answer that does not tell whether it was proposed (cut by the time limit, or a connection that broke after the member took it): run it again. A `backup` that a member took without answering in time (`may have been proposed`) may still be written: check it with `backup-status` (see "Backups") or use another name | - | - |
 | 5 | Its database, its log or a snapshot it installed has a cluster version with capabilities this version lacks: run the newer version | - | - | The replica's database (`export-seed`) or the backup (`restore-backup`) has a cluster version with capabilities this version lacks; nothing is written (`restore-backup` renames nothing, and deletes the database it built aside to read the version): run the newer version |

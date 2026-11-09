@@ -32,11 +32,17 @@ import org.junit.jupiter.api.io.TempDir;
  * attempt permits ({@link Proposer#ATTEMPT_BYTES_IN_FLIGHT}) are full, and a large write is refused, then smaller
  * ones. Each answer frees the bytes of one small write. The large write's resends reserve its bytes, so it is sent
  * before the small ones refused after it, instead of losing every freed slice of the lane to one of them.
+ *
+ * <p>R51-4: the node-wide write admission is set here ({@link #ADMISSION_BYTES}, room for the 13 writes held), not
+ * left to follow the default heap, under which some small writes were refused at once; and the test waits for the
+ * large write's reservation and for every write to be dispatched instead of sleeping.</p>
  */
 class ProposerPermitFairnessTest {
 
 	private static final int SMALL = 7 << 20;
 	private static final int LARGE = 12 << 20;
+	/** The node-wide write admission: well above the ~96 MiB of the writes held, whatever the heap (R51-4). */
+	private static final long ADMISSION_BYTES = 512L << 20;
 
 	@TempDir
 	Path temp;
@@ -44,9 +50,12 @@ class ProposerPermitFairnessTest {
 	private NodeMetrics metrics;
 	private NodeThreads threads;
 	private Proposer proposer;
+	private @org.jetbrains.annotations.Nullable String previousAdmission;
 
 	@BeforeEach
 	void setUp() {
+		previousAdmission = System.getProperty(Proposer.WRITE_ADMISSION_BYTES_PROPERTY);
+		System.setProperty(Proposer.WRITE_ADMISSION_BYTES_PROPERTY, Long.toString(ADMISSION_BYTES));
 		metrics = new NodeMetrics("n0");
 		threads = new NodeThreads("n0");
 		raft.leaderId = "n0";
@@ -58,6 +67,11 @@ class ProposerPermitFairnessTest {
 		var config = NodeConfig.defaults("n0", peers, temp).withRequestTimeout(Duration.ofSeconds(30));
 		proposer = new Proposer(group, RaftSettings.client(config), config, raft.serverSupplier(), metrics,
 				threads.control(), threads.submit());
+		if (previousAdmission == null) {
+			System.clearProperty(Proposer.WRITE_ADMISSION_BYTES_PROPERTY);
+		} else {
+			System.setProperty(Proposer.WRITE_ADMISSION_BYTES_PROPERTY, previousAdmission);
+		}
 	}
 
 	@AfterEach
@@ -104,13 +118,17 @@ class ProposerPermitFairnessTest {
 		}
 		InProcessCluster.await(Duration.ofSeconds(10), () -> held.size() == 4);
 		results.add(proposer.propose(put(100, LARGE)));
-		// Refused at least once (the lane holds 4 small writes), so it asks again every 50 ms.
-		Thread.sleep(200);
+		// Refused at least once (the lane holds 4 small writes), so it reserved its bytes and asks again every 50 ms.
+		InProcessCluster.await(Duration.ofSeconds(10), () -> proposer.dataLaneReservedBytes() > LARGE);
 		for (int i = 0; i < 8; i++) {
 			results.add(proposer.propose(put(10 + i, SMALL)));
 		}
-		Thread.sleep(200);
+		// Each small write is a batch of its own (two do not fit in one), dispatched and refused by the permits.
+		InProcessCluster.await(Duration.ofSeconds(10), () -> proposer.batchesInFlight() == 13);
 		assertEquals(4, sent.size(), "a write was sent without a permit");
+		assertTrue(results.stream().noneMatch(CompletableFuture::isDone), "a write ended before it was sent: the"
+				+ " node-wide admission refused it");
+		assertTrue(proposer.dataLaneReservedBytes() > LARGE, "the large write no longer holds the reservation");
 
 		boolean largeSent = false;
 		for (int round = 0; round < 12 && !largeSent; round++) {

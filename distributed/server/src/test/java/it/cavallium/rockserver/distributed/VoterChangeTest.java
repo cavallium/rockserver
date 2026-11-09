@@ -82,4 +82,21 @@ class VoterChangeTest {
 		assertTrue(message.contains("remove-peer 2") && message.contains("add-peer 4"), message);
 		assertTrue(message.contains("Replacing a node"), message);
 	}
+
+	/**
+	 * R51-1: the address of a member that stays, in the new voters, against its address in the configuration now. A
+	 * member added or removed is no address change (its id is what changes), and nor are listeners.
+	 */
+	@Test
+	void anAddressChangeOfAStayingMemberIsNamed() {
+		var current = peers("1", "2", "3");
+		var moved = RaftPeer.newBuilder(peer("2")).setAddress("10.9.9.9:1").build();
+		var changes = VoterChange.addressChanges(current, List.of(peer("1"), moved, peer("4")));
+		assertEquals(List.of("2 (at " + peer("2").getAddress() + " in the configuration, 10.9.9.9:1 in --peer)"),
+				changes);
+		assertEquals(List.of(), VoterChange.addressChanges(current, peers("1", "3", "4")));
+		assertEquals(List.of(), VoterChange.addressChanges(current, peers("3", "1", "2")));
+		var prioritized = RaftPeer.newBuilder(peer("3")).setPriority(5).build();
+		assertEquals(List.of(), VoterChange.addressChanges(current, List.of(peer("1"), peer("2"), prioritized)));
+	}
 }

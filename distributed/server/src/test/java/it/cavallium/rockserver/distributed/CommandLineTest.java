@@ -261,6 +261,59 @@ class CommandLineTest {
 	}
 
 	/**
+	 * R51-1: {@code add-peer} and {@code remove-peer} write the {@code --peer} address of every member that stays into the
+	 * new configuration. One that differs from the member's address in the leader's configuration (a mistyped port) is
+	 * refused with exit code 1 before anything is proposed, naming the member and both addresses; the configuration
+	 * keeps the old address. With {@code --change-addresses} the same call goes through and writes the new address (here
+	 * another spelling of the same host, which the running nodes keep reaching).
+	 */
+	@Test
+	void adminRefusesAStayingMembersAddressThatDiffersFromTheConfiguration() throws Exception {
+		cluster = new InProcessCluster(Files.createDirectories(temp.resolve("addresses")), 3, c -> c).startAll();
+		cluster.awaitLeader(TIMEOUT);
+		var lost = cluster.anyFollower().config().nodeId();
+		var survivors = new ArrayList<>(List.of("n0", "n1", "n2"));
+		survivors.remove(lost);
+		cluster.stop(lost);
+		var staying = survivors.getLast();
+		var self = cluster.config(staying).self();
+		var mistyped = new PeerConfig(staying, self.raftHost(), self.raftPort() + 1, self.apiHost(), self.apiPort());
+
+		var refused = run(adminWith(List.of("n0", "n1", "n2"), staying, mistyped, "remove-peer", lost));
+		assertEquals(1, refused.code(), refused.toString());
+		assertTrue(refused.out().contains("FAILED"), refused.out());
+		assertTrue(refused.out().contains(staying + " (at " + self.raftAddress() + " in the configuration, "
+				+ mistyped.raftAddress() + " in --peer)"), refused.out());
+		assertTrue(refused.out().contains("--change-addresses"), refused.out());
+		assertVoters(List.of("n0", "n1", "n2"));
+		assertEquals(self.raftAddress(), voterAddress(staying));
+
+		var respelled = new PeerConfig(staying, "localhost", self.raftPort(), self.apiHost(), self.apiPort());
+		var changed = run(with(List.of(adminWith(List.of("n0", "n1", "n2"), staying, respelled, "remove-peer", lost)),
+				"--change-addresses"));
+		assertEquals(0, changed.code(), changed.toString());
+		assertTrue(changed.out().strip().endsWith("OK"), changed.out());
+		assertVoters(survivors);
+		assertEquals(respelled.raftAddress(), voterAddress(staying));
+
+		var misplaced = run(with(List.of(admin(survivors, "status")), "--change-addresses"));
+		assertEquals(2, misplaced.code(), misplaced.toString());
+	}
+
+	/** {@link #admin} with member {@code replaced} given as {@code peer} instead of its own address. */
+	private String[] adminWith(List<String> peerIds, String replaced, PeerConfig peer, String... command) {
+		var args = new ArrayList<>(List.of(admin(peerIds, command)));
+		args.set(args.indexOf(cluster.config(replaced).self().format()), peer.format());
+		return args.toArray(String[]::new);
+	}
+
+	/** The address of voter {@code id} in the leader's configuration. */
+	private String voterAddress(String id) {
+		return leader().stateMachine().division().getRaftConf().getCurrentPeers().stream()
+				.filter(peer -> peer.getId().toString().equals(id)).findFirst().orElseThrow().getAddress();
+	}
+
+	/**
 	 * Review of round 14: a refusal by Ratis itself that no re-read can change ({@code changes a majority set}: two of
 	 * three voters replaced, which Ratis refuses whatever the flag) fails at once with Ratis' message, instead of
 	 * reading the configuration again until the time limit.
