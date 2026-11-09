@@ -760,7 +760,8 @@ public final class ReplicatedServerMain {
 	 * answer of a non-idempotent one leaves open whether it was proposed: nothing was compared or written for sure, and
 	 * the command can be run again. An idempotent one ({@code backup}) that a member took (it answered the capabilities
 	 * question, and its call then ended with a status other than {@link #notProposed}: cut by the time limit or by
-	 * {@link #proposalWait}, CANCELLED, UNKNOWN, INTERNAL) and that no member then answered with its log index in time
+	 * {@link #proposalWait}, CANCELLED, UNKNOWN, INTERNAL; a proposer's not-applied refusal is UNAVAILABLE, see
+	 * {@link ReplicaOps#notAppliedAsStatus}) and that no member then answered with its log index in time
 	 * ends with {@link #EXIT_INCOMPLETE} too, but names those members and says that it may have been proposed and may
 	 * still be applied, followed by {@code ifTaken} (R39-1): a slow leader may have appended it, and a rerun has a new
 	 * request id, so a {@code backup} run again under the same name is refused once the first one is written.

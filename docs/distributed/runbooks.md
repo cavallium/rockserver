@@ -236,7 +236,8 @@ It prints the log index of the backup and, for each node, `DONE` and the directo
 why it failed (disk full, a backup of that name exists), and `OK` only if every node of `$PEERS` wrote it. It exits
 with 1 if a node failed, and with 4 if a node gave no result within `--timeout-ms` (down, or slow): then ask again
 later with `rs admin $PEERS backup-status 2026-11-06 <index it printed>`, which proposes nothing. It also exits with 4
-when no node gave the log index in time. If it says `Nothing was proposed`, no node took the request: run it again.
+when no node gave the log index in time. If it says `Nothing was proposed`, no node took the request (or each one that did refused it as not applied, such
+as when no leader accepted it in time): run it again.
 If it says a node `took the request ... it may have been proposed`, the backup may still be written (a slow leader
 appended it): do not run it again under the same name, which is refused (`A backup named 2026-11-06 exists already`,
 exit 1) once the first one is written. Look on the nodes for `<data-dir>/backups/2026-11-06/backup.properties` with

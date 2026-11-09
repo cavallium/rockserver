@@ -73,7 +73,8 @@ class ProposerQueueTest {
 			var cause = assertInstanceOf(RocksDBException.class, error.getCause());
 			assertEquals(RocksDBErrorType.READ_DEADLINE_EXCEEDED, cause.getErrorUniqueId());
 			// Its body is gone; its overhead stays counted while it is still in the queue. Polled, as the other
-			// admission checks are (R39-2): an answer is not promised to come after the bytes went back.
+			// admission checks are (R39-2): only an answer that comes from the request's result is promised to come
+			// after the bytes went back, and a caller that gives up itself (cancel, orTimeout) is answered directly.
 			long expected = Proposer.MAX_BATCHES_IN_FLIGHT * weight + Proposer.REQUEST_OVERHEAD_BYTES;
 			long released = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
 			while (proposer.admittedBytes() != expected && System.nanoTime() < released) {
