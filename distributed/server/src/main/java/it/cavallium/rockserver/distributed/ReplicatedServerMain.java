@@ -189,6 +189,11 @@ public final class ReplicatedServerMain {
 	private static final long SEED_SNAPSHOT_POLL_MS = 200;
 	/** The {@code admin} flag that skips the check of one voter per change, here and on the leader. */
 	static final String UNSAFE_MULTI_VOTER_CHANGE = "--unsafe-multi-voter-change";
+	/**
+	 * R51-1: lets {@code add-peer} and {@code remove-peer} write a {@code --peer} address of a member that stays that
+	 * differs from its address in the leader's configuration; without it such a call is refused before it proposes.
+	 */
+	static final String CHANGE_ADDRESSES = "--change-addresses";
 
 	private ReplicatedServerMain() {}
 
@@ -667,6 +672,7 @@ public final class ReplicatedServerMain {
 		var groupId = RaftGroupId.valueOf(options.uuid("--group-id", NodeConfig.DEFAULT_GROUP_ID));
 		var timeout = Duration.ofMillis(options.longValue("--timeout-ms", DEFAULT_ADMIN_TIMEOUT.toMillis()));
 		boolean unsafe = options.flag(UNSAFE_MULTI_VOTER_CHANGE);
+		boolean changeAddresses = options.flag(CHANGE_ADDRESSES);
 		boolean allowSkipped = options.flag("--allow-skipped");
 		// A misspelled option would otherwise be ignored, with the word after it (R28-3). The words are the command,
 		// whose count each command checks (R29-4).
@@ -680,6 +686,9 @@ public final class ReplicatedServerMain {
 		}
 		if (unsafe && !List.of("add-peer", "remove-peer").contains(command.getFirst())) {
 			usage(UNSAFE_MULTI_VOTER_CHANGE + " is an option of add-peer and remove-peer only");
+		}
+		if (changeAddresses && !List.of("add-peer", "remove-peer").contains(command.getFirst())) {
+			usage(CHANGE_ADDRESSES + " is an option of add-peer and remove-peer only");
 		}
 		long deadline = System.nanoTime() + timeout.toNanos();
 		var group = RaftGroup.valueOf(groupId, peers.stream().map(ReplicatedServerMain::raftPeer).toList());
@@ -714,14 +723,14 @@ public final class ReplicatedServerMain {
 					var members = new ArrayList<>(peers.stream().map(ReplicatedServerMain::raftPeer).toList());
 					members.removeIf(p -> p.getId().toString().equals(added.id()));
 					members.add(raftPeer(added));
-					yield changeVoters(client, peers, groupId, members, unsafe, timeout, deadline);
+					yield changeVoters(client, peers, groupId, members, unsafe, changeAddresses, timeout, deadline);
 				}
 				case "remove-peer" -> {
 					var removed = peerId(command);
 					yield changeVoters(client, peers, groupId, peers.stream()
 							.filter(p -> !p.id().equals(removed))
 							.map(ReplicatedServerMain::raftPeer)
-							.toList(), unsafe, timeout, deadline);
+							.toList(), unsafe, changeAddresses, timeout, deadline);
 				}
 				case "snapshot" -> {
 					var api = client.getSnapshotManagementApi(RaftPeerId.valueOf(peerId(command)));
@@ -1130,11 +1139,15 @@ public final class ReplicatedServerMain {
 	 * Proposes the configuration with voters {@code target} (and the listeners of the leader's configuration) as a
 	 * compare-and-set against the leader's configuration, which it reads first. Without {@code unsafe} it fails, before
 	 * anything is proposed, if more than one voter would change ({@link VoterChange}); the leader's
-	 * {@link MembershipGuard} checks it again. If another change commits meanwhile (the compare-and-set fails), it reads
+	 * {@link MembershipGuard} checks it again. Without {@code changeAddresses} it also fails, before anything is
+	 * proposed, if a member that stays has another address in {@code target} than in the leader's configuration (R51-1,
+	 * {@link VoterChange#addressChanges}): {@code target} is written as it is, so a mistyped {@code --peer} address
+	 * would show only after the nodes restart. If another change commits meanwhile (the compare-and-set fails), it reads
 	 * the configuration again and checks again, until the deadline.
 	 */
 	private static RaftClientReply changeVoters(RaftClient client, List<PeerConfig> peers, RaftGroupId groupId,
-			List<RaftPeer> target, boolean unsafe, Duration timeout, long deadlineNanos) throws InterruptedException {
+			List<RaftPeer> target, boolean unsafe, boolean changeAddresses, Duration timeout, long deadlineNanos)
+			throws InterruptedException {
 		try (var infoClient = infoClient(peers, groupId)) {
 			Membership refusedOn = null;
 			String refusalMessage = null;
@@ -1149,6 +1162,18 @@ public final class ReplicatedServerMain {
 				System.out.println("leader " + current.leader() + ": voters " + VoterChange.ids(current.servers())
 						+ (current.listeners().isEmpty() ? "" : ", listeners " + VoterChange.ids(current.listeners()))
 						+ "; this change adds " + change.added() + " and removes " + change.removed());
+				var moved = VoterChange.addressChanges(current.servers(), target);
+				if (!moved.isEmpty()) {
+					if (!changeAddresses) {
+						fail("refused: --peer gives members that stay another address than the leader's configuration: "
+								+ String.join(", ", moved) + ". The change writes the --peer address of every member that"
+								+ " stays into the configuration, which the nodes use once they restart. Fix --peer to the"
+								+ " addresses of the configuration; to move a member, remove-peer it and add-peer it at its new"
+								+ " address, or pass " + CHANGE_ADDRESSES + " to write the --peer addresses. Nothing was"
+								+ " proposed. See \"Replacing a node\" in docs/distributed/runbooks.md");
+					}
+					System.out.println(CHANGE_ADDRESSES + ": this change also moves " + String.join(", ", moved));
+				}
 				if (!change.safe()) {
 					if (!unsafe) {
 						fail(VoterChange.refusal(change, current.servers()));
@@ -1736,6 +1761,7 @@ public final class ReplicatedServerMain {
 				        [--jvm-pause-limit-ms N] [--snapshot-every-bytes N] [--parallel-apply-threads N]
 				        [--allow-without-exit-on-oom]
 				  admin --peer ... [--group-id UUID] [--timeout-ms N] [--unsafe-multi-voter-change]
+				        [--change-addresses]
 				        status | transfer-leader ID | add-peer ID=... | remove-peer ID | snapshot ID
 				        | checksum [--allow-skipped] | backup NAME | backup-status NAME INDEX
 				  repair-log --data-dir DIR [--group-id UUID] [--dry-run]
@@ -1748,7 +1774,7 @@ public final class ReplicatedServerMain {
 	/** Minimal "--name value" parser; {@code --peer} may repeat, and a {@link #FLAGS flag} takes no value. */
 	private static final class Options {
 		private static final List<String> FLAGS = List.of("--pipelined-updates", "--join", "--dry-run",
-				"--allow-without-exit-on-oom", "--allow-skipped", UNSAFE_MULTI_VOTER_CHANGE,
+				"--allow-without-exit-on-oom", "--allow-skipped", UNSAFE_MULTI_VOTER_CHANGE, CHANGE_ADDRESSES,
 				"--without-damaged-snapshot");
 
 		private final List<String[]> pairs = new ArrayList<>();

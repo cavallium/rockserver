@@ -1,7 +1,9 @@
 package it.cavallium.rockserver.distributed;
 
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.List;
 import java.util.SortedSet;
 import java.util.TreeSet;
 import org.apache.ratis.protocol.RaftPeer;
@@ -69,8 +71,24 @@ record VoterChange(SortedSet<String> added, SortedSet<String> removed) {
 				+ " is done one voter per command. See \"Replacing a node\" in docs/distributed/runbooks.md";
 	}
 
-	/** R51-1, stub of the red test: no address change is seen yet. */
-	static java.util.List<String> addressChanges(Collection<RaftPeer> currentServers, Collection<RaftPeer> newServers) {
-		return java.util.List.of();
+	/**
+	 * R51-1: the members of {@code newServers} that are voters in {@code currentServers} too, at another address, each as
+	 * {@code id (at OLD in the configuration, NEW in --peer)}, in the order of {@code newServers}. Ratis writes the
+	 * address of every server of the new configuration as given, and a running leader keeps its connection to a member
+	 * by id, so a mistyped address of a member that stays shows only once the nodes restart and read the configuration
+	 * from their log. Addresses are compared as written: another spelling of the same host is a change too.
+	 */
+	static List<String> addressChanges(Collection<RaftPeer> currentServers, Collection<RaftPeer> newServers) {
+		var changes = new ArrayList<String>();
+		for (var target : newServers) {
+			for (var current : currentServers) {
+				if (current.getId().equals(target.getId())
+						&& !String.valueOf(current.getAddress()).equals(String.valueOf(target.getAddress()))) {
+					changes.add(target.getId() + " (at " + current.getAddress() + " in the configuration, "
+							+ target.getAddress() + " in --peer)");
+				}
+			}
+		}
+		return changes;
 	}
 }
