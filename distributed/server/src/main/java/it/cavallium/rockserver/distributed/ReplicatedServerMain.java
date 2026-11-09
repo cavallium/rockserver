@@ -231,7 +231,7 @@ public final class ReplicatedServerMain {
 
 	private static void run(Options options) throws IOException, InterruptedException {
 		// Before anything makes a temporary file: the JDK reads the property once.
-		useNodeTemporaryDirectory(Path.of(options.required("--data-dir")));
+		useNodeTemporaryDirectory(dataDirectory(options));
 		// A malformed value, or one the configuration refuses, is wrong usage, like an unknown option (R28 review 3).
 		var electionTimeout = options.value("--election-timeout-ms", "1000:2000").split(":", -1);
 		if (electionTimeout.length != 2) {
@@ -241,7 +241,7 @@ public final class ReplicatedServerMain {
 		try {
 			config = new NodeConfig(options.required("--node-id"),
 					options.peers(),
-					Path.of(options.required("--data-dir")),
+					dataDirectory(options),
 					options.value("--rockserver-config") != null ? Path.of(options.value("--rockserver-config")) : null,
 					options.value("--raft-bind-host"),
 					options.value("--api-bind-host"),
@@ -533,10 +533,20 @@ public final class ReplicatedServerMain {
 		}
 	}
 
+	/**
+	 * {@code --data-dir}, absolute and normalized, in the one form every command uses for every step (R34 review 2,
+	 * R35-1): the form {@link NodeStore#open} uses for {@code db/}. The OS resolves {@code /x/link/..} to the parent of
+	 * the link's target instead, so a raw path would put {@code raft/}, a restored backup or a repaired log in a
+	 * different directory than the database the node opens.
+	 */
+	private static Path dataDirectory(Options options) {
+		return Path.of(options.required("--data-dir")).toAbsolutePath().normalize();
+	}
+
 	private static void exportSeed(Options options) throws IOException {
 		// Normalized as NodeStore.exportSeed and open() take it, so the group directory checked here is the one the
 		// export locks and reads (R34 review 2).
-		var dataDir = Path.of(options.required("--data-dir")).toAbsolutePath().normalize();
+		var dataDir = dataDirectory(options);
 		var target = Path.of(options.required("--target"));
 		var rockserverConfig = options.value("--rockserver-config") != null
 				? Path.of(options.value("--rockserver-config")) : null;
@@ -1563,7 +1573,7 @@ public final class ReplicatedServerMain {
 	}
 
 	private static void repairLog(Options options) throws IOException {
-		var dataDir = Path.of(options.required("--data-dir"));
+		var dataDir = dataDirectory(options);
 		var groupId = options.value("--group-id", NodeConfig.DEFAULT_GROUP_ID);
 		var dryRun = options.flag("--dry-run");
 		options.requireConsumed();
@@ -1576,7 +1586,7 @@ public final class ReplicatedServerMain {
 
 	private static void restoreBackup(Options options) throws IOException {
 		var backup = Path.of(options.required("--backup"));
-		var dataDir = Path.of(options.required("--data-dir"));
+		var dataDir = dataDirectory(options);
 		var rockserverConfig = options.value("--rockserver-config") != null
 				? Path.of(options.value("--rockserver-config")) : null;
 		options.requireConsumed();

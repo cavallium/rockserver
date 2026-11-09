@@ -12,7 +12,8 @@ import org.jetbrains.annotations.Nullable;
  * @param nodeId id of this node, must appear in {@code peers}
  * @param peers initial voting members, identical on every node
  * @param dataDir node data directory: {@code dataDir/db} holds the RocksDB database, {@code dataDir/raft} the Raft log
- *                and snapshots. Both must be on the same filesystem (checkpoints use hard links)
+ *                and snapshots. Both must be on the same filesystem (checkpoints use hard links). Kept absolute and
+ *                normalized ({@code /x/link/..} is {@code /x}), the form {@link NodeStore#open} uses for the database
  * @param rockserverConfig Rockserver database config file, identical on every node; null for defaults
  * @param raftBindHost host the Raft server binds to; null binds all interfaces
  * @param apiBindHost host the Rockserver API binds to; null uses this node's {@link PeerConfig#apiHost()}
@@ -73,7 +74,9 @@ public record NodeConfig(String nodeId,
 	public NodeConfig {
 		Objects.requireNonNull(nodeId, "nodeId");
 		peers = List.copyOf(peers);
-		Objects.requireNonNull(dataDir, "dataDir");
+		// One form for the database and for Ratis' raft/: the normalized one, which NodeStore.open uses for db/. The OS
+		// would resolve /x/link/.. to the parent of the link's target, and the two would part (R35-1).
+		dataDir = Objects.requireNonNull(dataDir, "dataDir").toAbsolutePath().normalize();
 		Objects.requireNonNull(groupId, "groupId");
 		if (peers.stream().noneMatch(p -> p.id().equals(nodeId))) {
 			throw new IllegalArgumentException("Node " + nodeId + " is not in the peer list");
