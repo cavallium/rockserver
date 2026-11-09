@@ -292,6 +292,47 @@ class StartupChecksTest {
 	}
 
 	/**
+	 * Review of R43, 1: two first starts killed in a row inside the start-up check's open. The first was killed during
+	 * its WAL replay, after it wrote a recovery table file but before it committed it to the MANIFEST (RocksDB applies
+	 * the recovery edits at the end of recovery): here a stray table file numbered above any the MANIFEST knows. The
+	 * second open deletes it as obsolete (or would write the same number again). The marker of the second start must
+	 * list the seed's files, carried over from the first marker, not that stray file: the third start keeps the digest.
+	 */
+	@Test
+	void twoKilledChecksInARowKeepTheSeedDigestDespiteAnUncommittedTableFile() throws IOException {
+		var seed = tempDir.resolve("seed");
+		try (var store = NodeStore.open(seed, null, "seed")) {
+			long column = store.db().createColumn(NodeStoreTest.DATA_COLUMN, NodeStoreTest.DATA_SCHEMA);
+			for (int i = 0; i < 100; i++) {
+				NodeStoreTest.put(store, column, i, "v" + i);
+			}
+		}
+		var node = tempDir.resolve("node/db");
+		copy(seed, node);
+		var digest = NodeStore.recordSeedDigest(node);
+		NodeStore.noteSeedOpening(node);
+		var marker = Files.readString(node.resolveSibling("db.seed-digest"));
+
+		// The first check, killed during its WAL replay: a recovery table file the MANIFEST does not reference yet.
+		var stray = node.resolve("999999.sst");
+		Files.copy(largestFile(node, ".sst"), stray);
+		assertEquals(digest, NodeStore.recordSeedDigest(node), "the first killed check");
+
+		// The second check: its marker lists the seed's files, then its open deletes the stray file, and it is killed.
+		NodeStore.noteSeedOpening(node);
+		startupCheckOpen(node);
+		assertFalse(Files.exists(stray), "the open deleted the uncommitted table file");
+		assertEquals(digest, NodeStore.recordSeedDigest(node), "the second killed check");
+		assertEquals(marker, Files.readString(node.resolveSibling("db.seed-digest")),
+				"the marker of a kept digest is carried over");
+
+		// A third one, killed again, still keeps it.
+		NodeStore.noteSeedOpening(node);
+		startupCheckOpen(node);
+		assertEquals(digest, NodeStore.recordSeedDigest(node), "the third killed check");
+	}
+
+	/**
 	 * Like {@code rsync -a --delete source/ target/}: a file whose size and modification time are those of the source's
 	 * is skipped (not touched); any other is copied to a new file, with the source's modification time, and renamed over
 	 * the old one; what the source does not hold is deleted.
