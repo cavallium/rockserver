@@ -639,21 +639,20 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 	 * {@code .before-restore-<time>}, and fsyncs {@code dataDir} so that the renames survive a power loss (R35-2). Their
 	 * results, by log index and by name, would otherwise answer for the new cluster, whose log starts again from 1. A
 	 * failure to move {@code backups/} after {@code replica-ops.log} leaves the latter moved: a rerun moves the rest.
+	 * The fsync is unconditional (R35 review 2): a rerun after a kill between a rename and its fsync finds nothing to
+	 * move, and still makes the renames it inherits durable before the database is restored, by its own fsync rather
+	 * than by {@link NodeStore#restore}'s later one.
 	 */
 	private static void moveOldResultsAside(Path dataDir) throws IOException {
 		String suffix = ".before-restore-" + System.currentTimeMillis();
-		boolean moved = false;
 		for (Path old : List.of(dataDir.resolve(RESULTS_FILE), dataDir.resolve(BACKUPS_DIR))) {
 			if (Files.exists(old, LinkOption.NOFOLLOW_LINKS)) {
 				Path aside = old.resolveSibling(old.getFileName() + suffix);
 				Files.move(old, aside);
-				moved = true;
 				LOG.info("Moved {} of the old cluster to {}", old, aside);
 			}
 		}
-		if (moved) {
-			NodeStore.syncDirectory(dataDir);
-		}
+		NodeStore.syncDirectory(dataDir);
 	}
 
 	/**
