@@ -262,6 +262,11 @@ final class Proposer implements Closeable {
 		return admission;
 	}
 
+	/** Bytes the attempt permits of the lane of data writes reserve now (R50-1), for tests. */
+	long dataLaneReservedBytes() {
+		return anyLeader.permits.reservedBytes();
+	}
+
 	/** Batches in flight in both lanes now, for tests. */
 	int batchesInFlight() {
 		int count = 0;

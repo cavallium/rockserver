@@ -126,6 +126,12 @@ final class ByteAdmission {
 		assert after >= 0 : "released more than acquired";
 	}
 
+	/** Bytes the reservation keeps now, 0 if none is held (it may have lapsed): for tests. */
+	long reservedBytes() {
+		var reserved = reservation.get();
+		return reserved == null ? 0 : reserved.bytes;
+	}
+
 	long used() {
 		return used.get();
 	}
