@@ -1,6 +1,7 @@
 package it.cavallium.rockserver.core.client;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -432,6 +433,75 @@ class LeaderHintRouterTest {
 		assertEquals(List.of(Status.OK), closes);
 	}
 
+	/**
+	 * R46-1: {@code route().newCall} hands out a call on the leader's channel, and the caller starts it a moment later.
+	 * In between, a response that names a new leader ({@code offer}) or a call that fails on that channel ({@code drop})
+	 * shut the channel down: the call, started on a channel already shut down, failed {@code UNAVAILABLE} ("Channel
+	 * shutdown invoked") without being sent, and a write is not replayed, so it ended with an unknown outcome at each
+	 * leader change although nothing was sent. A call handed out before the change must be sent, once, and the old
+	 * channel shut down once no call handed to it is waiting to start.
+	 */
+	@Test
+	void aCallHandedOutBeforeTheLeaderChangesIsSentOnceItStarts() {
+		var router = router(LeaderHintRouter.Mode.LISTED);
+		var routed = router.route(main);
+		router.offer("node-b:5333");
+		var leader = opened.getFirst();
+		leader.state = ConnectivityState.READY;
+
+		// A response names a new leader between newCall and start.
+		var closes = new ArrayList<Status>();
+		var write = routed.newCall(method("put"), CallOptions.DEFAULT);
+		router.offer("node-c:5333");
+		int mainCalls = main.calls;
+		startUnary(write, closes);
+		assertTrue(closes.isEmpty(), "the write failed unsent: " + closes);
+		assertEquals(mainCalls + 1, main.calls, "the write went to the ordinary channel");
+		assertEquals(List.of("start", "request 1", "message", "halfClose"), main.lastCall.events);
+		assertTrue(leader.shutdown, "the old leader's channel is shut down once the call started");
+
+		// Another call fails on the leader's channel (drop) between newCall and start.
+		var newLeader = opened.getLast();
+		newLeader.state = ConnectivityState.READY;
+		var failing = routed.newCall(method("put"), CallOptions.DEFAULT);
+		var failingCloses = new ArrayList<Status>();
+		startUnary(failing, failingCloses);
+		var write2 = routed.newCall(method("put"), CallOptions.DEFAULT);
+		var closes2 = new ArrayList<Status>();
+		newLeader.lastListener.onClose(Status.UNAVAILABLE, new Metadata());
+		assertEquals(List.of(Status.Code.UNAVAILABLE), failingCloses.stream().map(Status::getCode).toList());
+		assertNull(router.currentAddress());
+		mainCalls = main.calls;
+		startUnary(write2, closes2);
+		assertTrue(closes2.isEmpty(), "the write failed unsent: " + closes2);
+		assertEquals(mainCalls + 1, main.calls, "the write went to the ordinary channel");
+		assertTrue(newLeader.shutdown, "the dropped channel is shut down once the call started");
+
+		// A call handed out and cancelled before its start does not keep the old channel open.
+		now.addAndGet(LeaderHintRouter.FAILED_HINT_BACKOFF_NANOS + 1);
+		router.offer("node-a:5333");
+		var third = opened.getLast();
+		third.state = ConnectivityState.READY;
+		var abandoned = routed.newCall(method("put"), CallOptions.DEFAULT);
+		router.offer("node-b:5333");
+		assertFalse(third.shutdown);
+		abandoned.cancel("caller gave up", null);
+		assertTrue(third.shutdown, "the old channel is shut down once the call handed to it was cancelled");
+	}
+
+	/** Starts a unary call as grpc's {@code futureUnaryCall} does, collecting how it closes. */
+	private static void startUnary(ClientCall<byte[], byte[]> call, List<Status> closes) {
+		call.start(new ClientCall.Listener<>() {
+			@Override
+			public void onClose(Status status, Metadata trailers) {
+				closes.add(status);
+			}
+		}, new Metadata());
+		call.request(1);
+		call.sendMessage(new byte[] {1});
+		call.halfClose();
+	}
+
 	@Test
 	void failedChannelIsDroppedWhenACallLooksForIt() {
 		var router = router(LeaderHintRouter.Mode.LISTED);
@@ -537,6 +607,8 @@ class LeaderHintRouterTest {
 			volatile int messages;
 			volatile boolean halfClosed;
 			private volatile boolean started;
+			/** Started on a channel already shut down. */
+			private volatile boolean failed;
 
 			@Override
 			public void start(Listener<R> listener, Metadata headers) {
@@ -545,12 +617,22 @@ class LeaderHintRouterTest {
 				}
 				started = true;
 				lastListener = listener;
+				if (shutdown) {
+					// As grpc's ManagedChannelImpl: a call started after shutdown() fails at once, and is never sent.
+					failed = true;
+					events.add("failed unsent");
+					listener.onClose(Status.UNAVAILABLE.withDescription("Channel shutdown invoked"), new Metadata());
+					return;
+				}
 				events.add("start");
 			}
 
 			@Override
 			public void request(int numMessages) {
 				checkState(started, "Not started");
+				if (failed) {
+					return;
+				}
 				requested.add(numMessages);
 				events.add("request " + numMessages);
 			}
@@ -562,6 +644,9 @@ class LeaderHintRouterTest {
 			public void halfClose() {
 				checkState(started, "Not started");
 				checkState(!halfClosed, "call already half-closed");
+				if (failed) {
+					return;
+				}
 				halfClosed = true;
 				events.add("halfClose");
 			}
@@ -570,6 +655,9 @@ class LeaderHintRouterTest {
 			public void sendMessage(Q message) {
 				checkState(started, "Not started");
 				checkState(!halfClosed, "call was half-closed");
+				if (failed) {
+					return;
+				}
 				messages++;
 				events.add("message");
 			}

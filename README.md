@@ -1,7 +1,8 @@
 # Rockserver
 
 Requires Java 27. Start it with `--enable-native-access=ALL-UNNAMED --add-modules jdk.incubator.vector`: the
-second flag lets hot paths use the Vector API (without it they fall back to scalar code).
+first lets RocksDB's native library load without the JDK's warning; the second makes the incubating Vector API
+available, which Rockserver's own code of this version does not use (it runs the same without it).
 
 ## Workload admission
 

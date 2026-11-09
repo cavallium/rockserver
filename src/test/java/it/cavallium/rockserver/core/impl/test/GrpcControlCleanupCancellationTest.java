@@ -473,6 +473,41 @@ class GrpcControlCleanupCancellationTest {
 		assertEquals(RequestContext.batch(), backend.cleanupContext.get());
 	}
 
+	/**
+	 * R46-4: with client sessions on (the default against a replicated server, which offers them), a getForUpdate that
+	 * opens an update goes through a future derived from the gRPC call's future, so that the client remembers the update
+	 * it opened. Cancelling that future did not cancel the call: no RST_STREAM, the server answered as if the caller
+	 * still waited, and the update it opened held its key until the update lease or the call's deadline, instead of
+	 * being released at once (design.md, "Single-key updates queue"). Same scenario as
+	 * {@link #cancelledRunningNewForUpdateClosesItsLateAllocationExactlyOnce}, against a server that offers sessions.
+	 */
+	@Test
+	void cancelledForUpdateWithClientSessionsReachesTheServerAndReleasesTheKey() throws Exception {
+		var backend = new BlockingForUpdateConnection(embeddedConnection, true);
+		var cancelled = new CountDownLatch(1);
+		var client = observedClient(backend, cancelled);
+		var sessionWrites = GrpcConnection.class.getDeclaredField("sessionWrites");
+		sessionWrites.setAccessible(true);
+		assertNotNull(sessionWrites.get(client), "client sessions are on");
+		long column = newForUpdateColumn();
+		try {
+			var request = client.getAsyncApi(RequestContext.ingest()).getAsync(0, column, key(1), RequestType.forUpdate());
+			assertTrue(backend.allocated.await(5, TimeUnit.SECONDS));
+			assertEquals(1, embeddedConnection.getInternalDB().getOpenTransactionsCount());
+			assertTrue(request.cancel(true));
+			assertTrue(cancelled.await(5, TimeUnit.SECONDS), "the cancel of the caller did not reach the server");
+		} finally {
+			backend.release.countDown();
+		}
+		awaitCondition(() -> embeddedConnection.getInternalDB().getOpenTransactionsCount() == 0
+				&& embeddedConnection.getInternalDB().getPendingOpsCount() == 0L,
+				"the cancelled update still holds its key");
+		assertEquals(1, backend.cleanups.get());
+		// The key is free for the next updater at once.
+		var next = embeddedConnection.getSyncApi(RequestContext.ingest()).get(0, column, key(1), RequestType.forUpdate());
+		embeddedConnection.getSyncApi(RequestContext.ingest()).closeFailedUpdate(next.updateId());
+	}
+
 	@ParameterizedTest
 	@ValueSource(booleans = {false, true})
 	void cancelledRunningForUpdatePreservesExistingOwner(boolean explicitTransaction) throws Exception {
@@ -587,8 +622,16 @@ class GrpcControlCleanupCancellationTest {
 		private final AtomicInteger cleanups = new AtomicInteger();
 		private final AtomicReference<RequestContext> cleanupContext = new AtomicReference<>();
 
+		/** Offers client sessions, as a replicated server does (R46-4). */
+		private final boolean clientSessions;
+
 		private BlockingForUpdateConnection(EmbeddedConnection delegate) {
+			this(delegate, false);
+		}
+
+		private BlockingForUpdateConnection(EmbeddedConnection delegate, boolean clientSessions) {
 			this.delegate = delegate;
+			this.clientSessions = clientSessions;
 		}
 
 		@Override
@@ -598,7 +641,8 @@ class GrpcControlCleanupCancellationTest {
 
 		@Override
 		public RockserverCapabilities getCapabilities() {
-			return delegate.getCapabilities();
+			var capabilities = delegate.getCapabilities();
+			return clientSessions ? capabilities.withClientSessions(true) : capabilities;
 		}
 
 		@Override

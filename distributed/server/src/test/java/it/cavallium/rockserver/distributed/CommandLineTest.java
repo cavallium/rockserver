@@ -21,6 +21,7 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
 import java.util.function.IntConsumer;
@@ -1168,6 +1169,32 @@ class CommandLineTest {
 		}
 		assertTrue(runs.get(4).err().contains("--dry-run takes no value"), runs.get(4).err());
 		assertTrue(Files.notExists(temp.resolve("seed")) && Files.notExists(temp.resolve("target")));
+	}
+
+	/**
+	 * R46-3: {@code repair-log} took {@code --group-id} as given, while {@code run}, {@code admin} and
+	 * {@code export-seed} parse it as a UUID and name the group's directory by its canonical (lower-case) form. A group
+	 * id that {@code run} accepted in upper case was refused ("does not exist: wrong --data-dir or --group-id?", exit 1),
+	 * and a value that is not a UUID was used as a path component ({@code raft/../..}) instead of being wrong usage.
+	 */
+	@Test
+	void repairLogParsesTheGroupIdAsTheOtherCommandsDo() throws IOException {
+		String group = "0f1e2d3c-4b5a-4968-8776-655443322110";
+		Path dataDir = temp.resolve("node");
+		Files.createDirectories(dataDir.resolve("raft").resolve(group).resolve("current"));
+		var upper = run("repair-log", "--data-dir", dataDir.toString(), "--group-id", group.toUpperCase(Locale.ROOT),
+				"--dry-run");
+		assertEquals(0, upper.code(), upper.toString());
+		assertTrue(upper.out().contains(dataDir.resolve("raft").resolve(group).resolve("current").toString()),
+				upper.out());
+
+		Files.createDirectories(temp.resolve("current"));
+		for (var wrong : List.of("../..", "nope")) {
+			var refused = run("repair-log", "--data-dir", dataDir.toString(), "--group-id", wrong, "--dry-run");
+			assertEquals(2, refused.code(), refused.toString());
+			assertTrue(refused.err().contains("invalid value for --group-id: " + wrong + " (not a UUID)"), refused.err());
+			assertTrue(refused.err().contains("Usage:"), refused.err());
+		}
 	}
 
 	@Test

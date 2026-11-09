@@ -21,6 +21,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Function;
 import java.util.function.LongSupplier;
 import org.jetbrains.annotations.Nullable;
@@ -93,8 +94,66 @@ final class LeaderHintRouter implements AutoCloseable {
 			"getCapabilities", "get", "exists", "existsMulti", "getMulti",
 			"flush", "compact", "getSstMetadata", "compactFiles", "getTableProperties");
 
-	/** The leader's channel. */
-	record Hint(String address, ManagedChannel channel) {}
+	/**
+	 * The leader's channel. Once it is no longer the current one ({@link #retire}), it is shut down when no call that
+	 * {@link #route} handed out on it waits for its start (R46-1): a call started on a channel already shut down fails
+	 * {@code UNAVAILABLE} without being sent, and a write that fails so ends with an unknown outcome. The count is
+	 * atomic, without a lock: it is on the path of every leader-bound call.
+	 */
+	static final class Hint {
+		private final String address;
+		private final ManagedChannel channel;
+		/**
+		 * Calls handed out on {@link #channel} and not started (nor cancelled) yet. A call that is never started nor
+		 * cancelled, which no gRPC stub does, would keep a retired channel open (idle) until the process ends.
+		 */
+		private final AtomicInteger unstarted = new AtomicInteger();
+		/** No longer the current hint: shut down once {@link #unstarted} is 0. */
+		private volatile boolean retired;
+
+		Hint(String address, ManagedChannel channel) {
+			this.address = address;
+			this.channel = channel;
+		}
+
+		String address() {
+			return address;
+		}
+
+		ManagedChannel channel() {
+			return channel;
+		}
+
+		/** Counts a call handed out on the channel; false, counting nothing, if the hint was retired. */
+		boolean acquire() {
+			unstarted.incrementAndGet();
+			if (retired) {
+				release();
+				return false;
+			}
+			return true;
+		}
+
+		/** A call counted by {@link #acquire} started, or was cancelled before its start. */
+		void release() {
+			// Either this sees the retirement, or retire() sees the count at 0: the channel is shut down at least once.
+			if (unstarted.decrementAndGet() == 0 && retired) {
+				channel.shutdown();
+			}
+		}
+
+		boolean retired() {
+			return retired;
+		}
+
+		/** No longer the leader's channel: shuts it down now, or once the calls handed out on it started. */
+		void retire() {
+			retired = true;
+			if (unstarted.get() == 0) {
+				channel.shutdown();
+			}
+		}
+	}
 
 	/**
 	 * Tests only: run by a replay once the replayed call is the current one, before it is started (R43-3).
@@ -189,10 +248,16 @@ final class LeaderHintRouter implements AutoCloseable {
 			@Override
 			public <Q, R> ClientCall<Q, R> newCall(MethodDescriptor<Q, R> method, CallOptions options) {
 				var hint = leaderChannelFor(method);
-				if (hint == null) {
+				// Counted until the caller starts the call, so that the channel is not shut down under it (R46-1).
+				if (hint == null || !hint.acquire()) {
 					return main.newCall(method, options);
 				}
-				return new LeaderCall<>(hint, main, method, options, replayable.contains(method.getBareMethodName()));
+				try {
+					return new LeaderCall<>(hint, main, method, options, replayable.contains(method.getBareMethodName()));
+				} catch (RuntimeException | Error e) {
+					hint.release();
+					throw e;
+				}
 			}
 
 			@Override
@@ -216,6 +281,10 @@ final class LeaderHintRouter implements AutoCloseable {
 	 * start (R43-3). The lock is reentrant: a listener called back on the caller's own thread inside a forwarded method
 	 * (a channel that fails the call at once) replays there. Nothing that holds the lock waits for another thread: the
 	 * methods of a {@link ClientCall} do not block, and {@link #drop} runs outside it.</p>
+	 *
+	 * <p>The call holds its hint ({@link Hint#acquire}) until it is started or cancelled. If the hint was retired in
+	 * between (a response named a new leader, or a call on the channel failed), it starts on the ordinary channel
+	 * instead: nothing was sent yet, and the retired channel may be a dead node's (R46-1).</p>
 	 */
 	private final class LeaderCall<Q, R> extends ClientCall<Q, R> {
 
@@ -237,6 +306,8 @@ final class LeaderHintRouter implements AutoCloseable {
 		private boolean answered;
 		private @Nullable Listener<R> listener;
 		private @Nullable Metadata headers;
+		/** Counted in {@link Hint#unstarted} until started or cancelled; guarded by callLock. */
+		private boolean holding = true;
 
 		LeaderCall(Hint hint, Channel main, MethodDescriptor<Q, R> method, CallOptions options, boolean replayable) {
 			this.hint = hint;
@@ -249,14 +320,32 @@ final class LeaderHintRouter implements AutoCloseable {
 
 		@Override
 		public void start(Listener<R> listener, Metadata headers) {
-			synchronized (callLock) {
-				this.listener = listener;
-				if (replayable) {
-					var copy = new Metadata();
-					copy.merge(headers);
-					this.headers = copy;
+			boolean release = false;
+			try {
+				synchronized (callLock) {
+					release = holding;
+					holding = false;
+					this.listener = listener;
+					if (replayable) {
+						var copy = new Metadata();
+						copy.merge(headers);
+						this.headers = copy;
+					}
+					if (release && hint.retired()) {
+						// The hint was retired after this call was handed out (R46-1): the ordinary channel serves it, as any
+						// call made after the retirement. The call made on the leader's channel was never started: nothing
+						// was sent there.
+						current = main.newCall(method, options);
+						current.start(listener, headers);
+					} else {
+						current.start(new LeaderListener(listener), headers);
+					}
 				}
-				current.start(new LeaderListener(listener), headers);
+			} finally {
+				if (release) {
+					// Outside the lock: it may shut the retired channel down.
+					hint.release();
+				}
 			}
 		}
 
@@ -270,9 +359,16 @@ final class LeaderHintRouter implements AutoCloseable {
 
 		@Override
 		public void cancel(@Nullable String message, @Nullable Throwable cause) {
+			boolean release;
 			synchronized (callLock) {
 				cancelled = true;
+				release = holding;
+				holding = false;
 				current.cancel(message, cause);
+			}
+			if (release) {
+				// Cancelled before its start: it no longer keeps a retired channel open.
+				hint.release();
 			}
 		}
 
@@ -448,7 +544,7 @@ final class LeaderHintRouter implements AutoCloseable {
 			LOG.debug("Ignoring the leader address {}: not one of the client's addresses", value);
 			return;
 		}
-		ManagedChannel previous;
+		Hint previous;
 		ManagedChannel created;
 		synchronized (lock) {
 			hint = current;
@@ -456,14 +552,14 @@ final class LeaderHintRouter implements AutoCloseable {
 				return;
 			}
 			created = channels.apply(address);
-			previous = hint == null ? null : hint.channel();
+			previous = hint;
 			current = new Hint(value, created);
 		}
 		// Connects now, so that the next call to the leader finds it ready.
 		created.getState(true);
 		if (previous != null) {
-			// Calls in flight on it end as they do.
-			previous.shutdown();
+			// Calls in flight on it end as they do; calls handed out on it and not started yet are sent elsewhere first.
+			previous.retire();
 		}
 		LOG.debug("Leader-bound calls go to {}", value);
 	}
@@ -486,7 +582,7 @@ final class LeaderHintRouter implements AutoCloseable {
 			failedAt.values().removeIf(at -> now - at >= FAILED_HINT_BACKOFF_NANOS);
 			failedAt.put(hint.address(), now);
 		}
-		hint.channel().shutdown();
+		hint.retire();
 		LOG.debug("Leader-bound calls go to the ordinary channel: {} failed", hint.address());
 	}
 
