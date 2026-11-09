@@ -97,8 +97,10 @@ final class LeaderHintRouter implements AutoCloseable {
 	/**
 	 * The leader's channel. Once it is no longer the current one ({@link #retire}), it is shut down when no call that
 	 * {@link #route} handed out on it waits for its start (R46-1): a call started on a channel already shut down fails
-	 * {@code UNAVAILABLE} without being sent, and a write that fails so ends with an unknown outcome. The count is
-	 * atomic, without a lock: it is on the path of every leader-bound call.
+	 * {@code UNAVAILABLE} without being sent, and a write that fails so ends with an unknown outcome. The shutdown is
+	 * graceful: calls already started on the channel run until they end, or until the router closes, which forces
+	 * every retired channel that has not terminated (R49-1). The count is atomic, without a lock: it is on the path of
+	 * every leader-bound call.
 	 */
 	static final class Hint {
 		private final String address;
@@ -171,6 +173,12 @@ final class LeaderHintRouter implements AutoCloseable {
 	private volatile @Nullable Hint current;
 	/** Addresses whose channel failed, with when: not taken again for {@link #FAILED_HINT_BACKOFF_NANOS}. Guarded by {@link #lock}. */
 	private final Map<String, Long> failedAt = new HashMap<>();
+	/**
+	 * Retired hints whose channel may still carry calls started on it, which its graceful shutdown waits for:
+	 * {@link #close} forces them as it forces the current one (R49-1). A hint leaves once its channel terminated,
+	 * checked at each retirement, so the set holds only channels with calls still running. Guarded by {@link #lock}.
+	 */
+	private final Set<Hint> retiredOpen = new HashSet<>();
 	/** Guarded by {@link #lock}. */
 	private boolean closed;
 
@@ -554,11 +562,15 @@ final class LeaderHintRouter implements AutoCloseable {
 			created = channels.apply(address);
 			previous = hint;
 			current = new Hint(value, created);
+			if (previous != null) {
+				keepUntilClose(previous);
+			}
 		}
 		// Connects now, so that the next call to the leader finds it ready.
 		created.getState(true);
 		if (previous != null) {
-			// Calls in flight on it end as they do; calls handed out on it and not started yet are sent elsewhere first.
+			// Calls in flight on it end as they do, or at close() (R49-1); calls handed out on it and not started yet are
+			// sent elsewhere first.
 			previous.retire();
 		}
 		LOG.debug("Leader-bound calls go to {}", value);
@@ -581,26 +593,60 @@ final class LeaderHintRouter implements AutoCloseable {
 			// Small: only addresses that failed within the backoff stay.
 			failedAt.values().removeIf(at -> now - at >= FAILED_HINT_BACKOFF_NANOS);
 			failedAt.put(hint.address(), now);
+			keepUntilClose(hint);
 		}
 		hint.retire();
 		LOG.debug("Leader-bound calls go to the ordinary channel: {} failed", hint.address());
 	}
 
+	/**
+	 * Keeps {@code retiring}, which is no longer the current hint, for {@link #close}, and forgets the retired hints
+	 * whose channel terminated. Holds {@link #lock}. Runs once per retirement, never per call.
+	 */
+	private void keepUntilClose(Hint retiring) {
+		retiredOpen.removeIf(retired -> retired.channel().isTerminated());
+		retiredOpen.add(retiring);
+	}
+
+	/**
+	 * Forces the leader's channel and every retired one whose calls have not ended (R49-1), so that a stream or a call
+	 * without a deadline on a former leader's channel fails now, while the connection's callback executor can still
+	 * tell its caller, instead of running on after the connection closed. Waits up to 5 s in all for the channels to
+	 * terminate. A retired channel is never forced before this (R46-1): its calls end as they do.
+	 */
 	@Override
 	public void close() {
-		Hint hint;
+		List<Hint> hints;
 		synchronized (lock) {
 			closed = true;
-			hint = current;
+			hints = new ArrayList<>(retiredOpen);
+			retiredOpen.clear();
+			var hint = current;
 			current = null;
-		}
-		if (hint != null) {
-			hint.channel().shutdownNow();
-			try {
-				hint.channel().awaitTermination(5, TimeUnit.SECONDS);
-			} catch (InterruptedException e) {
-				Thread.currentThread().interrupt();
+			if (hint != null) {
+				hints.add(hint);
 			}
+		}
+		for (var hint : hints) {
+			hint.channel().shutdownNow();
+		}
+		long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+		try {
+			for (var hint : hints) {
+				long left = deadline - System.nanoTime();
+				if (left <= 0 || !hint.channel().awaitTermination(left, TimeUnit.NANOSECONDS)) {
+					LOG.debug("The leader channel to {} did not terminate within 5 s of the close", hint.address());
+				}
+			}
+		} catch (InterruptedException e) {
+			Thread.currentThread().interrupt();
+		}
+	}
+
+	/** Tests only: the retired hints that {@link #close} would force. */
+	int retiredOpenForTesting() {
+		synchronized (lock) {
+			return retiredOpen.size();
 		}
 	}
 

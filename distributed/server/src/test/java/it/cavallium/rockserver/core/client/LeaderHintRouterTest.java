@@ -489,6 +489,56 @@ class LeaderHintRouterTest {
 		assertTrue(third.shutdown, "the old channel is shut down once the call handed to it was cancelled");
 	}
 
+	/**
+	 * R49-1: a channel retired by a new leader ({@code offer}) or by a failure ({@code drop}) is shut down gracefully,
+	 * and the calls already started on it run on (R46-1). The router used to forget it, so {@code close()} forced only
+	 * the current hint's channel, and a stream on a former leader's channel outlived the connection. Every retired
+	 * channel that has not terminated must be forced by {@code close()}, and none before it.
+	 */
+	@Test
+	void closeForcesRetiredChannelsWhoseCallsAreStillRunning() {
+		var router = router(LeaderHintRouter.Mode.LISTED);
+		var routed = router.route(main);
+		router.offer("node-b:5333");
+		var b = opened.getLast();
+		b.state = ConnectivityState.READY;
+		b.holdsCalls = true;
+		assertSame(b, call(routed, "scanRaw"));
+
+		// A new leader: b is retired, gracefully; its stream keeps it from terminating.
+		router.offer("node-c:5333");
+		var c = opened.getLast();
+		assertTrue(b.shutdown, "the old leader's channel is shut down");
+		assertFalse(b.forced, "a retired channel is not forced before the close (R46-1)");
+		assertFalse(b.terminated);
+		assertEquals(1, router.retiredOpenForTesting());
+
+		// c is retired with no call on it and terminates; a later retirement forgets it, and keeps b.
+		router.offer("node-a:5333");
+		var a = opened.getLast();
+		assertTrue(c.terminated);
+		router.offer("node-b:5333");
+		var b2 = opened.getLast();
+		assertEquals(2, router.retiredOpenForTesting(), "b and a are kept, c is forgotten");
+
+		// A failure retires the current channel the same way (drop).
+		b2.state = ConnectivityState.READY;
+		b2.holdsCalls = true;
+		assertSame(b2, call(routed, "put"));
+		b2.lastListener.onClose(Status.UNAVAILABLE, new Metadata());
+		assertNull(router.currentAddress());
+		assertTrue(b2.shutdown);
+		assertFalse(b2.forced, "a dropped channel is not forced before the close (R46-1)");
+		assertFalse(b.forced);
+
+		router.close();
+		assertTrue(b.forced, "close() forces the retired channel whose stream still runs");
+		assertTrue(b2.forced, "close() forces the dropped channel whose call still runs");
+		assertTrue(a.terminated);
+		assertFalse(c.forced, "a retired channel that terminated is not kept");
+		assertEquals(0, router.retiredOpenForTesting());
+	}
+
 	/** Starts a unary call as grpc's {@code futureUnaryCall} does, collecting how it closes. */
 	private static void startUnary(ClientCall<byte[], byte[]> call, List<Status> closes) {
 		call.start(new ClientCall.Listener<>() {
@@ -538,6 +588,10 @@ class LeaderHintRouterTest {
 		volatile ConnectivityState state = ConnectivityState.IDLE;
 		boolean connectRequested;
 		boolean shutdown;
+		/** Calls are running on it: a graceful {@link #shutdown} does not terminate it, {@link #shutdownNow} does. */
+		boolean holdsCalls;
+		boolean forced;
+		boolean terminated;
 		/** The listener of the last call started on this channel. */
 		volatile ClientCall.@Nullable Listener<?> lastListener;
 		volatile @Nullable FakeCall<?, ?> lastCall;
@@ -571,6 +625,7 @@ class LeaderHintRouterTest {
 		@Override
 		public ManagedChannel shutdown() {
 			shutdown = true;
+			terminated |= !holdsCalls;
 			return this;
 		}
 
@@ -581,12 +636,15 @@ class LeaderHintRouterTest {
 
 		@Override
 		public boolean isTerminated() {
-			return shutdown;
+			return terminated;
 		}
 
 		@Override
 		public ManagedChannel shutdownNow() {
-			return shutdown();
+			shutdown = true;
+			forced = true;
+			terminated = true;
+			return this;
 		}
 
 		@Override
