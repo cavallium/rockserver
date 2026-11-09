@@ -427,6 +427,10 @@ class StartupChecksTest {
 		assertFalse(NodeStore.sameTable(before, "4096 78@" + t2 + ",1," + m + "," + b), "another inode");
 		assertFalse(NodeStore.sameTable(before, "4097 77@" + t2 + ",1," + m + "," + b), "another size");
 		assertFalse(NodeStore.sameTable(before, "4097 77@" + t1 + ",2," + m + "," + b), "another size");
+		// Review of R45, 1: an unchanged inode and change time is the same file, even when the birth-time probe gave
+		// another answer at the restart (it could not create its file, or the device check differed).
+		assertTrue(NodeStore.sameTable(before, "4096 77@" + t1 + ",2," + m + ",-"), "birth time known, then not");
+		assertTrue(NodeStore.sameTable("4096 77@" + t1 + ",2," + m + ",-", before), "birth time not known, then known");
 		// A marker written before R45-1 lists the inode and change time only.
 		assertTrue(NodeStore.sameTable("4096 77@" + t1, before), "an older marker, same file");
 		assertFalse(NodeStore.sameTable("4096 77@" + t1, "4096 77@" + t2 + ",1," + m + "," + b),
@@ -437,7 +441,7 @@ class StartupChecksTest {
 	 * Whether files under {@code dir} have a birth time: one whose modification time is set to the epoch still has
 	 * another creation time (without one, Java gives the modification time, or the epoch).
 	 */
-	private static boolean birthTimeKnown(Path dir) throws IOException {
+	static boolean birthTimeKnown(Path dir) throws IOException {
 		var probe = Files.createTempFile(dir, "birth", ".probe");
 		try {
 			Files.setLastModifiedTime(probe, java.nio.file.attribute.FileTime.fromMillis(0));

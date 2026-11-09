@@ -252,6 +252,8 @@ class StartupClusterTest {
 	 */
 	@Test
 	void aRestoredFirstStartKilledDuringTheCheckKeepsTheBackupDigestAfterTheBackupCopyIsDeleted() throws Exception {
+		org.junit.jupiter.api.Assumptions.assumeTrue(StartupChecksTest.birthTimeKnown(root),
+				"the file system of the test keeps no birth times: a link change then counts as another file, by design");
 		cluster = new InProcessCluster(root, 1, config -> config);
 		var backupCopy = createSeed(root.resolve("backup-copy"), 100);
 		var n0 = cluster.config("n0");
