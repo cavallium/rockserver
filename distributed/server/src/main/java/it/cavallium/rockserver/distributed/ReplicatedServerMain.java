@@ -729,14 +729,22 @@ public final class ReplicatedServerMain {
 	 *
 	 * <p>Ends with {@link #EXIT_INCOMPLETE} (R28-2) when no member took the request within the time limit, or when the
 	 * answer of a non-idempotent one leaves open whether it was proposed: nothing was compared or written for sure, and
-	 * the command can be run again. A refusal (not every member supports the operation, an invalid argument) exits
+	 * the command can be run again. A refusal (an invalid argument, an operation this version does not know) exits
 	 * with 1.</p>
+	 *
+	 * <p>A member refuses for the cluster version ({@link ReplicaOps#versionRefusal}) by its own applied view, which
+	 * lags behind the leader's on a member that is catching up (after a start, an add-peer, at the end of a rolling
+	 * upgrade, on a slow disk): that refusal proposed nothing, so the next member that answered is asked, also for an
+	 * operation that is not idempotent (R32-4). Only when every member that answered refuses for the version does the
+	 * command fail with 1, naming each of them and the version it gave.</p>
 	 */
 	private static long proposeOp(List<PeerConfig> peers, RaftGroupId groupId, byte op, byte[] payload,
 			boolean idempotent, long deadlineNanos) throws InterruptedException {
 		record Answer(PeerConfig peer, @Nullable String silence) {}
 		while (true) {
 			String last = null;
+			int answering = 0;
+			var versionRefusals = new ArrayList<String>();
 			var answered = new LinkedBlockingQueue<Answer>();
 			var question = min(PEER_ANSWER_TIMEOUT, remaining(deadlineNanos));
 			for (PeerConfig peer : peers) {
@@ -753,12 +761,21 @@ public final class ReplicatedServerMain {
 					last = peer.id() + ": " + answer.silence();
 					continue;
 				}
+				answering++;
 				try {
 					var reply = ReplicaOps.call(peer.raftAddress(), groupId, op, payload,
 							proposalWait(idempotent, remaining(deadlineNanos))).join();
 					return ByteBuffer.wrap(reply).getLong();
 				} catch (CompletionException ex) {
 					var status = Status.fromThrowable(ex.getCause());
+					if (ReplicaOps.versionRefusal(status)) {
+						// Its own applied view (R32-4): it may lag behind the leader. Nothing was proposed, so asking the
+						// next member is safe also for an operation that is not idempotent.
+						System.out.println(peer.id() + " refused: " + status.getDescription() + "; asking the next member");
+						versionRefusals.add(peer.id() + " (" + status.getDescription() + ")");
+						last = peer.id() + ": " + status;
+						continue;
+					}
 					if (status.getCode() == Status.Code.FAILED_PRECONDITION || status.getCode() == Status.Code.INVALID_ARGUMENT
 							|| status.getCode() == Status.Code.UNIMPLEMENTED) {
 						fail(peer.id() + " refused: " + status.getDescription());
@@ -769,6 +786,12 @@ public final class ReplicatedServerMain {
 					}
 					last = peer.id() + ": " + status;
 				}
+			}
+			if (answering > 0 && versionRefusals.size() == answering) {
+				fail("every member that answered refused for the cluster version it has applied: "
+						+ String.join("; ", versionRefusals) + ". If every member runs a version that supports it, some"
+						+ " lag behind the leader: run the command again once they caught up; otherwise upgrade every"
+						+ " member first");
 			}
 			if (System.nanoTime() - deadlineNanos > 0) {
 				failIncomplete("no member took the request within the time limit (--timeout-ms); last answer " + last

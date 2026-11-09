@@ -962,14 +962,34 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 		}
 	}
 
+	/**
+	 * How a refusal of {@link #OP_PROPOSE_CHECKSUM} or {@link #OP_PROPOSE_BACKUP} for the cluster version begins, in
+	 * this version and in the older ones ("... yet: the cluster version is X. Upgrade every member first"): see
+	 * {@link #versionRefusal}.
+	 */
+	static final String VERSION_REFUSAL = "Not every member supports ";
+
+	/**
+	 * Whether {@code status} is a member's refusal of a proposal because the cluster version it has applied lacks the
+	 * operation (R32-4). That is the member's own view: a member that lags behind the leader has not applied the
+	 * latest cluster version yet. Nothing was proposed, so {@code admin} asks the next member.
+	 */
+	static boolean versionRefusal(Status status) {
+		return status.getCode() == Status.Code.FAILED_PRECONDITION && status.getDescription() != null
+				&& status.getDescription().startsWith(VERSION_REFUSAL);
+	}
+
 	private CompletableFuture<byte[]> propose(long capability, LogEntry entry) {
 		var proposer = this.proposer;
 		if (proposer == null) {
 			return failed(Status.UNAVAILABLE, "The node is starting");
 		}
 		if (!clusterHas(capability)) {
-			return failed(Status.FAILED_PRECONDITION, "Not every member supports " + Capabilities.describe(capability)
-					+ " yet: the cluster version is " + Capabilities.describe(clusterVersion) + ". Upgrade every member first");
+			// Before anything is proposed: see versionRefusal.
+			return failed(Status.FAILED_PRECONDITION, VERSION_REFUSAL + Capabilities.describe(capability)
+					+ " yet as far as " + config.nodeId() + " knows: it has applied cluster version "
+					+ Capabilities.describe(clusterVersion) + ", and a member that lags behind the leader has not applied"
+					+ " the latest one yet");
 		}
 		return proposer.propose(entry).thenApply(index -> ByteBuffer.allocate(Long.BYTES).putLong((Long) index).array());
 	}
