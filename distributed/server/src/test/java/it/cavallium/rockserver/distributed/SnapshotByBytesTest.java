@@ -15,6 +15,7 @@ import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
+import org.apache.ratis.server.raftlog.RaftLog;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -103,6 +104,56 @@ class SnapshotByBytesTest {
 		}
 		InProcessCluster.await(TIMEOUT, () -> cluster.runningNodes().stream()
 				.allMatch(node -> node.stateMachine().getLatestSnapshot() != null));
+	}
+
+	/**
+	 * R48-1: after a restart, Ratis' StateMachineUpdater starts at the log's snapshot index and hands the log over again
+	 * only once a commit arrives; the database is already further. A snapshot asked meanwhile (here before any commit,
+	 * with one node of three up; in a cluster, a snapshot request while the replay has not reached the database's
+	 * position) must not return the database's index: Ratis compares it with its own applied index, logs
+	 * "Bug in StateMachine", and purges nothing, while the byte count was reset and a checkpoint made. It answers "no
+	 * snapshot taken" instead, keeping the count, until Ratis has handed over every entry up to the database's
+	 * position; then it takes one as usual.
+	 */
+	@Test
+	void noSnapshotPastWhatRatisHandedOverAfterARestart() throws Exception {
+		cluster = new InProcessCluster(temp, 3, c -> c.withSnapshotEveryEntries(1_000_000)
+				.withSnapshotEveryBytes(1 << 20)).startAll();
+		var leader = cluster.awaitLeader(TIMEOUT);
+		var api = leader.connection().getSyncApi(RequestContext.batch(Duration.ofSeconds(20)));
+		long column = api.createColumn("c", ColumnSchema.of(IntList.of(Long.BYTES), ObjectList.of(), true));
+		var value = Buf.wrap(new byte[256 * 1024]);
+		for (long i = 0; i < 3; i++) {
+			api.put(0, column, new Keys(Buf.wrap(ByteBuffer.allocate(Long.BYTES).putLong(i).array())), value,
+					RequestType.none());
+		}
+		cluster.awaitConverged(TIMEOUT);
+		for (var id : cluster.ids()) {
+			cluster.stop(id);
+		}
+		var first = cluster.ids().getFirst();
+		var stateMachine = cluster.start(first).stateMachine();
+		long databaseApplied = stateMachine.appliedIndex().get();
+		assertTrue(databaseApplied > stateMachine.handedOverForTesting(),
+				"applied " + databaseApplied + ", handed over " + stateMachine.handedOverForTesting());
+		long counted = stateMachine.bytesSinceSnapshotForTesting();
+
+		assertEquals(RaftLog.INVALID_LOG_INDEX, stateMachine.takeSnapshot(), "no snapshot past what Ratis applied");
+		assertNull(stateMachine.getLatestSnapshot(), "no checkpoint was made");
+		assertEquals(counted, stateMachine.bytesSinceSnapshotForTesting(), "the count is kept");
+
+		for (var id : cluster.ids()) {
+			if (!id.equals(first)) {
+				cluster.start(id);
+			}
+		}
+		cluster.awaitLeader(TIMEOUT);
+		cluster.awaitConverged(TIMEOUT);
+		InProcessCluster.await(TIMEOUT, () -> stateMachine.handedOverForTesting() >= databaseApplied);
+		long taken = stateMachine.takeSnapshot();
+		assertTrue(taken >= databaseApplied && taken <= stateMachine.handedOverForTesting(),
+				"snapshot at " + taken + ", database at " + databaseApplied);
+		assertEquals(taken, stateMachine.getLatestSnapshot().getIndex());
 	}
 
 	@Test
