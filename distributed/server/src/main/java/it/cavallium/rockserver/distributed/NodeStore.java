@@ -931,10 +931,15 @@ final class NodeStore implements Closeable {
 	 * the digest of those files, which no other copy of the seed has. With the marker it keeps the seed digest as long
 	 * as every file listed here is still there and is the same file, and one at least is listed: the open
 	 * ({@link #openForStartupCheck}, without automatic compactions: R43-2) adds table files but neither deletes nor
-	 * rewrites one, while a copy made again ({@code cp}, {@code rsync}, restore-backup) makes new ones, and a later copy
-	 * of the seed's source lacks those its compactions replaced (R43-1). A seed with table files that its MANIFEST does
-	 * not reference (copied from a source that crashed) loses them in the open, which deletes obsolete files: such a
-	 * killed start is not kept, and fails safe at genesis. It also lists IDENTITY
+	 * rewrites one that the MANIFEST references, while a copy made again ({@code cp}, {@code rsync}, restore-backup)
+	 * makes new ones, and a later copy of the seed's source lacks those its compactions replaced (R43-1). Files the
+	 * MANIFEST does not reference are another matter: the open deletes them as obsolete, and a recovery output it wrote
+	 * before it was killed and had not committed yet can be deleted or written again under the same number by the next
+	 * open. So when the file already holds a marker (the digest was kept after an earlier killed check), the new marker
+	 * carries over its {@code identity} and {@code table} lines, the seed's own files, instead of listing {@code dbDir}
+	 * again (Review of R43, 1). A seed with table files that its MANIFEST does not reference (copied from a source that
+	 * crashed or was copied while it ran) loses them in the open: such a killed start is not kept, and fails safe at
+	 * genesis; the runbooks ask for a cleanly stopped source (Review of R43, 2). It also lists IDENTITY
 	 * ({@code identity <size> <identity> <sha-256>}, or {@code identity none}), which the open keeps and another database
 	 * copied over this one replaces. Does nothing
 	 * when no seed digest was recorded or {@code dbDir} holds no database; {@link #noteSeedOpened} drops the marker.
@@ -950,6 +955,19 @@ final class NodeStore implements Closeable {
 			content.append(OPENED_LINE).append(opened).append('\n');
 		}
 		content.append(OPENING).append('\n');
+		if (lines.contains(OPENING)) {
+			// recordSeedDigest kept the digest under the marker of an earlier killed check (it drops the marker when it
+			// takes a new one): the seed's own files are those that marker listed. Listing db/ again would add the files
+			// that killed open wrote, among them recovery outputs not yet in the MANIFEST, which this open deletes as
+			// obsolete or writes again under the same number (Review of R43, 1).
+			for (String line : lines) {
+				if (line.startsWith(IDENTITY_LINE) || line.startsWith(TABLE_LINE)) {
+					content.append(line).append('\n');
+				}
+			}
+			writeSeedDigestFile(dbDir, content.toString());
+			return;
+		}
 		content.append(IDENTITY_LINE).append(identityFile(dbDir)).append('\n');
 		for (var table : tableFiles(dbDir).entrySet()) {
 			content.append(TABLE_LINE).append(table.getValue()).append(' ').append(table.getKey()).append('\n');
