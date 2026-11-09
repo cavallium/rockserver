@@ -239,6 +239,142 @@ class StartupChecksTest {
 		}
 	}
 
+	/**
+	 * R43-1: after a killed start-up check, the operator lets the seed's source database run on (here flushes that its
+	 * own compaction folds into a new table file, deleting one the marker listed), stops it, and copies it again with
+	 * {@code rsync -a --delete}: the quick check (size and modification time) skips IDENTITY and every table file the
+	 * source still holds, so they keep their inode and change time; {@code --delete} removes the rest. That is not the
+	 * seed: a new digest is recorded. A listed table file gone is enough to tell, because the check's open never deletes
+	 * one ({@link #theStartupCheckOpenDeletesNoListedTableFile}).
+	 */
+	@Test
+	void aLaterCopyOfTheSourceByRsyncDeleteAfterAKilledCheckGetsANewDigest() throws Exception {
+		var source = tempDir.resolve("source");
+		try (var store = NodeStore.open(source, null, "source")) {
+			long kept = store.db().createColumn("kept", NodeStoreTest.DATA_SCHEMA);
+			long changed = store.db().createColumn("changed", NodeStoreTest.DATA_SCHEMA);
+			for (int i = 0; i < 100; i++) {
+				NodeStoreTest.put(store, kept, i, "v" + i);
+				NodeStoreTest.put(store, changed, i, "v" + i);
+			}
+		}
+		var node = tempDir.resolve("node/db");
+		rsyncDelete(source, node);
+		var digest = NodeStore.recordSeedDigest(node);
+		NodeStore.noteSeedOpening(node);
+		startupCheckOpen(node);
+		assertEquals(digest, NodeStore.recordSeedDigest(node), "the killed check alone");
+
+		// The source runs on: new values for the same keys of one column, flushed next to the old ones, compacted.
+		var seedTables = fileNames(source, ".sst");
+		try (var store = NodeStore.open(source, null, "source")) {
+			long changed = store.db().createColumn("changed", NodeStoreTest.DATA_SCHEMA);
+			// Four L0 files in all reach the compaction trigger of the default config.
+			for (int round = 0; round < 3; round++) {
+				for (int i = 0; i < 100; i++) {
+					NodeStoreTest.put(store, changed, i, "w" + round + "-" + i);
+				}
+				store.db().flush();
+			}
+			long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
+			while (fileNames(source, ".sst").containsAll(seedTables)) {
+				assertTrue(System.nanoTime() < deadline, "the source compacted none of " + seedTables);
+				Thread.sleep(20);
+			}
+		}
+		var left = fileNames(source, ".sst").stream().filter(seedTables::contains).toList();
+		assertFalse(left.isEmpty(), "the source kept none of " + seedTables);
+
+		// The marker of the killed check is still there: the retry above kept the digest without writing another.
+		rsyncDelete(source, node);
+		assertTrue(fileNames(node, ".sst").containsAll(left));
+		assertNotEquals(digest, NodeStore.recordSeedDigest(node), "a later copy of the source with rsync --delete");
+	}
+
+	/**
+	 * Like {@code rsync -a --delete source/ target/}: a file whose size and modification time are those of the source's
+	 * is skipped (not touched); any other is copied to a new file, with the source's modification time, and renamed over
+	 * the old one; what the source does not hold is deleted.
+	 */
+	private static void rsyncDelete(Path source, Path target) throws IOException {
+		Files.createDirectories(target);
+		try (Stream<Path> walk = Files.walk(source)) {
+			for (Path path : walk.toList()) {
+				Path destination = target.resolve(source.relativize(path).toString());
+				if (Files.isDirectory(path)) {
+					Files.createDirectories(destination);
+				} else if (!Files.isRegularFile(destination) || Files.size(destination) != Files.size(path)
+						|| !Files.getLastModifiedTime(destination).equals(Files.getLastModifiedTime(path))) {
+					Path temporary = destination.resolveSibling("." + destination.getFileName() + ".tmp");
+					Files.copy(path, temporary, java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+							java.nio.file.StandardCopyOption.COPY_ATTRIBUTES);
+					Files.move(temporary, destination, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+				}
+			}
+		}
+		try (Stream<Path> walk = Files.walk(target)) {
+			for (Path path : walk.sorted(Comparator.reverseOrder()).toList()) {
+				if (!Files.exists(source.resolve(target.relativize(path).toString()))) {
+					Files.delete(path);
+				}
+			}
+		}
+	}
+
+	/**
+	 * R43-2: the start-up check's open deletes no table file the marker listed, so the keep rule can ask for every one of
+	 * them. Its own compaction did: here the data column holds four overlapping L0 files, which the default compaction
+	 * trigger (four L0 files) folds into one, deleting them.
+	 */
+	@Test
+	void theStartupCheckOpenDeletesNoListedTableFile() throws Exception {
+		var config = tempDir.resolve("no-compactions.conf");
+		Files.writeString(config, "database.global.disable-auto-compactions = true\n");
+		var seed = tempDir.resolve("seed");
+		try (var store = NodeStore.open(seed, config, "seed")) {
+			long column = store.db().createColumn(NodeStoreTest.DATA_COLUMN, NodeStoreTest.DATA_SCHEMA);
+			for (int round = 0; round < 4; round++) {
+				for (int i = 0; i < 100; i++) {
+					NodeStoreTest.put(store, column, i, "v" + round + "-" + i);
+				}
+				store.db().flush();
+			}
+		}
+		var node = tempDir.resolve("node/db");
+		copy(seed, node);
+		var digest = NodeStore.recordSeedDigest(node);
+		NodeStore.noteSeedOpening(node);
+		var seedTables = fileNames(node, ".sst");
+		assertTrue(seedTables.size() >= 2, seedTables.toString());
+		// Killed while open, after its compaction (if any) had the time to run.
+		try (var store = startupCheckStore(node)) {
+			long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(3);
+			while (fileNames(node, ".sst").containsAll(seedTables) && System.nanoTime() < deadline) {
+				Thread.sleep(20);
+			}
+		}
+		var gone = seedTables.stream().filter(name -> !fileNamesUnchecked(node, ".sst").contains(name)).toList();
+		assertTrue(gone.isEmpty(), "the start-up check's open deleted " + gone + " of " + seedTables);
+		assertEquals(digest, NodeStore.recordSeedDigest(node));
+	}
+
+	/** The start-up check's open and close of {@code dbDir}, as {@code ReplicatedNode} makes it. */
+	private static void startupCheckOpen(Path dbDir) throws IOException {
+		startupCheckStore(dbDir).close();
+	}
+
+	private static NodeStore startupCheckStore(Path dbDir) throws IOException {
+		return NodeStore.open(dbDir, null, "node");
+	}
+
+	private static List<String> fileNamesUnchecked(Path root, String suffix) {
+		try {
+			return fileNames(root, suffix);
+		} catch (IOException e) {
+			throw new UncheckedIOException(e);
+		}
+	}
+
 	/** The names of the files under {@code root} that end with {@code suffix}. */
 	private static List<String> fileNames(Path root, String suffix) throws IOException {
 		try (Stream<Path> walk = Files.walk(root)) {

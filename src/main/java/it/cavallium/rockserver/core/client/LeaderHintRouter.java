@@ -96,6 +96,11 @@ final class LeaderHintRouter implements AutoCloseable {
 	/** The leader's channel. */
 	record Hint(String address, ManagedChannel channel) {}
 
+	/**
+	 * Tests only: run by a replay once the replayed call is the current one, before it is started (R43-3).
+	 */
+	static volatile @Nullable Runnable replaySwappedForTesting;
+
 	private final Mode mode;
 	/** Methods, by bare name, that run again on the ordinary channel when the leader's channel fails before answering. */
 	private final Set<String> replayable;
@@ -336,6 +341,10 @@ final class LeaderHintRouter implements AutoCloseable {
 				messages = List.copyOf(sent);
 				toRequest = requested;
 				close = halfClosed;
+			}
+			var swapped = replaySwappedForTesting;
+			if (swapped != null) {
+				swapped.run();
 			}
 			call.start(listener, replayHeaders);
 			if (toRequest > 0) {
