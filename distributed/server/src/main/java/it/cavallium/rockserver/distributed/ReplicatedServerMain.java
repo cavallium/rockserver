@@ -84,7 +84,10 @@ import org.rocksdb.NativeLibraryLoader;
  * {@code --peer} wrote it; it exits with 1 if a member failed or gave an answer that cannot be read (a member of
  * another version), and with 4 if a member gave no result in time, or no
  * member took the request in time. Both ask the members at once and propose through one that answers, so that a
- * frozen member listed first does not hold them (see {@code proposeOp}), and then ask every member for its result at
+ * frozen member listed first does not hold them (see {@code proposeOp}); a member that refuses by the cluster version
+ * it has applied (it may lag behind the leader) proposed nothing, and the next member that answered is asked: only when
+ * every member that answered refuses so do they exit with 1, naming each and its version (R32-4). They then ask every
+ * member for its result at
  * once, each within the time left (see {@code awaitResults}), so that they end within {@code --timeout-ms}. A node on
  * which a backup fails deletes what it wrote of it.
  * {@code backup-status NAME INDEX} asks the members again about that backup ({@code INDEX} is the log index that
@@ -127,7 +130,8 @@ import org.rocksdb.NativeLibraryLoader;
  * and a group without a directory in a {@code raft/} holding other groups is wrong usage, given or not (R31-2, R32-2).
  * A damaged snapshot fails it with exit code 1, naming the snapshot's index and the database's, and writes nothing;
  * {@code --without-damaged-snapshot} exports the database as it is, and the output names the snapshot left out
- * (R32-1).</p>
+ * (R32-1). A node that runs is refused with exit code 1 before anything of it is touched: the command first takes
+ * its group's {@code in_use.lock}, which a running node holds, as {@code repair-log} does (R32-5).</p>
  *
  * <p>{@code admin} refuses an option it does not know, a malformed value (a malformed {@code add-peer} argument
  * included), or a word its command does not take, with exit code 2. Its changes end with

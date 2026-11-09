@@ -132,7 +132,9 @@ Failure branches:
 - The lost node was the leader: the same steps, after the election (`status` shows a new leader).
 - Two nodes of three lost: there is no majority, `add-peer` cannot work. See "No quorum" in the design document, and
   "Restoring a backup" below. Without a backup, `rs export-seed --data-dir DATA-DIR --target NEW [--rockserver-config FILE] [--group-id UUID]` on each stopped
-  node prints the index its copy holds; pick the highest. A node that crashed while installing a snapshot can have
+  node prints the index its copy holds; pick the highest. It refuses a node that runs (exit 1, `Not exported:
+  .../raft/<group>/in_use.lock is locked: stop the node first.`, the message of `repair-log`), also one that is
+  installing a snapshot with `db/` closed, before it touches anything of the node. A node that crashed while installing a snapshot can have
   `db/` behind that snapshot: `export-seed` verifies the snapshot and restores it into `db/` first, as a start of the
   node would, and its output then says `its database was behind its snapshot at index N, restored first`. If the
   crash damaged that snapshot, `export-seed` exits 1 with `Not exported: The replica's latest snapshot ... (at index N)
@@ -371,7 +373,14 @@ The cluster version keeps the new kinds of log entries off until every member ru
 - Clients use sessions only through nodes whose cluster version allows them. A client connected before that runs without
   sessions until it reconnects: restart the clients after the upgrade (or start them with
   `-Dit.cavallium.rockserver.grpc.client.session-writes=false` until then).
-- `admin checksum` and `admin backup` are refused until every member supports them.
+- `admin checksum` and `admin backup` are refused until every member supports them. A member decides by the cluster
+  version it has applied, which lags behind the leader's on a member that is catching up (right after a start, after
+  `add-peer`, up to about 10 s plus its apply lag after the last member of a rolling upgrade restarts, on a slow
+  disk): `admin` then prints `<id> refused: Not every member supports ... as far as <id> knows: it has applied
+  cluster version ...; asking the next member` and goes on with the next member that answered (nothing was
+  proposed). It fails with 1 only when every member that answered refuses so, naming each with the version it gave:
+  if every member runs a version that supports the command, run it again once they caught up; otherwise upgrade
+  every member first.
 - Never downgrade a node below the cluster version: it would stop on the first entry it cannot read. A node whose
   database has a cluster version with a capability its binary lacks (a downgrade, or a newer cluster's database copied
   here) refuses to start, with exit code 5 and a message naming the unknown capabilities: start the newer version
@@ -442,7 +451,7 @@ disk problem to look at.
 | Code | `run` | `admin` | `repair-log` | `export-seed`, `restore-backup` |
 |---|---|---|---|---|
 | 0 | Not on a stop by signal: see below | `OK` | The log is valid, or was (with `--dry-run`: could be) repaired | Done |
-| 1 | Did not start: a port in use, a refused data directory (another file system, a cluster's database without its Raft state, a pointless `--join`), any other failure of the start (an `Error` too, such as a class that does not load) | `FAILED: ...`: refused (a change of more than one voter included, or a member refused `checksum`/`backup`: not every member supports it), a change failed, the replicas differ (`checksum`), a member failed (`backup`), a member's answer cannot be read (`<id>: cannot read its answer (...)`: a member of another version, asking again would not help) | Refused: see its output | Failed: see the exception; `export-seed` also when the replica's latest snapshot is damaged (`Not exported: ...`, nothing written; see "Replacing a node", `--without-damaged-snapshot`) |
+| 1 | Did not start: a port in use, a refused data directory (another file system, a cluster's database without its Raft state, a pointless `--join`), any other failure of the start (an `Error` too, such as a class that does not load) | `FAILED: ...`: refused (a change of more than one voter included, or every member that answered refused `checksum`/`backup` for the cluster version it has applied: not every member supports it, or they lag behind the leader, see "Upgrades"), a change failed, the replicas differ (`checksum`), a member failed (`backup`), a member's answer cannot be read (`<id>: cannot read its answer (...)`: a member of another version, asking again would not help) | Refused: see its output (also while the node runs: its `in_use.lock` is locked) | Failed: see the exception; `export-seed` also while the node runs (`Not exported: ... in_use.lock is locked: stop the node first.`, nothing touched) and when the replica's latest snapshot is damaged (`Not exported: ...`, nothing written; see "Replacing a node", `--without-damaged-snapshot`) |
 | 2 | Wrong usage, or no `-XX:+ExitOnOutOfMemoryError`: also an unknown option, a word that is no option's value (a flag given a value, `--join false` or `--pipelined-updates false`, which turned the flag on before), a malformed value (a non-numeric number, an `--election-timeout-ms` that is not MIN:MAX, a `--peer` or `--group-id` that does not parse) or one the node's configuration refuses (`--parallel-apply-threads 1`, a node id not among the peers, a minimum election timeout not below the maximum) | Wrong usage: also an unknown option (a misspelled one), an option of another command (`--allow-skipped` without `checksum`, `--unsafe-multi-voter-change` without `add-peer` or `remove-peer`), a word the command does not take (`status now`), a malformed value (`--timeout-ms`, `--peer`, `--group-id`, the index of `backup-status`, the argument of `add-peer`, a member id with `=` for `remove-peer`, `transfer-leader` or `snapshot`) | Wrong usage: also an unknown option or a stray word (`--dry-run yes`) | Wrong usage: also an unknown option or a stray word; `export-seed` with a group (`--group-id`, or the default without it) that has no directory in a `raft/` holding other groups |
 | 3 | The node stopped after a failure: its replica failed, Raft closed, a JVM pause beyond `--jvm-pause-limit-ms`, out of direct memory on a thread of replication; also a failure that raced a SIGTERM, and out of heap (the JVM's own status for `-XX:+ExitOnOutOfMemoryError`) | - | - | - |
 | 4 | Removed from the cluster, confirmed by a majority of the current configuration: refused at the start, or found out while it heard no leader. Do not start it again (see "Removed node"; until a majority answers, a removed node waits outside instead) | Incomplete: a member gave no result in time (`checksum`, `backup`, `backup-status`), no member took the request in time, or a `checksum` answer that does not tell whether it was proposed: run it again | - | - |

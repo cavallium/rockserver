@@ -884,7 +884,8 @@ final class NodeStore implements Closeable {
 	 * flushed state plus what its RocksDB WAL replays), without the replication metadata ({@link #META_COLUMN}: the
 	 * cluster id, the applied position, results and sessions), whose cluster id would make every node of a new cluster
 	 * refuse it. The source is opened as a replica, which also finishes a restore that a crash interrupted; it must not
-	 * run. Table files are hard-linked when {@code target} is on the same file system. This form ignores the Raft
+	 * run, which this form cannot check (the command uses {@link #exportSeed(Path, Path, Path, Path, boolean)}, which
+	 * checks the node's Raft lock, R32-5). Table files are hard-linked when {@code target} is on the same file system. This form ignores the Raft
 	 * snapshots: the command passes them, see {@link #exportSeed(Path, Path, Path, Path)} (R31-2).
 	 *
 	 * @return what the copy held: the applied position and cluster of the replica
@@ -915,6 +916,13 @@ final class NodeStore implements Closeable {
 	 * Like {@link #exportSeed(Path, Path, Path, Path)}; with {@code withoutDamagedSnapshot}, a damaged latest snapshot
 	 * does not stop the export: the copy holds what {@code dbDir} holds, and {@link ExportedSeed#damagedSnapshot} and
 	 * {@link ExportedSeed#damagedSnapshotIndex} say which snapshot was left out (R32-1).
+	 *
+	 * <p>When the group directory (the parent of {@code stateMachineDir}) exists, its {@link RaftLogRepair#LOCK_FILE}
+	 * is locked first and held to the end (R32-5): a node holds it for as long as it runs, also while it installs a
+	 * snapshot with {@code db/} closed and so without RocksDB's LOCK, and the open would otherwise finish or delete the
+	 * restore directories it is building ({@link #open} recovers them before RocksDB locks the database).</p>
+	 *
+	 * @throws NodeRunningException if the node holds its group's lock: nothing of the node is touched, nothing written
 	 */
 	static ExportedSeed exportSeed(Path dbDir, @Nullable Path stateMachineDir, @Nullable Path rockserverConfig,
 			Path target, boolean withoutDamagedSnapshot) throws IOException {
