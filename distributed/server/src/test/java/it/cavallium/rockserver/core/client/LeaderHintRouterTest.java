@@ -21,8 +21,11 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
 import java.util.TreeSet;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import org.jetbrains.annotations.Nullable;
 import org.junit.jupiter.api.Test;
 
@@ -354,6 +357,81 @@ class LeaderHintRouterTest {
 		assertEquals(mainCalls, main.calls);
 	}
 
+	/**
+	 * R43-3: the leader's channel fails while the caller is still forwarding ({@code futureUnaryCall} starts the call,
+	 * then requests, sends and half-closes), and the failure arrives on another thread (the callback executor). The
+	 * replay made the ordinary channel's call the current one and only then started it, outside the lock: the caller's
+	 * request reached that call before its start (grpc: "Not started"), or its half-close before the replayed message.
+	 * The caller's operations must reach the replayed call after the replay put it in place.
+	 */
+	@Test
+	void callerOperationsDuringAReplayReachTheReplayedCallAfterIt() throws Exception {
+		var router = router(LeaderHintRouter.Mode.LISTED);
+		var routed = router.route(main);
+		router.offer("node-b:5333");
+		var leader = opened.getFirst();
+		leader.state = ConnectivityState.READY;
+		var closes = new CopyOnWriteArrayList<Status>();
+		var call = routed.newCall(method("getRangePage"), CallOptions.DEFAULT);
+		call.start(new ClientCall.Listener<>() {
+			@Override
+			public void onClose(Status status, Metadata trailers) {
+				closes.add(status);
+			}
+		}, new Metadata());
+		int mainCalls = main.calls;
+
+		var swapped = new CountDownLatch(1);
+		var resume = new CountDownLatch(1);
+		LeaderHintRouter.replaySwappedForTesting = () -> {
+			swapped.countDown();
+			try {
+				resume.await(10, TimeUnit.SECONDS);
+			} catch (InterruptedException e) {
+				Thread.currentThread().interrupt();
+			}
+		};
+		try {
+			var replayFailure = new AtomicReference<Throwable>();
+			var failing = Thread.ofPlatform().start(() -> {
+				try {
+					leader.lastListener.onClose(Status.UNAVAILABLE, new Metadata());
+				} catch (Throwable t) {
+					replayFailure.set(t);
+				}
+			});
+			assertTrue(swapped.await(10, TimeUnit.SECONDS), "no replay");
+			var callerFailure = new AtomicReference<Throwable>();
+			var caller = Thread.ofPlatform().start(() -> {
+				try {
+					call.request(2);
+					call.sendMessage(new byte[] {1});
+					call.halfClose();
+				} catch (Throwable t) {
+					callerFailure.set(t);
+				}
+			});
+			// Until the caller is done or waits for the replay.
+			long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+			while (caller.isAlive() && caller.getState() != Thread.State.BLOCKED
+					&& caller.getState() != Thread.State.WAITING && System.nanoTime() < deadline) {
+				Thread.sleep(5);
+			}
+			resume.countDown();
+			failing.join(10_000);
+			caller.join(10_000);
+			assertNull(callerFailure.get(), () -> "the caller failed: " + callerFailure.get());
+			assertNull(replayFailure.get(), () -> "the replay failed: " + replayFailure.get());
+		} finally {
+			LeaderHintRouter.replaySwappedForTesting = null;
+		}
+		assertEquals(mainCalls + 1, main.calls);
+		assertEquals(List.of("start", "request 2", "message", "halfClose"), main.lastCall.events);
+		assertTrue(closes.isEmpty(), "the caller saw the failure: " + closes);
+		main.lastListener.onClose(Status.OK, new Metadata());
+		assertEquals(List.of(Status.OK), closes);
+	}
+
 	@Test
 	void failedChannelIsDroppedWhenACallLooksForIt() {
 		var router = router(LeaderHintRouter.Mode.LISTED);
@@ -391,9 +469,9 @@ class LeaderHintRouterTest {
 		boolean connectRequested;
 		boolean shutdown;
 		/** The listener of the last call started on this channel. */
-		ClientCall.@Nullable Listener<?> lastListener;
-		@Nullable FakeCall<?, ?> lastCall;
-		int calls;
+		volatile ClientCall.@Nullable Listener<?> lastListener;
+		volatile @Nullable FakeCall<?, ?> lastCall;
+		volatile int calls;
 
 		FakeChannel(String name) {
 			this.name = name;
@@ -451,20 +529,30 @@ class LeaderHintRouterTest {
 			return name;
 		}
 
+		/** Refuses what grpc's {@code ClientCallImpl} refuses: anything before {@code start}, a message after a half-close. */
 		private final class FakeCall<Q, R> extends ClientCall<Q, R> {
+
+			final List<String> events = new CopyOnWriteArrayList<>();
+			final List<Integer> requested = new CopyOnWriteArrayList<>();
+			volatile int messages;
+			volatile boolean halfClosed;
+			private volatile boolean started;
 
 			@Override
 			public void start(Listener<R> listener, Metadata headers) {
+				if (started) {
+					throw new IllegalStateException("Already started");
+				}
+				started = true;
 				lastListener = listener;
+				events.add("start");
 			}
-
-			final List<Integer> requested = new ArrayList<>();
-			int messages;
-			boolean halfClosed;
 
 			@Override
 			public void request(int numMessages) {
+				checkState(started, "Not started");
 				requested.add(numMessages);
+				events.add("request " + numMessages);
 			}
 
 			@Override
@@ -472,12 +560,24 @@ class LeaderHintRouterTest {
 
 			@Override
 			public void halfClose() {
+				checkState(started, "Not started");
+				checkState(!halfClosed, "call already half-closed");
 				halfClosed = true;
+				events.add("halfClose");
 			}
 
 			@Override
 			public void sendMessage(Q message) {
+				checkState(started, "Not started");
+				checkState(!halfClosed, "call was half-closed");
 				messages++;
+				events.add("message");
+			}
+
+			private static void checkState(boolean condition, String message) {
+				if (!condition) {
+					throw new IllegalStateException(message);
+				}
 			}
 		}
 	}

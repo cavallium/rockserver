@@ -66,7 +66,10 @@ leader's stops at genesis with exit code 3 (see "One seed" in the design documen
 truncated file and a copy taken at another moment, but not a table file damaged without a change of size, which only
 the check of step 3 finds.
 
-1. Stop the single node (a clean stop: its database must be closed).
+1. Stop the single node (a clean stop: its database must be closed). Do not copy a database that is running, and
+   if the node crashed, start it once and stop it cleanly before you copy it: a crashed or running database can hold
+   table files its MANIFEST does not reference, which the first start's check deletes as it opens the copy, and a
+   first start killed during that check then no longer recognizes the seed and stops at genesis (Review of R43, 2).
 2. Copy its database directory to every node, as `<data-dir>/db` (for example `rsync -a --delete old-db/
    n1:/srv/rockserver/data/db/`). The data directories must hold nothing else: no `raft/`. Then run `sync` on every
    node (or `sync -f <data-dir>/db`): `rsync`, `cp` and `scp` do not fsync, and a power loss before writeback can
@@ -80,11 +83,13 @@ the check of step 3 finds.
    A first start that fails or is stopped before the node joins (a refused config, or a kill or a start timeout while
    it opens a large seed to check it) can simply be started again: it keeps the digest it recorded before it opened the
    database (R41-1; the log says `the seed digest recorded before it is kept`). If you copy the seed again in between,
-   delete `<data-dir>/db` and `<data-dir>/db.seed-digest` first (or use `rsync -a --delete`): the node then records
-   the digest of the new copy. A copy made over the old files without deleting them (`cp -r`, `rsync` without
-   `--delete`) is found when it brings another database's `IDENTITY`, but not when it is a later copy of the seed's own
-   source database, which `rsync` leaves the same `IDENTITY`. If the log says it kept the digest and you put another
-   database in place after such a stop, delete `<data-dir>/db.seed-digest` before the next start.
+   always delete `<data-dir>/db` and `<data-dir>/db.seed-digest` first, whatever tool you copy with: the node then
+   records the digest of the new copy. `rsync -a --delete` over the old `db/` is not enough (R43-1): `db.seed-digest`
+   sits next to `db/`, outside what it deletes, and a later copy of the seed's own source database keeps the same
+   `IDENTITY` and the table files the source did not compact, which `rsync` leaves untouched. The node finds such a
+   copy only when the source compacted away a table file of the seed, and another database copied over `db/` only by
+   its `IDENTITY`. If the log says it kept the digest and you put another database in place after such a stop, delete
+   `<data-dir>/db.seed-digest` before the next start.
 5. Check: `rs admin $PEERS checksum` prints `OK` and the same digest for every node.
 6. Only then point clients at the cluster.
 

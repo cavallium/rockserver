@@ -245,11 +245,68 @@ class StartupClusterTest {
 		assertEquals(backupDigest, NodeStore.readSeedDigest(n0.dbDir()));
 	}
 
+	/**
+	 * R43-2: the start-up check of a first start opens the seed without automatic compactions. With them, the open's
+	 * compaction deleted the seed's table files (here four overlapping L0 files of one column, the default trigger), and
+	 * a kill after it left none of the files the marker listed: the next first start recorded a new digest and stopped
+	 * at genesis.
+	 */
+	@Test
+	void theStartupCheckOfAFirstStartDeletesNoTableFileOfTheSeed() throws Exception {
+		cluster = new InProcessCluster(root, 1, config -> config);
+		var config = root.resolve("no-compactions.conf");
+		Files.writeString(config, InProcessCluster.MERGE_CONFIG + "\ndatabase.global.disable-auto-compactions = true\n");
+		var seed = root.resolve("seed");
+		try (var store = NodeStore.open(seed, config, "seed")) {
+			long column = store.db().createColumn("seeded", SCHEMA);
+			for (int round = 0; round < 4; round++) {
+				for (int i = 0; i < 100; i++) {
+					store.db().put(0, column, key(i), Buf.wrap(new byte[] {(byte) round}), RequestType.none());
+				}
+				store.db().flush();
+			}
+		}
+		var n0 = cluster.config("n0");
+		copy(seed, n0.dbDir());
+		var seedTables = tableNames(seed);
+		assertTrue(seedTables.size() >= 4, seedTables.toString());
+		String seedDigest = NodeStore.databaseFilesDigest(seed);
+		// Killed while the check has the database open, once its compaction (if any) had the time to run.
+		failFirstStartDuringTheCheck("n0", () -> {
+			long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(3);
+			while (tableNames(n0.dbDir()).containsAll(seedTables) && System.nanoTime() < deadline) {
+				try {
+					Thread.sleep(20);
+				} catch (InterruptedException e) {
+					throw new IllegalStateException(e);
+				}
+			}
+		});
+		var left = tableNames(n0.dbDir());
+		assertEquals(List.of(), seedTables.stream().filter(name -> !left.contains(name)).toList(),
+				"table files of the seed deleted by the start-up check");
+		assertEquals(seedDigest, NodeStore.recordSeedDigest(n0.dbDir()));
+	}
+
+	private static List<String> tableNames(Path root) {
+		try (Stream<Path> walk = Files.walk(root)) {
+			return walk.map(path -> path.getFileName().toString()).filter(name -> name.endsWith(".sst")).toList();
+		} catch (IOException e) {
+			throw new java.io.UncheckedIOException(e);
+		}
+	}
+
 	/** Starts {@code id} for the first time and stops it inside the start-up check's open, as a kill there would. */
 	private void failFirstStartDuringTheCheck(String id) {
+		failFirstStartDuringTheCheck(id, () -> {});
+	}
+
+	/** Like {@link #failFirstStartDuringTheCheck(String)}, running {@code beforeKill} first inside the open. */
+	private void failFirstStartDuringTheCheck(String id, Runnable beforeKill) {
 		var dbDir = cluster.config(id).dbDir();
 		ReplicatedNode.startupCheckOpenedForTesting = config -> {
 			if (config.dbDir().equals(dbDir)) {
+				beforeKill.run();
 				throw new IllegalStateException("killed during the start-up check (test)");
 			}
 		};

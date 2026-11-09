@@ -166,7 +166,7 @@ class StartupChecksTest {
 		var digest = NodeStore.recordSeedDigest(node);
 		NodeStore.noteSeedOpening(node);
 		// The check's open, cut before noteSeedOpened: the files changed, the seed's table files are the same ones.
-		NodeStore.open(node, null, "node").close();
+		startupCheckOpen(node);
 		assertNotEquals(digest, NodeStore.databaseFilesDigest(node));
 		assertEquals(digest, NodeStore.recordSeedDigest(node));
 		assertEquals(digest, NodeStore.recordSeedDigest(node), "kept again by a retry");
@@ -225,7 +225,7 @@ class StartupChecksTest {
 			copy(seed, node);
 			var digest = NodeStore.recordSeedDigest(node);
 			NodeStore.noteSeedOpening(node);
-			NodeStore.open(node, null, "node").close();
+			startupCheckOpen(node);
 			assertEquals(digest, NodeStore.recordSeedDigest(node), "the killed check alone");
 			var seedTables = fileNames(node, ".sst");
 			var otherTables = fileNames(other, ".sst");
@@ -236,6 +236,189 @@ class StartupChecksTest {
 			copyOver(other, node, inPlace);
 			assertTrue(fileNames(node, ".sst").containsAll(seedTables), "the seed's table files are still there");
 			assertNotEquals(digest, NodeStore.recordSeedDigest(node), (inPlace ? "cp" : "rsync") + " of another database");
+		}
+	}
+
+	/**
+	 * R43-1: after a killed start-up check, the operator lets the seed's source database run on (here flushes that its
+	 * own compaction folds into a new table file, deleting one the marker listed), stops it, and copies it again with
+	 * {@code rsync -a --delete}: the quick check (size and modification time) skips IDENTITY and every table file the
+	 * source still holds, so they keep their inode and change time; {@code --delete} removes the rest. That is not the
+	 * seed: a new digest is recorded. A listed table file gone is enough to tell, because the check's open never deletes
+	 * one ({@link #theStartupCheckOpenDeletesNoListedTableFile}).
+	 */
+	@Test
+	void aLaterCopyOfTheSourceByRsyncDeleteAfterAKilledCheckGetsANewDigest() throws Exception {
+		var source = tempDir.resolve("source");
+		try (var store = NodeStore.open(source, null, "source")) {
+			long kept = store.db().createColumn("kept", NodeStoreTest.DATA_SCHEMA);
+			long changed = store.db().createColumn("changed", NodeStoreTest.DATA_SCHEMA);
+			for (int i = 0; i < 100; i++) {
+				NodeStoreTest.put(store, kept, i, "v" + i);
+				NodeStoreTest.put(store, changed, i, "v" + i);
+			}
+		}
+		var node = tempDir.resolve("node/db");
+		rsyncDelete(source, node);
+		var digest = NodeStore.recordSeedDigest(node);
+		NodeStore.noteSeedOpening(node);
+		startupCheckOpen(node);
+		assertEquals(digest, NodeStore.recordSeedDigest(node), "the killed check alone");
+
+		// The source runs on: new values for the same keys of one column, flushed next to the old ones, compacted.
+		var seedTables = fileNames(source, ".sst");
+		try (var store = NodeStore.open(source, null, "source")) {
+			long changed = store.db().createColumn("changed", NodeStoreTest.DATA_SCHEMA);
+			// Four L0 files in all reach the compaction trigger of the default config.
+			for (int round = 0; round < 3; round++) {
+				for (int i = 0; i < 100; i++) {
+					NodeStoreTest.put(store, changed, i, "w" + round + "-" + i);
+				}
+				store.db().flush();
+			}
+			long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(30);
+			while (fileNames(source, ".sst").containsAll(seedTables)) {
+				assertTrue(System.nanoTime() < deadline, "the source compacted none of " + seedTables);
+				Thread.sleep(20);
+			}
+		}
+		var left = fileNames(source, ".sst").stream().filter(seedTables::contains).toList();
+		assertFalse(left.isEmpty(), "the source kept none of " + seedTables);
+
+		// The marker of the killed check is still there: the retry above kept the digest without writing another.
+		rsyncDelete(source, node);
+		assertTrue(fileNames(node, ".sst").containsAll(left));
+		assertNotEquals(digest, NodeStore.recordSeedDigest(node), "a later copy of the source with rsync --delete");
+	}
+
+	/**
+	 * Review of R43, 1: two first starts killed in a row inside the start-up check's open. The first was killed during
+	 * its WAL replay, after it wrote a recovery table file but before it committed it to the MANIFEST (RocksDB applies
+	 * the recovery edits at the end of recovery): here a stray table file numbered above any the MANIFEST knows. The
+	 * second open deletes it as obsolete (or would write the same number again). The marker of the second start must
+	 * list the seed's files, carried over from the first marker, not that stray file: the third start keeps the digest.
+	 */
+	@Test
+	void twoKilledChecksInARowKeepTheSeedDigestDespiteAnUncommittedTableFile() throws IOException {
+		var seed = tempDir.resolve("seed");
+		try (var store = NodeStore.open(seed, null, "seed")) {
+			long column = store.db().createColumn(NodeStoreTest.DATA_COLUMN, NodeStoreTest.DATA_SCHEMA);
+			for (int i = 0; i < 100; i++) {
+				NodeStoreTest.put(store, column, i, "v" + i);
+			}
+		}
+		var node = tempDir.resolve("node/db");
+		copy(seed, node);
+		var digest = NodeStore.recordSeedDigest(node);
+		NodeStore.noteSeedOpening(node);
+		var marker = Files.readString(node.resolveSibling("db.seed-digest"));
+
+		// The first check, killed during its WAL replay: a recovery table file the MANIFEST does not reference yet.
+		var stray = node.resolve("999999.sst");
+		Files.copy(largestFile(node, ".sst"), stray);
+		assertEquals(digest, NodeStore.recordSeedDigest(node), "the first killed check");
+
+		// The second check: its marker lists the seed's files, then its open deletes the stray file, and it is killed.
+		NodeStore.noteSeedOpening(node);
+		startupCheckOpen(node);
+		assertFalse(Files.exists(stray), "the open deleted the uncommitted table file");
+		assertEquals(digest, NodeStore.recordSeedDigest(node), "the second killed check");
+		assertEquals(marker, Files.readString(node.resolveSibling("db.seed-digest")),
+				"the marker of a kept digest is carried over");
+
+		// A third one, killed again, still keeps it.
+		NodeStore.noteSeedOpening(node);
+		startupCheckOpen(node);
+		assertEquals(digest, NodeStore.recordSeedDigest(node), "the third killed check");
+	}
+
+	/**
+	 * Like {@code rsync -a --delete source/ target/}: a file whose size and modification time are those of the source's
+	 * is skipped (not touched); any other is copied to a new file, with the source's modification time, and renamed over
+	 * the old one; what the source does not hold is deleted.
+	 */
+	private static void rsyncDelete(Path source, Path target) throws IOException {
+		Files.createDirectories(target);
+		try (Stream<Path> walk = Files.walk(source)) {
+			for (Path path : walk.toList()) {
+				Path destination = target.resolve(source.relativize(path).toString());
+				if (Files.isDirectory(path)) {
+					Files.createDirectories(destination);
+				} else if (!Files.isRegularFile(destination) || Files.size(destination) != Files.size(path)
+						|| !Files.getLastModifiedTime(destination).equals(Files.getLastModifiedTime(path))) {
+					Path temporary = destination.resolveSibling("." + destination.getFileName() + ".tmp");
+					Files.copy(path, temporary, java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+							java.nio.file.StandardCopyOption.COPY_ATTRIBUTES);
+					Files.move(temporary, destination, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+				}
+			}
+		}
+		try (Stream<Path> walk = Files.walk(target)) {
+			for (Path path : walk.sorted(Comparator.reverseOrder()).toList()) {
+				if (!Files.exists(source.resolve(target.relativize(path).toString()))) {
+					Files.delete(path);
+				}
+			}
+		}
+	}
+
+	/**
+	 * R43-2: the start-up check's open deletes no table file the marker listed, so the keep rule can ask for every one of
+	 * them. Its own compaction did: here the data column holds four overlapping L0 files, which the default compaction
+	 * trigger (four L0 files) folds into one, deleting them. Compactions stay off whatever the node's config says.
+	 */
+	@Test
+	void theStartupCheckOpenDeletesNoListedTableFile() throws Exception {
+		var config = tempDir.resolve("no-compactions.conf");
+		Files.writeString(config, "database.global.disable-auto-compactions = true\n");
+		var seed = tempDir.resolve("seed");
+		try (var store = NodeStore.open(seed, config, "seed")) {
+			long column = store.db().createColumn(NodeStoreTest.DATA_COLUMN, NodeStoreTest.DATA_SCHEMA);
+			for (int round = 0; round < 4; round++) {
+				for (int i = 0; i < 100; i++) {
+					NodeStoreTest.put(store, column, i, "v" + round + "-" + i);
+				}
+				store.db().flush();
+			}
+		}
+		var node = tempDir.resolve("node/db");
+		copy(seed, node);
+		var digest = NodeStore.recordSeedDigest(node);
+		NodeStore.noteSeedOpening(node);
+		var seedTables = fileNames(node, ".sst");
+		assertTrue(seedTables.size() >= 2, seedTables.toString());
+		// Killed while open, after its compaction (if any) had the time to run. The node's config turns compactions on
+		// for the column itself, and asks for adaptive compaction I/O, which needs them: the check's open overrides both.
+		var nodeConfig = tempDir.resolve("node.conf");
+		Files.writeString(nodeConfig, """
+				database.global.adaptive-compaction-io = true
+				database.global.column-options = [ { name: "%s", disable-auto-compactions: false } ]
+				""".formatted(NodeStoreTest.DATA_COLUMN));
+		try (var store = NodeStore.openForStartupCheck(node, nodeConfig, "node")) {
+			long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(3);
+			while (fileNames(node, ".sst").containsAll(seedTables) && System.nanoTime() < deadline) {
+				Thread.sleep(20);
+			}
+		}
+		var gone = seedTables.stream().filter(name -> !fileNamesUnchecked(node, ".sst").contains(name)).toList();
+		assertTrue(gone.isEmpty(), "the start-up check's open deleted " + gone + " of " + seedTables);
+		assertEquals(digest, NodeStore.recordSeedDigest(node));
+	}
+
+	/** The start-up check's open and close of {@code dbDir}, as {@code ReplicatedNode} makes it. */
+	private static void startupCheckOpen(Path dbDir) throws IOException {
+		startupCheckStore(dbDir).close();
+	}
+
+	private static NodeStore startupCheckStore(Path dbDir) throws IOException {
+		return NodeStore.openForStartupCheck(dbDir, null, "node");
+	}
+
+	private static List<String> fileNamesUnchecked(Path root, String suffix) {
+		try {
+			return fileNames(root, suffix);
+		} catch (IOException e) {
+			throw new UncheckedIOException(e);
 		}
 	}
 
