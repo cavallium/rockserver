@@ -949,8 +949,10 @@ final class NodeStore implements Closeable {
 	 * {@code <db>.restore-ready/CURRENT}, it throws "No database in" before anything is touched.</p>
 	 *
 	 * <p>A {@code target} that is, contains or is inside {@code dbDir}, one of its restore directories or the node's Raft
-	 * directory (also through a symbolic link) is refused before anything is touched, and so is a symbolic link to
-	 * nothing; on a failure, only a target that this call's checkpoint created is deleted (R34-2).</p>
+	 * directory (also through a symbolic link, a dangling one too) is refused before anything is touched, and so is a
+	 * symbolic link to nothing and an existing {@code <target>.tmp}, which the checkpoint builds in; on a failure, only
+	 * what this call's checkpoint created is deleted (R34-2 and its review). {@code dbDir}, {@code stateMachineDir} and
+	 * {@code target} are normalized once, as {@link #open} normalizes {@code dbDir}, and every step uses that form.</p>
 	 *
 	 * @throws NodeRunningException if the node holds its group's lock: nothing of the node is touched, nothing written
 	 */

@@ -142,8 +142,9 @@ Failure branches:
   `export-seed` finishes the swap, as a start of the node would, and exports that database; it prints `No database in
   .../db` only when neither `db/` nor `db.restore-ready` holds one. `--target` must be a new path outside the node's
   `db/`, its `db.restore-*` directories and `raft/`: `export-seed` refuses one inside them (also through a symbolic
-  link, and `DATA-DIR/db` itself when it is missing) with `a directory of the node being exported`, before it touches
-  anything (R34-2). It can also have `db/` behind that snapshot: `export-seed` verifies the snapshot and restores it into `db/` first, as a start of the
+  link, a dangling one too, and `DATA-DIR/db` itself when it is missing) with `a directory of the node being exported`,
+  before it touches anything (R34-2). It builds the copy in `NEW.tmp` and refuses a `NEW.tmp` that already exists
+  (`The target's temporary directory ... already exists`) rather than delete it: remove it, or choose another target. It can also have `db/` behind that snapshot: `export-seed` verifies the snapshot and restores it into `db/` first, as a start of the
   node would, and its output then says `its database was behind its snapshot at index N, restored first`. If the
   crash damaged that snapshot, `export-seed` exits 1 with `Not exported: The replica's latest snapshot ... (at index N)
   is damaged`, the database's index, and writes nothing: that replica may have applied entries up to N that its `db/`
