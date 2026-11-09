@@ -278,6 +278,11 @@ public final class ReplicatedServerMain {
 		startAndServe(config, directMemoryWatch);
 	}
 
+	/** R47-1: not yet. */
+	static @Nullable String unreadableLogHint(Throwable failure, Path dataDir, String groupId) {
+		return null;
+	}
+
 	/** How {@code run} starts its node: {@link ReplicatedNode#start}, unless a test replaced it. */
 	@FunctionalInterface
 	interface NodeStarter {

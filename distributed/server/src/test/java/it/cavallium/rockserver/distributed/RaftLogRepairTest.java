@@ -208,6 +208,38 @@ class RaftLogRepairTest {
 		assertEquals(Outcome.OK, repair().outcome(), "a repaired log needs nothing more");
 	}
 
+	/**
+	 * R47-1: a start that fails because Ratis cannot read the log (a torn or a damaged entry: the bytes do not tell
+	 * which, {@code repair-log} decides) prints how to run {@code repair-log} on this node, whatever wraps the error;
+	 * another failure of the start does not.
+	 */
+	@Test
+	void aStartThatCannotReadTheLogPointsToRepairLog() throws IOException {
+		writeSegment("log_0-9", 0, 9);
+		var open = writeOpenSegment(10, 19);
+		long start = entryStart(10, 19);
+		tear(open, start, start + entrySize(19));
+		var torn = assertThrows(IOException.class, () -> ratisEntries(open));
+		var data = dir.resolve("data");
+		var wrapped = new IOException("Failed to start", new java.util.concurrent.CompletionException(torn));
+		var hint = ReplicatedServerMain.unreadableLogHint(wrapped, data, GROUP);
+		assertTrue(hint != null && hint.contains("repair-log --data-dir " + data + " --dry-run"), String.valueOf(hint));
+		assertFalse(hint.contains("--group-id"), "the default group needs no --group-id: " + hint);
+		var group = UUID.randomUUID().toString();
+		var other = ReplicatedServerMain.unreadableLogHint(wrapped, data, group);
+		assertTrue(other != null && other.contains("repair-log --data-dir " + data + " --group-id " + group + " --dry-run"),
+				String.valueOf(other));
+
+		var damaged = writeSegment("log_20-29", 20, 29);
+		flipBit(damaged, entryStart(20, 25) + 100, 0x01);
+		var refused = assertThrows(IOException.class, () -> ratisEntries(damaged));
+		assertTrue(ReplicatedServerMain.unreadableLogHint(refused, data, GROUP) != null, "damage reads the same way");
+
+		assertNull(ReplicatedServerMain.unreadableLogHint(new java.net.BindException("Address already in use"), data, GROUP));
+		assertNull(ReplicatedServerMain.unreadableLogHint(new IllegalStateException("refused", new IOException("disk")),
+				data, GROUP));
+	}
+
 	@Test
 	void entryTornAtAPageBoundaryIsDropped() throws IOException {
 		var open = writeOpenSegment(0, 1);
@@ -1095,6 +1127,9 @@ class RaftLogRepairTest {
 		var refused = assertThrows(IllegalStateException.class, () -> cluster.waitReady(victim, READY_TIMEOUT));
 		assertTrue(refused.getMessage().contains("before printing READY"), refused.getMessage());
 		assertTrue(cluster.output(victim).contains("Log entry corrupted"), cluster.logTail(victim));
+		// R47-1: the start failure names the command that decides, with this node's data directory.
+		assertTrue(cluster.output(victim).contains("repair-log --data-dir " + cluster.dataDir(victim) + " --dry-run"),
+				cluster.logTail(victim));
 	}
 
 	/** A dry run that changes nothing, then the repair of what {@link #tearFrom} did, through the command line. */
