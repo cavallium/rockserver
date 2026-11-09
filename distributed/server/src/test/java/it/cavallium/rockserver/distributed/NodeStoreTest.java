@@ -1035,11 +1035,7 @@ class NodeStoreTest {
 		Files.createDirectories(dataDir.resolve(ReplicaOps.BACKUPS_DIR).resolve("nightly-1"));
 		Path absolute = dataDir.toAbsolutePath().normalize();
 		var observed = dataDirStatesAtEachFsync(absolute, () -> ReplicaOps.restore(backupDir, dataDir, null));
-		// The first fsync of the data directory is moveOldResultsAside's own: it comes before NodeStore.restore makes
-		// any db.restore-* entry, whose later fsync of the data directory would otherwise be the first (R35 review 1).
-		assertEquals("no db", observed.peek(), "fsyncs of the data directory: " + observed);
-		assertTrue(observed.stream().noneMatch(state -> state.contains("log") || state.contains("backups")),
-				"fsyncs of the data directory: " + observed);
+		assertOldResultsDurablyAsideBeforeTheDatabase(observed);
 		try (var files = Files.list(dataDir)) {
 			var names = files.map(path -> path.getFileName().toString()).toList();
 			assertTrue(names.stream().anyMatch(name -> name.startsWith("replica-ops.log.before-restore-")), "" + names);
@@ -1048,13 +1044,14 @@ class NodeStoreTest {
 	}
 
 	/**
-	 * R35-2: a {@code restore-backup} that fails (here: a {@code --rockserver-config} that does not parse, standing in
-	 * for a kill) has already moved the old cluster's results aside, so its rerun, which the failure allows, starts the
-	 * new cluster without them. Before, a kill after the database was restored and before the moves left them in place
-	 * next to {@code db/}, and the rerun was refused.
+	 * R35-2 and R36-3: a {@code restore-backup} that fails before the database is complete (here: a
+	 * {@code --rockserver-config} that does not parse) leaves the data directory as it found it, the old cluster's
+	 * results in place and no database, and its rerun moves them aside and restores. Since R36-1 every check and every
+	 * read of the backup comes before the renames, so a refusal renames nothing; at R35 the renames came first and a
+	 * failure left them done.
 	 */
 	@Test
-	void aFailedRestoreBackupHasAlreadyMovedTheOldResultsAside() throws IOException {
+	void aFailedRestoreBackupLeavesTheOldResultsInPlaceAndItsRerunMovesThem() throws IOException {
 		Path backupDir = tempDir.resolve("backup");
 		checkpointWithData(backupDir.resolve(ReplicaOps.BACKUP_DB_DIR), 10, TermIndex.valueOf(1, 10));
 		Files.writeString(backupDir.resolve(ReplicaOps.BACKUP_PROPERTIES), "name=b\nindex=10\ncluster=c\n");
@@ -1063,11 +1060,11 @@ class NodeStoreTest {
 		Path badConfig = tempDir.resolve("bad.conf");
 		Files.writeString(badConfig, "database { this does not parse");
 		assertThrows(Exception.class, () -> ReplicaOps.restore(backupDir, dataDir, badConfig));
-		assertFalse(Files.exists(dataDir.resolve("db")));
-		assertFalse(Files.exists(dataDir.resolve("replica-ops.log")), "the old results are still in place");
+		assertEquals(List.of("replica-ops.log"), entryNames(dataDir), "what the failed restore left");
 
 		assertEquals(TermIndex.valueOf(1, 10), ReplicaOps.restore(backupDir, dataDir, null));
 		assertFalse(Files.exists(dataDir.resolve("replica-ops.log")));
+		assertTrue(Files.isRegularFile(dataDir.resolve("db").resolve("CURRENT")));
 	}
 
 	/**
@@ -1086,7 +1083,212 @@ class NodeStoreTest {
 		Files.writeString(dataDir.resolve("replica-ops.log.before-restore-1"), "old cluster\n");
 		Path absolute = dataDir.toAbsolutePath().normalize();
 		var observed = dataDirStatesAtEachFsync(absolute, () -> ReplicaOps.restore(backupDir, dataDir, null));
-		assertEquals("no db", observed.peek(), "fsyncs of the data directory: " + observed);
+		assertOldResultsDurablyAsideBeforeTheDatabase(observed);
+	}
+
+	/**
+	 * R36-1/R36-2: {@code restore-backup --backup DATA-DIR/backups/<name>}, the directory the node's own {@code backup}
+	 * wrote, restores. Since R35-2 the command renamed {@code backups/} before it read the backup's database and failed
+	 * with {@link java.nio.file.NoSuchFileException}; at 52ea5e3 it worked. Now everything is read from the backup, and
+	 * the database built aside, before the renames; the backup ends up, intact, under
+	 * {@code backups.before-restore-<time>}.
+	 */
+	@Test
+	void restoreBackupRestoresABackupInsideTheDataDirectorysOwnBackupsDirectory() throws IOException {
+		Path dataDir = Files.createDirectories(tempDir.resolve("data"));
+		Path backupDir = dataDir.resolve(ReplicaOps.BACKUPS_DIR).resolve("2026-11-06");
+		checkpointWithData(backupDir.resolve(ReplicaOps.BACKUP_DB_DIR), 10, TermIndex.valueOf(1, 10));
+		Files.writeString(backupDir.resolve(ReplicaOps.BACKUP_PROPERTIES), "name=b\nindex=10\ncluster=c\n");
+		Files.writeString(dataDir.resolve("replica-ops.log"), "old cluster\n");
+
+		assertEquals(TermIndex.valueOf(1, 10), ReplicaOps.restore(backupDir, dataDir, null));
+
+		assertRestoredWithTheBackupMovedAside(dataDir, "2026-11-06");
+	}
+
+	/** R36-1/R36-2, through a symbolic link outside the data directory to {@code DATA-DIR/backups/<name>}. */
+	@Test
+	void restoreBackupRestoresABackupInsideTheOwnBackupsDirectoryThroughASymbolicLink() throws IOException {
+		Path dataDir = Files.createDirectories(tempDir.resolve("data"));
+		Path backupDir = dataDir.resolve(ReplicaOps.BACKUPS_DIR).resolve("nightly");
+		checkpointWithData(backupDir.resolve(ReplicaOps.BACKUP_DB_DIR), 10, TermIndex.valueOf(1, 10));
+		Files.writeString(backupDir.resolve(ReplicaOps.BACKUP_PROPERTIES), "name=b\nindex=10\ncluster=c\n");
+		Path link = Files.createSymbolicLink(tempDir.resolve("latest-backup"), backupDir);
+
+		assertEquals(TermIndex.valueOf(1, 10), ReplicaOps.restore(link, dataDir, null));
+
+		assertRestoredWithTheBackupMovedAside(dataDir, "nightly");
+	}
+
+	/**
+	 * R36-1/R36-2: a rerun after a run that stopped between its renames and the database's swap names the place its
+	 * {@code --backup DATA-DIR/backups/<name>} was moved to, rather than failing with a bare
+	 * {@link java.nio.file.NoSuchFileException}; the rerun with that path restores.
+	 */
+	@Test
+	void aRerunAfterTheRenamesSaysWhereTheBackupWasMoved() throws IOException {
+		Path dataDir = Files.createDirectories(tempDir.resolve("data"));
+		Path moved = dataDir.resolve(ReplicaOps.BACKUPS_DIR + ".before-restore-1").resolve("b1");
+		checkpointWithData(moved.resolve(ReplicaOps.BACKUP_DB_DIR), 10, TermIndex.valueOf(1, 10));
+		Files.writeString(moved.resolve(ReplicaOps.BACKUP_PROPERTIES), "name=b\nindex=10\ncluster=c\n");
+
+		var refused = assertThrows(IOException.class,
+				() -> ReplicaOps.restore(dataDir.resolve(ReplicaOps.BACKUPS_DIR).resolve("b1"), dataDir, null));
+		assertTrue(refused.getMessage().contains("--backup " + moved.toAbsolutePath().normalize()), refused.getMessage());
+		assertFalse(Files.exists(dataDir.resolve("db")));
+
+		assertEquals(TermIndex.valueOf(1, 10), ReplicaOps.restore(moved, dataDir, null));
+	}
+
+	/**
+	 * R36-3: a newer cluster's backup is refused before anything is renamed: the old cluster's {@code replica-ops.log}
+	 * and {@code backups/} stay in place, and no database, not even the one built aside to read the version, stays.
+	 * The exit-code table says "nothing is written"; at R35 the renames had happened.
+	 */
+	@Test
+	void aNewerClustersBackupIsRefusedBeforeAnythingIsRenamed() throws IOException {
+		Path dataDir = Files.createDirectories(tempDir.resolve("data"));
+		Path backupDir = dataDir.resolve(ReplicaOps.BACKUPS_DIR).resolve("newer");
+		Path source = tempDir.resolve("newer-source");
+		writeDatabaseOfVersion(source, NEWER_VERSION);
+		try (var store = NodeStore.open(source, null, "source")) {
+			store.checkpoint(backupDir.resolve(ReplicaOps.BACKUP_DB_DIR));
+		}
+		Files.writeString(backupDir.resolve(ReplicaOps.BACKUP_PROPERTIES), "name=b\nindex=7\ncluster=c\n");
+		Files.writeString(dataDir.resolve("replica-ops.log"), "old cluster\n");
+
+		assertThrows(ReplicatedNode.NewerVersionException.class, () -> ReplicaOps.restore(backupDir, dataDir, null));
+
+		assertEquals(List.of("backups", "replica-ops.log"), entryNames(dataDir), "what the refused restore left");
+		assertTrue(Files.isRegularFile(backupDir.resolve(ReplicaOps.BACKUP_PROPERTIES)));
+	}
+
+	/**
+	 * R36-1 guard: the database is built and opened aside, then renamed to {@code db/}; a Rockserver config whose
+	 * volume is an absolute path inside {@code DATA-DIR/db} still restores, with the volume inside the restored
+	 * database and nothing left aside.
+	 */
+	@Test
+	void restoreBackupWithAnAbsoluteVolumePathInsideTheDatabase() throws IOException {
+		Path backupDir = tempDir.resolve("backup");
+		checkpointWithData(backupDir.resolve(ReplicaOps.BACKUP_DB_DIR), 10, TermIndex.valueOf(1, 10));
+		Files.writeString(backupDir.resolve(ReplicaOps.BACKUP_PROPERTIES), "name=b\nindex=10\ncluster=c\n");
+		Path dataDir = Files.createDirectories(tempDir.resolve("data")).toAbsolutePath().normalize();
+		Path config = tempDir.resolve("absolute.conf");
+		Files.writeString(config, """
+				database.global.fallback-column-options.volumes = [
+				  { volume-path: "%s", target-size: "10TiB" }
+				]
+				""".formatted(dataDir.resolve("db").resolve("volume")));
+
+		assertEquals(TermIndex.valueOf(1, 10), ReplicaOps.restore(backupDir, dataDir, config));
+
+		assertEquals(List.of("db", "db.seed-digest"), entryNames(dataDir));
+		try (var store = NodeStore.open(dataDir.resolve("db"), config, "restored")) {
+			assertEquals(10, contents(store, store.db().getColumnId(DATA_COLUMN)).size());
+		}
+	}
+
+	/**
+	 * R36 review 1: a Rockserver config whose {@code wal-path} is an absolute path inside {@code DATA-DIR/db} (which the
+	 * node's start accepts) restores: the build aside opens its WAL inside {@code db.restore-backup}, not in
+	 * {@code DATA-DIR/db/wal}, which made {@code db/} appear before the renames and the wal-path check refuse the build.
+	 */
+	@Test
+	void restoreBackupWithAnAbsoluteWalPathInsideTheDatabase() throws IOException {
+		assertRestoresWithAnAbsolutePathInsideTheDatabase("wal-path", "wal");
+	}
+
+	/**
+	 * R36 review 1: the same for {@code log-path}: the build's info log went to {@code DATA-DIR/db/logs}, so {@code db/}
+	 * existed before the renames, and the rename of the build to {@code db/} failed on every run.
+	 */
+	@Test
+	void restoreBackupWithAnAbsoluteLogPathInsideTheDatabase() throws IOException {
+		assertRestoresWithAnAbsolutePathInsideTheDatabase("log-path", "logs");
+	}
+
+	private void assertRestoresWithAnAbsolutePathInsideTheDatabase(String key, String child) throws IOException {
+		Path backupDir = tempDir.resolve("backup");
+		checkpointWithData(backupDir.resolve(ReplicaOps.BACKUP_DB_DIR), 10, TermIndex.valueOf(1, 10));
+		Files.writeString(backupDir.resolve(ReplicaOps.BACKUP_PROPERTIES), "name=b\nindex=10\ncluster=c\n");
+		Path dataDir = Files.createDirectories(tempDir.resolve("data")).toAbsolutePath().normalize();
+		Files.writeString(dataDir.resolve("replica-ops.log"), "old cluster\n");
+		Path config = tempDir.resolve("absolute.conf");
+		Files.writeString(config, "database.global.%s = \"%s\"\n".formatted(key, dataDir.resolve("db").resolve(child)));
+
+		assertEquals(TermIndex.valueOf(1, 10), ReplicaOps.restore(backupDir, dataDir, config));
+
+		var names = entryNames(dataDir);
+		assertEquals(3, names.size(), names.toString());
+		assertEquals(List.of("db", "db.seed-digest"), names.subList(0, 2));
+		assertTrue(names.get(2).startsWith("replica-ops.log.before-restore-"), names.toString());
+		assertTrue(Files.isDirectory(dataDir.resolve("db").resolve(child)), "the " + key + " directory is inside db/");
+		try (var store = NodeStore.open(dataDir.resolve("db"), config, "restored")) {
+			assertEquals(10, contents(store, store.db().getColumnId(DATA_COLUMN)).size());
+		}
+	}
+
+	/**
+	 * R36 review 2: after an earlier restore-backup that succeeded (its {@code db/} is there and {@code backups/} was
+	 * renamed), a repeat with the old {@code --backup DATA-DIR/backups/<x>} is refused for the database it would
+	 * overwrite, not told to run again with the moved path, which would be refused for the same database.
+	 */
+	@Test
+	void aRepeatAfterASuccessfulRestoreIsRefusedForTheDatabaseNotSentToTheMovedBackup() throws IOException {
+		Path dataDir = Files.createDirectories(tempDir.resolve("data"));
+		Path moved = dataDir.resolve(ReplicaOps.BACKUPS_DIR + ".before-restore-1").resolve("b1");
+		checkpointWithData(moved.resolve(ReplicaOps.BACKUP_DB_DIR), 10, TermIndex.valueOf(1, 10));
+		Files.writeString(moved.resolve(ReplicaOps.BACKUP_PROPERTIES), "name=b\nindex=10\ncluster=c\n");
+		assertEquals(TermIndex.valueOf(1, 10), ReplicaOps.restore(moved, dataDir, null));
+
+		var refused = assertThrows(IOException.class,
+				() -> ReplicaOps.restore(dataDir.resolve(ReplicaOps.BACKUPS_DIR).resolve("b1"), dataDir, null));
+		assertTrue(refused.getMessage().contains("holds a database"), refused.getMessage());
+		assertFalse(refused.getMessage().contains("run again with"), refused.getMessage());
+	}
+
+	private void assertRestoredWithTheBackupMovedAside(Path dataDir, String name) throws IOException {
+		try (var store = NodeStore.open(dataDir.resolve("db"), null, "restored")) {
+			assertEquals(TermIndex.INITIAL_VALUE, store.applied(), "the replication metadata is dropped");
+			assertEquals(10, contents(store, store.db().getColumnId(DATA_COLUMN)).size());
+		}
+		assertNotNull(NodeStore.readSeedDigest(dataDir.resolve("db")));
+		assertFalse(Files.exists(dataDir.resolve(ReplicaOps.BACKUPS_DIR)), "the old backups are still in place");
+		Path aside;
+		try (Stream<Path> list = Files.list(dataDir)) {
+			aside = list.filter(path -> path.getFileName().toString().startsWith(ReplicaOps.BACKUPS_DIR + ".before-restore-"))
+					.findFirst().orElseThrow();
+		}
+		assertTrue(Files.isRegularFile(aside.resolve(name).resolve(ReplicaOps.BACKUP_PROPERTIES)), "the backup moved");
+		assertTrue(Files.isRegularFile(aside.resolve(name).resolve(ReplicaOps.BACKUP_DB_DIR).resolve("CURRENT")));
+	}
+
+	private static List<String> entryNames(Path dir) throws IOException {
+		try (Stream<Path> list = Files.list(dir)) {
+			return list.map(path -> path.getFileName().toString()).sorted().toList();
+		}
+	}
+
+	/**
+	 * The guarantee of R35-2, over {@link #dataDirStatesAtEachFsync}: no fsync of the data directory sees the old
+	 * results next to {@code db/}, and the last fsync before {@code db/} first appears sees neither the old results nor
+	 * {@code db/}, so the renames are durable before the database can be. Since R36-1 the database is built aside, and
+	 * fsyncs of the data directory during that build may still see the old results.
+	 */
+	private static void assertOldResultsDurablyAsideBeforeTheDatabase(java.util.Queue<String> observed) {
+		var states = List.copyOf(observed);
+		java.util.function.Predicate<String> hasDb = state -> !state.endsWith("no db");
+		java.util.function.Predicate<String> hasOld = state -> state.contains("log") || state.contains("backups");
+		assertTrue(states.stream().noneMatch(state -> hasDb.test(state) && hasOld.test(state)),
+				"fsyncs of the data directory: " + states);
+		int firstDb = 0;
+		while (firstDb < states.size() && !hasDb.test(states.get(firstDb))) {
+			firstDb++;
+		}
+		assertTrue(firstDb > 0 && firstDb < states.size(), "fsyncs of the data directory: " + states);
+		String before = states.get(firstDb - 1);
+		assertFalse(hasDb.test(before) || hasOld.test(before), "fsyncs of the data directory: " + states);
 	}
 
 	/**

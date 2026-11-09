@@ -182,10 +182,22 @@ final class NodeStore implements Closeable {
 	 * finished first, so the database never opens empty in its place.
 	 */
 	static NodeStore open(Path dbDir, @Nullable Path rockserverConfig, String name) throws IOException {
+		return open(dbDir, rockserverConfig, null, name);
+	}
+
+	/**
+	 * Like {@link #open(Path, Path, String)}, for a database in {@code dbDir} that will be renamed to
+	 * {@code configuredDbDir} (when not null), the directory the Rockserver config was written for: an absolute
+	 * {@code volume-path} under {@code configuredDbDir} is opened as the same path under {@code dbDir}, as export-seed
+	 * opens its copy ({@link #replicaConfig(Path, Path, Path, String)}). {@code restore-backup} builds the restored
+	 * database aside and renames it to {@code db/} once the old cluster's results are out of the way (R36-1).
+	 */
+	static NodeStore open(Path dbDir, @Nullable Path rockserverConfig, @Nullable Path configuredDbDir, String name)
+			throws IOException {
 		dbDir = dbDir.toAbsolutePath().normalize();
 		RestoreDirs.of(dbDir).recover();
 		deleteLeftConfigs(dbDir.getParent());
-		Path config = replicaConfig(rockserverConfig, dbDir, name);
+		Path config = replicaConfig(rockserverConfig, dbDir, configuredDbDir, name);
 		EmbeddedConnection connection;
 		try {
 			connection = new EmbeddedConnection(dbDir, name, config);
@@ -231,19 +243,12 @@ final class NodeStore implements Closeable {
 
 	/**
 	 * Writes the config the replica opens its database with to {@link #replicaConfigFile}: {@link #REPLICA_OVERRIDES} over
-	 * the given Rockserver config (HOCON), or over the defaults when there is none. The file is owner-only
-	 * ({@link #writeOwnerOnly}, R31-1).
-	 */
-	private static Path replicaConfig(@Nullable Path rockserverConfig, Path dbDir, String nodeId) throws IOException {
-		return replicaConfig(rockserverConfig, dbDir, null, nodeId);
-	}
-
-	/**
-	 * Like {@link #replicaConfig(Path, Path, String)}, for a copy in {@code dbDir} of the database in {@code sourceDbDir}
-	 * (when not null): an absolute {@code volume-path} under {@code sourceDbDir} becomes the same path relative to the
-	 * database directory, so that the copy opens its own volumes. The file is made next to {@code dbDir}, not in the
-	 * JDK's temporary directory (see {@code ReplicatedServerMain}), owner-only since it holds the resolved config with
-	 * its secrets ({@link #writeOwnerOnly}, R31-1). {@code nodeId} is the metrics node name when the config sets none.
+	 * the given Rockserver config (HOCON), or over the defaults when there is none. For a copy in {@code dbDir} of the
+	 * database in {@code sourceDbDir} (when not null), or a database that will be renamed to it: an absolute
+	 * {@code volume-path} under {@code sourceDbDir} becomes the same path relative to the database directory, so that the
+	 * copy opens its own volumes. The file is made next to {@code dbDir}, not in the JDK's temporary directory (see
+	 * {@code ReplicatedServerMain}), owner-only since it holds the resolved config with its secrets
+	 * ({@link #writeOwnerOnly}, R31-1). {@code nodeId} is the metrics node name when the config sets none.
 	 * Package-private for tests.
 	 */
 	static Path replicaConfig(@Nullable Path rockserverConfig, Path dbDir, @Nullable Path sourceDbDir,
@@ -261,7 +266,7 @@ final class NodeStore implements Closeable {
 			}
 			config = withReplicaWriteBuffers(config.resolve());
 			if (sourceDbDir != null) {
-				config = withRelativeVolumes(config, sourceDbDir);
+				config = withRelativePaths(config, sourceDbDir);
 			}
 		} catch (ConfigException | IllegalArgumentException e) {
 			throw new IOException("Failed to read the Rockserver config " + rockserverConfig, e);
@@ -382,12 +387,24 @@ final class NodeStore implements Closeable {
 
 	/**
 	 * Rewrites every absolute {@code volume-path} (of {@code fallback-column-options} and of the entries of
-	 * {@code column-options}) that lies under {@code dbDir} into the same path relative to the database directory.
+	 * {@code column-options}), and an absolute {@code wal-path} or {@code log-path}, that lies under {@code dbDir} into
+	 * the same path relative to the database directory.
 	 */
-	static Config withRelativeVolumes(Config config, Path dbDir) {
+	static Config withRelativePaths(Config config, Path dbDir) {
 		Path root = dbDir.toAbsolutePath().normalize();
 		String fallbackPath = "database.global.fallback-column-options.volumes";
 		Config result = config;
+		// The WAL and the info log as well (R36 review 1): RocksDB resolves an absolute wal-path or log-path as is, so a
+		// copy, or a database built aside to be renamed to dbDir, would write them into dbDir itself.
+		for (String pathKey : List.of("database.global.wal-path", "database.global.log-path")) {
+			if (config.hasPath(pathKey)) {
+				Path path = Path.of(config.getString(pathKey));
+				if (path.isAbsolute() && path.normalize().startsWith(root)) {
+					String relative = root.relativize(path.normalize()).toString();
+					result = result.withValue(pathKey, ConfigValueFactory.fromAnyRef(relative.isEmpty() ? "." : relative));
+				}
+			}
+		}
 		if (config.hasPath(fallbackPath)) {
 			result = result.withValue(fallbackPath, relativeVolumes(config.getObjectList(fallbackPath), root));
 		}
@@ -1520,6 +1537,18 @@ final class NodeStore implements Closeable {
 		Files.move(dirs.building, dirs.ready);
 		syncDirectory(dirs.parent);
 		dirs.recover();
+	}
+
+	/**
+	 * Deletes {@code dbDir} and the sibling directories a {@link #restore} into it builds ({@code <db>.restore-tmp},
+	 * {@code -ready}, {@code -old}), whatever state a crash left them in; for a database directory that nothing opens
+	 * as a node's database, such as the one {@code restore-backup} builds aside (R36-1).
+	 */
+	static void deleteWithRestoreDirectories(Path dbDir) throws IOException {
+		var dirs = RestoreDirs.of(dbDir);
+		for (Path dir : List.of(dirs.building, dirs.ready, dirs.old, dirs.dbDir)) {
+			deleteRecursively(dir);
+		}
 	}
 
 	/** Sibling directories used by {@link #restore}. */

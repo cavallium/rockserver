@@ -262,17 +262,28 @@ over (clients open new ones by themselves).
 2. On every node of the new cluster, into an empty data directory, from a copy of the same backup:
    `rs restore-backup --backup /path/to/<name> --data-dir /srv/rockserver/data [--rockserver-config ...]`.
    It prints `OK`, the data directory and the log index the data reaches. It refuses a data directory with a `db/` or a
-   Raft log, and first renames a `replica-ops.log` and a `backups/` of the old cluster found there (suffix
-   `.before-restore-<time>`) and fsyncs the directory, before it restores anything, so that their results never answer
-   for the new cluster. Every command takes `--data-dir` absolute and normalized (`/x/link/..` is `/x`, not the parent
+   Raft log, before it looks at the backup. It reads the backup and builds the database aside, in `DATA-DIR/db.restore-backup`, checking its cluster
+   version; only then does it rename a `replica-ops.log` and a `backups/` of the old cluster found there (suffix
+   `.before-restore-<time>`) and fsync the directory, and then rename the built database to `db/`, so that their
+   results never answer for the new cluster. A backup inside `DATA-DIR/backups` (the node's own
+   `--backup DATA-DIR/backups/<name>`, also through a link) works: it is read completely before it is renamed with
+   `backups/`, and is then found, intact, under `backups.before-restore-<time>/<name>`. Every command takes `--data-dir` absolute and normalized (`/x/link/..` is `/x`, not the parent
    of the link's target): use the same `--data-dir` for `restore-backup` and for the node's start, and the `OK` line
    names the directory both use.
-   It refuses a backup of a newer cluster version than this binary supports with exit code 5, and leaves no `db/`:
-   restore it with the newer version. Run that newer version on every node of the new cluster as well: the restored
+   It refuses a backup of a newer cluster version than this binary supports with exit code 5 before it renames
+   anything, and leaves no `db/`: restore it with the newer version. Run that newer version on every node of the new cluster as well: the restored
    `db/` carries no cluster version, so an older binary started on it is not refused, and would hold data written by a
    newer version under the oldest cluster version. On any other failure (a `--rockserver-config` that does not parse,
-   a column that does not open, a full disk) it also removes the `db/` it made, so fix the cause and run the same
-   command again. A `db/` left there by an interrupted run (power loss, `kill -9`) is not removed: delete
+   a column that does not open, a full disk) it also removes what it built, and renames nothing if it failed before
+   the renames, so fix the cause and run the same command again. A run interrupted (power loss, `kill -9`) before
+   `db/` appeared leaves at most `db.restore-backup` (with possibly `db.restore-backup.restore-tmp`, `.restore-ready`
+   or `.restore-old`, and `rockserver-replica-for-db.restore-backup.conf`, which holds the resolved config with its
+   secrets) and the renames: run the same command again, which deletes all of those and finds nothing more to rename;
+   if that run had already renamed the `backups/` your `--backup` pointed into, the rerun says where the backup is
+   now (`run again with --backup .../backups.before-restore-<time>/<name>`). A `wal-path`, `log-path` or volume path
+   of the `--rockserver-config` that is absolute inside `DATA-DIR/db` is fine: the database built aside keeps them
+   under `db.restore-backup`, and they are in `db/` after the rename.
+   A `db/` left by a run interrupted in its last step (recording `db.seed-digest`) is not removed: delete
    `DATA-DIR/db` and run it again.
    Use copies of one node's backup on every node (`cp -a`, `rsync`, `scp` of the whole `<name>` directory), not the
    backup each node took itself: those hold the same data, but not the same files. `restore-backup` records the seed
@@ -478,7 +489,7 @@ disk problem to look at.
 | 2 | Wrong usage, or no `-XX:+ExitOnOutOfMemoryError`: also an unknown option, a word that is no option's value (a flag given a value, `--join false` or `--pipelined-updates false`, which turned the flag on before), a malformed value (a non-numeric number, an `--election-timeout-ms` that is not MIN:MAX, a `--peer` or `--group-id` that does not parse) or one the node's configuration refuses (`--parallel-apply-threads 1`, a node id not among the peers, a minimum election timeout not below the maximum) | Wrong usage: also an unknown option (a misspelled one), an option of another command (`--allow-skipped` without `checksum`, `--unsafe-multi-voter-change` without `add-peer` or `remove-peer`), a word the command does not take (`status now`), a malformed value (`--timeout-ms`, `--peer`, `--group-id`, the index of `backup-status`, the argument of `add-peer`, a member id with `=` for `remove-peer`, `transfer-leader` or `snapshot`) | Wrong usage: also an unknown option or a stray word (`--dry-run yes`) | Wrong usage: also an unknown option or a stray word; `export-seed` with a group (`--group-id`, or the default without it) that has no directory in a `raft/` holding other groups |
 | 3 | The node stopped after a failure: its replica failed, Raft closed, a JVM pause beyond `--jvm-pause-limit-ms`, out of direct memory on a thread of replication; also a failure that raced a SIGTERM, and out of heap (the JVM's own status for `-XX:+ExitOnOutOfMemoryError`) | - | - | - |
 | 4 | Removed from the cluster, confirmed by a majority of the current configuration: refused at the start, or found out while it heard no leader. Do not start it again (see "Removed node"; until a majority answers, a removed node waits outside instead) | Incomplete: a member gave no result in time (`checksum`, `backup`, `backup-status`), no member took the request in time, or a `checksum` answer that does not tell whether it was proposed: run it again | - | - |
-| 5 | Its database, its log or a snapshot it installed has a cluster version with capabilities this version lacks: run the newer version | - | - | The replica's database (`export-seed`) or the backup (`restore-backup`) has a cluster version with capabilities this version lacks; nothing is written: run the newer version |
+| 5 | Its database, its log or a snapshot it installed has a cluster version with capabilities this version lacks: run the newer version | - | - | The replica's database (`export-seed`) or the backup (`restore-backup`) has a cluster version with capabilities this version lacks; nothing is written (`restore-backup` renames nothing, and deletes the database it built aside to read the version): run the newer version |
 
 A stop of `run` by SIGTERM, after its hand-off, ends with 143 and one by SIGINT with 130: the JVM's
 status for a signal (128 plus its number), since the shutdown hook halts with a status of its own only after a
