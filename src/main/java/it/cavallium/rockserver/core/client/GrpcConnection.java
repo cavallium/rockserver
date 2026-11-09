@@ -302,18 +302,20 @@ public final class GrpcConnection extends BaseConnection {
 		if (writes != null && writes.numbers(request)) {
 			return (RA) writes.send(context, (RocksDBAPICommand.RocksDBAPICommandSingle<?>) request);
 		}
+		// The futures derived below pass a cancel on to the call (R46-4): a cancelled getForUpdate reaches the server,
+		// which releases its key at once, as with sessions off.
 		if (writes != null && writes.endsUpdateUnnumbered(request)) {
 			// A multi write over the numbering limit that ends an update: the update is forgotten once it ended, as
 			// after a numbered one.
-			return (RA) ((CompletableFuture<Object>) delegate.requestAsync(context, request))
-					.whenComplete((_, _) -> writes.forgetUpdate(request));
+			var call = (CompletableFuture<Object>) delegate.requestAsync(context, request);
+			return (RA) CancelPropagatingFuture.of(call, call.whenComplete((_, _) -> writes.forgetUpdate(request)));
 		}
 		if (writes != null && SessionWrites.observes(request)) {
-			return (RA) ((CompletableFuture<Object>) delegate.requestAsync(context, request))
-					.thenApply(result -> {
-						writes.observe(request, result);
-						return result;
-					});
+			var call = (CompletableFuture<Object>) delegate.requestAsync(context, request);
+			return (RA) CancelPropagatingFuture.of(call, call.thenApply(result -> {
+				writes.observe(request, result);
+				return result;
+			}));
 		}
 		return delegate.requestAsync(context, request);
 	}
@@ -1115,15 +1117,13 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 
 		return (CompletableFuture<List<T>>) (switch (requestType) {
 			case RequestNothing<?> _ ->
-					toResponse(reactiveStubWithRequestDeadline().putMulti(inputRequests)
+					emptyList(toResponse(reactiveStubWithRequestDeadline().putMulti(inputRequests)
 						.ignoreElement()
-						.toFuture())
-						.thenApply(_ -> List.of());
+						.toFuture()));
 			case RequestType.RequestEnsure<?> _ ->
-					toResponse(reactiveStubWithRequestDeadline().putMultiEnsure(inputRequests)
+					emptyList(toResponse(reactiveStubWithRequestDeadline().putMultiEnsure(inputRequests)
 							.ignoreElement()
-							.toFuture())
-							.thenApply(_ -> List.of());
+							.toFuture()));
 			case RequestPrevious<?> _ ->
 					toResponse(reactiveStubWithRequestDeadline().putMultiGetPrevious(inputRequests)
 						.collect(() -> new ArrayList<@Nullable Buf>(),
@@ -1180,10 +1180,9 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 
 		return (CompletableFuture<List<T>>) (switch (requestType) {
 			case RequestNothing<?> _ ->
-					toResponse(reactiveStubWithRequestDeadline().deleteMulti(inputRequests)
+					emptyList(toResponse(reactiveStubWithRequestDeadline().deleteMulti(inputRequests)
 							.ignoreElement()
-							.toFuture())
-							.thenApply(_ -> List.of());
+							.toFuture()));
 			case RequestPrevious<?> _ ->
 					toResponse(reactiveStubWithRequestDeadline().deleteMultiGetPrevious(inputRequests)
 							.collect(() -> new ArrayList<@Nullable Buf>(),
@@ -1248,10 +1247,9 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 
 		return (CompletableFuture<List<T>>) (switch (requestType) {
 			case RequestNothing<?> _ ->
-					toResponse(reactiveStubWithRequestDeadline().mergeMulti(inputRequests)
+					emptyList(toResponse(reactiveStubWithRequestDeadline().mergeMulti(inputRequests)
 						.ignoreElement()
-						.toFuture())
-						.thenApply(_ -> List.of());
+						.toFuture()));
 			case RequestType.RequestMerged<?> _ ->
 					toResponse(reactiveStubWithRequestDeadline().mergeMultiGetMerged(inputRequests)
 						.map(v -> v.hasMerged() ? mapByteString(v.getMerged()) : null)
@@ -1969,9 +1967,15 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 		return result;
 	}
 
+	/** Maps the errors of {@code future}; a cancel reaches it, and through it the call (R46-4). */
 	private static <T> CompletableFuture<T> toResponse(CompletableFuture<T> future) {
-		return future
-				.exceptionallyCompose(ex -> CompletableFuture.failedFuture(mapGrpcStatusError(ex)));
+		return CancelPropagatingFuture.of(future,
+				future.exceptionallyCompose(ex -> CompletableFuture.failedFuture(mapGrpcStatusError(ex))));
+	}
+
+	/** The answer of a write that returns nothing: a cancel reaches {@code future}, and through it the call (R46-4). */
+	private static <T> CompletableFuture<List<T>> emptyList(CompletableFuture<?> future) {
+		return CancelPropagatingFuture.of(future, future.thenApply(_ -> List.of()));
 	}
 
 	private static <T> Mono<T> toResponse(Mono<T> mono) {

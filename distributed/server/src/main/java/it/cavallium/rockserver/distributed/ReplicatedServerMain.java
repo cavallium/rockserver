@@ -105,7 +105,8 @@ import org.rocksdb.NativeLibraryLoader;
  * with {@code --join}, however long before the {@code add-peer}. It exits with 3 if its replica failed or its Raft server
  * closed, so that a supervisor notices. {@code repair-log} runs on a stopped node, after a power loss left it unable to read its Raft log: see
  * {@link RaftLogRepair}. It exits with 0 if the log is valid or was repaired (with {@code --dry-run}: could be) and
- * with 1 if it refuses.</p>
+ * with 1 if it refuses. Its {@code --group-id} is a UUID as for {@code run}, in any case: another value is wrong usage,
+ * exit 2 (R46-3).</p>
  *
  * <p>Run a node with {@code -XX:+ExitOnOutOfMemoryError}: {@code run} refuses to start without it, unless
  * {@code --allow-without-exit-on-oom} is given (for development only). Running out of direct memory on a thread of
@@ -1609,7 +1610,9 @@ public final class ReplicatedServerMain {
 
 	private static void repairLog(Options options) throws IOException {
 		var dataDir = dataDirectory(options);
-		var groupId = options.value("--group-id", NodeConfig.DEFAULT_GROUP_ID);
+		// As run, admin and export-seed (R46-3): a UUID, whose canonical form names the group's directory; any other
+		// value is wrong usage, never a path component.
+		var groupId = options.uuid("--group-id", NodeConfig.DEFAULT_GROUP_ID).toString();
 		var dryRun = options.flag("--dry-run");
 		options.requireConsumed();
 		var report = RaftLogRepair.run(dataDir, groupId, dryRun);
