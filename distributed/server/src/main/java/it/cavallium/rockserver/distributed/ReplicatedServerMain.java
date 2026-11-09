@@ -70,6 +70,7 @@ import org.rocksdb.NativeLibraryLoader;
  *       | checksum [--allow-skipped] | backup NAME | backup-status NAME INDEX
  * repair-log --data-dir DIR [--group-id UUID] [--dry-run]
  * export-seed --data-dir DIR --target DIR [--rockserver-config FILE] [--group-id UUID]
+ *             [--without-damaged-snapshot]
  * restore-backup --backup DIR --data-dir DIR [--rockserver-config FILE]
  * </pre>
  *
@@ -123,7 +124,10 @@ import org.rocksdb.NativeLibraryLoader;
  * cluster, the last resort of "No quorum" in the design document (see {@link NodeStore#exportSeed}). A verified snapshot
  * in {@code raft/<group>/sm} ahead of the database (a crash during its installation) is restored into it first, as the
  * node's start would, and the output says so; {@code --group-id} names the node's group (default as for {@code run}),
- * and without it a {@code raft/} holding only other groups is wrong usage (R31-2).</p>
+ * and a group without a directory in a {@code raft/} holding other groups is wrong usage, given or not (R31-2, R32-2).
+ * A damaged snapshot fails it with exit code 1, naming the snapshot's index and the database's, and writes nothing;
+ * {@code --without-damaged-snapshot} exports the database as it is, and the output names the snapshot left out
+ * (R32-1).</p>
  *
  * <p>{@code admin} refuses an option it does not know, a malformed value (a malformed {@code add-peer} argument
  * included), or a word its command does not take, with exit code 2. Its changes end with
@@ -532,33 +536,47 @@ public final class ReplicatedServerMain {
 				? Path.of(options.value("--rockserver-config")) : null;
 		boolean groupGiven = options.value("--group-id") != null;
 		var groupId = options.uuid("--group-id", NodeConfig.DEFAULT_GROUP_ID).toString();
+		boolean withoutDamagedSnapshot = options.flag("--without-damaged-snapshot");
 		options.requireConsumed();
 		Path groupDir = dataDir.resolve("raft").resolve(groupId);
-		if (!groupGiven && !Files.isDirectory(groupDir)) {
-			// A node of another group: its snapshot, possibly ahead of db/, would be missed without a word (R31-2).
+		if (!Files.isDirectory(groupDir)) {
+			// A node of another group, or a mistyped --group-id (R32-2): its snapshot, possibly ahead of db/, would be
+			// missed without a word (R31-2).
 			var others = groupDirs(dataDir.resolve("raft"));
 			if (!others.isEmpty()) {
 				usage("no Raft state of group " + groupId + " in " + dataDir.resolve("raft") + ", which holds "
-						+ String.join(", ", others) + ": pass the node's --group-id");
+						+ String.join(", ", others) + ": pass the node's --group-id"
+						+ (groupGiven ? " (the one given has no directory there)" : ""));
 			}
 		}
 		NodeStore.ExportedSeed exported;
 		try {
-			exported = NodeStore.exportSeed(dataDir.resolve("db"), groupDir.resolve("sm"), rockserverConfig, target);
+			exported = NodeStore.exportSeed(dataDir.resolve("db"), groupDir.resolve("sm"), rockserverConfig, target,
+					withoutDamagedSnapshot);
 		} catch (ReplicatedNode.NewerVersionException e) {
 			System.err.println("Not exported: " + e.getMessage());
 			exit(5);
 			return;
+		} catch (NodeStore.DamagedSnapshotNotExportedException e) {
+			// Not a usage error: the same command line works on another replica (R32-1).
+			System.err.println("Not exported: " + e.getMessage());
+			exit(1);
+			return;
 		}
+		String left = null;
 		if (exported.damagedSnapshot() != null) {
-			System.err.println("WARNING: the replica's latest snapshot is damaged and was not used: "
-					+ exported.damagedSnapshot());
+			left = exported.damagedSnapshotIndex() >= 0
+					? "damaged snapshot at index " + exported.damagedSnapshotIndex()
+					: "damaged snapshot of unknown index";
+			System.err.println("WARNING: --without-damaged-snapshot: the replica's " + left + " was not used, and the"
+					+ " copy may lack entries up to it: " + exported.damagedSnapshot());
 		}
 		System.out.println("Exported the database of cluster " + exported.clusterId() + ", applied up to index "
 				+ exported.applied().getIndex() + " of term " + exported.applied().getTerm() + ", to " + target
 				+ (exported.restoredSnapshot() == null ? ""
 						: " (its database was behind its snapshot at index " + exported.restoredSnapshot().getIndex()
 								+ ", restored first as a start of the node would)")
+				+ (left == null ? "" : " (without its " + left + ", which the replica may have applied)")
 				+ ". Compare the applied index with the other replicas' before seeding a new cluster with it");
 	}
 
@@ -1589,6 +1607,7 @@ public final class ReplicatedServerMain {
 				        | checksum [--allow-skipped] | backup NAME | backup-status NAME INDEX
 				  repair-log --data-dir DIR [--group-id UUID] [--dry-run]
 				  export-seed --data-dir DIR --target DIR [--rockserver-config FILE] [--group-id UUID]
+				              [--without-damaged-snapshot]
 				  restore-backup --backup DIR --data-dir DIR [--rockserver-config FILE]""");
 		exit(2);
 	}
@@ -1596,7 +1615,8 @@ public final class ReplicatedServerMain {
 	/** Minimal "--name value" parser; {@code --peer} may repeat, and a {@link #FLAGS flag} takes no value. */
 	private static final class Options {
 		private static final List<String> FLAGS = List.of("--pipelined-updates", "--join", "--dry-run",
-				"--allow-without-exit-on-oom", "--allow-skipped", UNSAFE_MULTI_VOTER_CHANGE);
+				"--allow-without-exit-on-oom", "--allow-skipped", UNSAFE_MULTI_VOTER_CHANGE,
+				"--without-damaged-snapshot");
 
 		private final List<String[]> pairs = new ArrayList<>();
 		private final List<String> positional = new ArrayList<>();

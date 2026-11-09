@@ -901,14 +901,21 @@ final class NodeStore implements Closeable {
 	 * of the database (a crash after a received snapshot was renamed into place, before it was restored into
 	 * {@code db/}), the snapshot is verified and restored into {@code dbDir} first, exactly as the replica's start would
 	 * ({@link CheckpointStorage#init(Path)}, then {@link #restoreSnapshotIfAhead}), and the copy holds it (R31-2). A
-	 * snapshot damaged by such a crash is not used: the copy holds what {@code dbDir} holds, and
-	 * {@link ExportedSeed#damagedSnapshot} says why.
+	 * snapshot damaged by such a crash is not used, and nothing is exported (R32-1): the replica may have applied
+	 * entries up to it that its database lacks, see {@link #exportSeed(Path, Path, Path, Path, boolean)}.
+	 *
+	 * @throws DamagedSnapshotNotExportedException if the latest snapshot is damaged: nothing is written
 	 */
 	static ExportedSeed exportSeed(Path dbDir, @Nullable Path stateMachineDir, @Nullable Path rockserverConfig,
 			Path target) throws IOException {
 		return exportSeed(dbDir, stateMachineDir, rockserverConfig, target, false);
 	}
 
+	/**
+	 * Like {@link #exportSeed(Path, Path, Path, Path)}; with {@code withoutDamagedSnapshot}, a damaged latest snapshot
+	 * does not stop the export: the copy holds what {@code dbDir} holds, and {@link ExportedSeed#damagedSnapshot} and
+	 * {@link ExportedSeed#damagedSnapshotIndex} say which snapshot was left out (R32-1).
+	 */
 	static ExportedSeed exportSeed(Path dbDir, @Nullable Path stateMachineDir, @Nullable Path rockserverConfig,
 			Path target, boolean withoutDamagedSnapshot) throws IOException {
 		target = target.toAbsolutePath().normalize();
@@ -921,7 +928,7 @@ final class NodeStore implements Closeable {
 		// The copy's config first: when it is refused, nothing has been written yet.
 		Path config = replicaConfig(rockserverConfig, target, dbDir, "export-target");
 		try {
-			return exportSeedInto(dbDir, stateMachineDir, rockserverConfig, target, config);
+			return exportSeedInto(dbDir, stateMachineDir, rockserverConfig, target, config, withoutDamagedSnapshot);
 		} catch (IOException | RuntimeException | Error failure) {
 			// Nothing half-made stays (R29-1): the target did not exist before, and a checkpoint that failed removed its
 			// own temporary copy.
@@ -937,11 +944,13 @@ final class NodeStore implements Closeable {
 	}
 
 	private static ExportedSeed exportSeedInto(Path dbDir, @Nullable Path stateMachineDir,
-			@Nullable Path rockserverConfig, Path target, Path config) throws IOException {
+			@Nullable Path rockserverConfig, Path target, Path config, boolean withoutDamagedSnapshot)
+			throws IOException {
 		TermIndex applied;
 		String clusterId;
 		TermIndex restoredSnapshot = null;
 		String damagedSnapshot = null;
+		long damagedSnapshotIndex = -1;
 		var store = open(dbDir, rockserverConfig, "export-source");
 		try {
 			// After the open: it fails while the replica runs, before anything in its Raft directory is touched.
@@ -956,9 +965,24 @@ final class NodeStore implements Closeable {
 						restoredSnapshot = snapshot.getTermIndex();
 					}
 				} catch (CheckpointStorage.DamagedSnapshotException damaged) {
-					// A start refuses this replica; the last resort copies what its database holds all the same.
-					LOG.warn("Exporting {} without the damaged snapshot in {}", dbDir, stateMachineDir, damaged);
-					damagedSnapshot = damaged.getMessage();
+					// A start refuses this replica. The database may lack entries up to the snapshot's index that only
+					// the snapshot held: export it only when told to, never with an exit status that looks complete.
+					var databaseApplied = store.applied();
+					long index = damaged.snapshotIndex();
+					String at = index >= 0 ? "at index " + index : "of unknown index";
+					if (!withoutDamagedSnapshot) {
+						throw new DamagedSnapshotNotExportedException("The replica's latest snapshot "
+								+ damaged.dir() + " (" + at + ") is damaged (" + damaged.reason() + "), probably by a"
+								+ " crash while it was installed, and cannot be used; its database is at index "
+								+ databaseApplied.getIndex() + " and may lack entries up to the snapshot's index,"
+								+ " which no tool reads out of the damaged files. Export the other replicas and"
+								+ " compare their indexes; to export this database as it is, pass"
+								+ " --without-damaged-snapshot", index, databaseApplied, damaged);
+					}
+					LOG.warn("Exporting {} at index {} without the damaged snapshot {} in {}", dbDir,
+							databaseApplied.getIndex(), at, stateMachineDir, damaged);
+					damagedSnapshot = damaged.dir() + " (" + damaged.reason() + ")";
+					damagedSnapshotIndex = index;
 				}
 			}
 			// The copy leaves out the cluster version with the rest of the metadata: refuse a newer cluster's database
@@ -982,17 +1006,22 @@ final class NodeStore implements Closeable {
 			db.flush();
 		}
 		syncTree(target);
-		return new ExportedSeed(applied, clusterId, restoredSnapshot, damagedSnapshot, -1);
+		return new ExportedSeed(applied, clusterId, restoredSnapshot, damagedSnapshot, damagedSnapshotIndex);
 	}
 
 	/**
 	 * What {@link #exportSeed} copied: the applied position and the cluster (null if none) of the replica; the position
-	 * of the snapshot restored into its database first (null if none was ahead), and why a snapshot of the replica could
-	 * not be used (null if none was damaged), see {@link #exportSeed(Path, Path, Path, Path)}.
+	 * of the snapshot restored into its database first (null if none was ahead); the damaged snapshot left out and why
+	 * (null if none was damaged) and its index (-1 if none, or if its name does not tell), see
+	 * {@link #exportSeed(Path, Path, Path, Path, boolean)}.
 	 */
 	record ExportedSeed(TermIndex applied, @Nullable String clusterId, @Nullable TermIndex restoredSnapshot,
 			@Nullable String damagedSnapshot, long damagedSnapshotIndex) {}
 
+	/**
+	 * {@code export-seed} found the replica's latest snapshot damaged and was not told to export without it: nothing
+	 * was written (R32-1). The message is meant for that command: it names the snapshot's index and the database's.
+	 */
 	static final class DamagedSnapshotNotExportedException extends IOException {
 		private final long snapshotIndex;
 		private final TermIndex databaseApplied;
@@ -1004,10 +1033,12 @@ final class NodeStore implements Closeable {
 			this.databaseApplied = databaseApplied;
 		}
 
+		/** The damaged snapshot's index, -1 if its name does not tell. */
 		long snapshotIndex() {
 			return snapshotIndex;
 		}
 
+		/** The position the replica's database was applied up to. */
 		TermIndex databaseApplied() {
 			return databaseApplied;
 		}

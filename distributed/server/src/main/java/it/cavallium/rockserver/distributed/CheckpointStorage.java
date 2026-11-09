@@ -561,10 +561,46 @@ final class CheckpointStorage implements StateMachineStorage {
 	/** An installed snapshot lost data in a crash; this replica cannot use it and must be rebuilt. */
 	static final class DamagedSnapshotException extends IOException {
 
+		private final Path dir;
+		private final String reason;
+
 		DamagedSnapshotException(Path dir, String reason, @Nullable Throwable cause) {
 			super("Installed snapshot " + dir + " is damaged (" + reason + "), probably by a crash before it was"
 					+ " synced. The Raft log may already start after it, so this replica cannot catch up by itself:"
 					+ " rebuild it from the other members", cause);
+			this.dir = dir;
+			this.reason = reason;
+		}
+
+		/** The damaged snapshot's directory, {@code snapshot-<term>-<index>}. */
+		Path dir() {
+			return dir;
+		}
+
+		/** What is wrong with it, without the advice of the message (which fits a start, not {@code export-seed}). */
+		String reason() {
+			return reason;
+		}
+
+		/**
+		 * The snapshot's index, from its directory name ({@code snapshot-<term>-<index>}, as Ratis installs it; its
+		 * properties file may be what the crash damaged), or -1 if the name does not tell.
+		 */
+		long snapshotIndex() {
+			String name = dir.getFileName().toString();
+			if (!name.startsWith(SNAPSHOT_PREFIX)) {
+				return -1;
+			}
+			String[] parts = name.substring(SNAPSHOT_PREFIX.length()).split("-");
+			if (parts.length != 2) {
+				return -1;
+			}
+			try {
+				Long.parseLong(parts[0]);
+				return Long.parseLong(parts[1]);
+			} catch (NumberFormatException e) {
+				return -1;
+			}
 		}
 	}
 }
