@@ -343,6 +343,116 @@ class StartupChecksTest {
 	}
 
 	/**
+	 * R45-1: a table file shared by hard links with something outside {@code db/} (a backup copy that restore-backup
+	 * linked on the same file system, the source of an export, a seed spread with {@code cp -al}) gets a new change time
+	 * whenever any other link to it is created or removed: Linux updates the inode's ctime on {@code link()} and
+	 * {@code unlink()}. After a killed check the operator deletes the backup copy (one link fewer per shared file) and
+	 * links another copy (one more): neither changes the files the check's open left, so the digest is kept. A table
+	 * file rewritten in place with its own size and modification time ({@code cp -p} over it), its link count
+	 * unchanged, is still another file.
+	 */
+	@Test
+	void aKilledCheckKeepsTheDigestWhenOutsideHardLinksToTheSeedComeAndGo() throws IOException {
+		org.junit.jupiter.api.Assumptions.assumeTrue(birthTimeKnown(tempDir),
+				"the file system of " + tempDir + " keeps no birth time");
+		var seed = tempDir.resolve("seed");
+		try (var store = NodeStore.open(seed, null, "seed")) {
+			long column = store.db().createColumn(NodeStoreTest.DATA_COLUMN, NodeStoreTest.DATA_SCHEMA);
+			// Three table files in the data column (below the L0 compaction trigger).
+			for (int round = 0; round < 3; round++) {
+				for (int i = 0; i < 100; i++) {
+					NodeStoreTest.put(store, column, i, "v" + round + "-" + i);
+				}
+				store.db().flush();
+			}
+		}
+		var node = tempDir.resolve("node/db");
+		copy(seed, node);
+		var untouched = largestFile(node, ".sst");
+		var shared = new ArrayList<Path>();
+		try (Stream<Path> walk = Files.walk(node)) {
+			walk.filter(path -> path.toString().endsWith(".sst") && !path.equals(untouched)).forEach(shared::add);
+		}
+		shared.add(node.resolve("IDENTITY"));
+		assertTrue(shared.size() >= 3, shared.toString());
+		// Half of them linked from a backup copy before the first start, the other half not yet.
+		var backup = Files.createDirectories(tempDir.resolve("backup"));
+		var later = Files.createDirectories(tempDir.resolve("later"));
+		for (int i = 0; i < shared.size(); i += 2) {
+			Files.createLink(backup.resolve(shared.get(i).getFileName()), shared.get(i));
+		}
+		var digest = NodeStore.recordSeedDigest(node);
+		NodeStore.noteSeedOpening(node);
+		startupCheckOpen(node);
+
+		// Before the restart: the backup copy deleted, another copy linked.
+		deleteTree(backup);
+		for (int i = 1; i < shared.size(); i += 2) {
+			Files.createLink(later.resolve(shared.get(i).getFileName()), shared.get(i));
+		}
+		assertEquals(digest, NodeStore.recordSeedDigest(node), "outside links removed and added after a killed check");
+		assertEquals(digest, NodeStore.recordSeedDigest(node), "kept again by a retry");
+
+		// One listed table file written again in place with its own size and modification time, nothing linked.
+		var modified = Files.getLastModifiedTime(untouched);
+		Files.write(untouched, Files.readAllBytes(untouched));
+		Files.setLastModifiedTime(untouched, modified);
+		assertNotEquals(digest, NodeStore.recordSeedDigest(node), "a table file written again in place");
+	}
+
+	/**
+	 * R45-1, the rule itself on {@code <size> <inode>@<ctime>,<links>,<mtime>,<birth time>} values: only a change of
+	 * the link count explains a new change time, and only when the inode, size, modification time and birth time are
+	 * the same and the birth time is known.
+	 */
+	@Test
+	void aTableFileIsTheSameDespiteANewChangeTimeOnlyWhenOnlyItsLinkCountChanged() {
+		String t1 = "2026-11-09T10:00:00.100000000Z";
+		String t2 = "2026-11-09T11:00:00.200000000Z";
+		String m = "2026-11-01T09:00:00.300000000Z";
+		String b = "2026-11-01T08:59:59.400000000Z";
+		String b2 = "2026-11-09T10:59:59.500000000Z";
+		String before = "4096 77@" + t1 + ",2," + m + "," + b;
+		assertTrue(NodeStore.sameTable(before, before));
+		assertTrue(NodeStore.sameTable(before, "4096 -"), "unknown identity");
+		assertTrue(NodeStore.sameTable(before, "4096 77@" + t2 + ",1," + m + "," + b), "an outside link removed");
+		assertTrue(NodeStore.sameTable(before, "4096 77@" + t2 + ",3," + m + "," + b), "an outside link added");
+		assertFalse(NodeStore.sameTable(before, "4096 77@" + t2 + ",2," + m + "," + b),
+				"written again in place, its modification time set back (cp -p over it)");
+		assertFalse(NodeStore.sameTable(before, "4096 77@" + t2 + ",1," + m + "," + b2),
+				"a copy made again after rm -r on the reused inode, modification time kept, fewer links");
+		assertFalse(NodeStore.sameTable("4096 77@" + t1 + ",2," + m + ",-", "4096 77@" + t2 + ",1," + m + ",-"),
+				"no birth time to tell a reused inode");
+		assertFalse(NodeStore.sameTable(before, "4096 77@" + t2 + ",1," + t2 + "," + b), "written again");
+		assertFalse(NodeStore.sameTable(before, "4096 78@" + t2 + ",1," + m + "," + b), "another inode");
+		assertFalse(NodeStore.sameTable(before, "4097 77@" + t2 + ",1," + m + "," + b), "another size");
+		assertFalse(NodeStore.sameTable(before, "4097 77@" + t1 + ",2," + m + "," + b), "another size");
+		// Review of R45, 1: an unchanged inode and change time is the same file, even when the birth-time probe gave
+		// another answer at the restart (it could not create its file, or the device check differed).
+		assertTrue(NodeStore.sameTable(before, "4096 77@" + t1 + ",2," + m + ",-"), "birth time known, then not");
+		assertTrue(NodeStore.sameTable("4096 77@" + t1 + ",2," + m + ",-", before), "birth time not known, then known");
+		// A marker written before R45-1 lists the inode and change time only.
+		assertTrue(NodeStore.sameTable("4096 77@" + t1, before), "an older marker, same file");
+		assertFalse(NodeStore.sameTable("4096 77@" + t1, "4096 77@" + t2 + ",1," + m + "," + b),
+				"an older marker, nothing to tell a link change");
+	}
+
+	/**
+	 * Whether files under {@code dir} have a birth time: one whose modification time is set to the epoch still has
+	 * another creation time (without one, Java gives the modification time, or the epoch).
+	 */
+	static boolean birthTimeKnown(Path dir) throws IOException {
+		var probe = Files.createTempFile(dir, "birth", ".probe");
+		try {
+			Files.setLastModifiedTime(probe, java.nio.file.attribute.FileTime.fromMillis(0));
+			return Files.readAttributes(probe, java.nio.file.attribute.BasicFileAttributes.class).creationTime()
+					.toMillis() != 0;
+		} finally {
+			Files.delete(probe);
+		}
+	}
+
+	/**
 	 * Like {@code rsync -a --delete source/ target/}: a file whose size and modification time are those of the source's
 	 * is skipped (not touched); any other is copied to a new file, with the source's modification time, and renamed over
 	 * the old one; what the source does not hold is deleted.

@@ -89,7 +89,12 @@ the check of step 3 finds.
    `IDENTITY` and the table files the source did not compact, which `rsync` leaves untouched. The node finds such a
    copy only when the source compacted away a table file of the seed, and another database copied over `db/` only by
    its `IDENTITY`. If the log says it kept the digest and you put another database in place after such a stop, delete
-   `<data-dir>/db.seed-digest` before the next start.
+   `<data-dir>/db.seed-digest` before the next start. Hard links to the seed's files coming and going in between are
+   fine (R45-1): deleting a backup copy that `restore-backup` linked into `db/`, or another copy made with `cp -al`,
+   or linking one. The node tells such a change from a copy made again by the files' birth time, which ext4, XFS,
+   btrfs and tmpfs keep; on a file system without birth times, or if a link to one file is removed and another added
+   back, it takes the files for a new copy, records a new digest and stops at genesis with exit 3: copy the seed again
+   as above.
 5. Check: `rs admin $PEERS checksum` prints `OK` and the same digest for every node.
 6. Only then point clients at the cluster.
 
@@ -333,7 +338,8 @@ over (clients open new ones by themselves).
    Run `sync` after copying the backup (and after copying a restored `db/`): the copy tools do not fsync. On the
    same file system `restore-backup` hard-links the backup copy's table files and fsyncs each one (R34-1), so a power
    loss right after it cannot damage both `db/` and the copy, but a sync right after the copy keeps that from
-   depending on the command.
+   depending on the command. The backup copy can be deleted once the restore printed OK, also before a first start
+   that was stopped during its start-up check is started again (R45-1, see "Seeding a cluster", step 4).
 3. Start every node as for a new cluster, without `--join`; the nodes of the old cluster stay stopped. The first leader proposes
    a seeded genesis, as in "Seeding a cluster".
 4. Check: `status`, then `checksum` prints `OK`, then a few known keys read back.

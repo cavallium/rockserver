@@ -246,6 +246,31 @@ class StartupClusterTest {
 	}
 
 	/**
+	 * R45-1: restore-backup on the file system of the backup copy hard-links the copy's table files into {@code db/}. A
+	 * first start killed during the start-up check, then the backup copy deleted (each unlink gives the shared inodes a
+	 * new change time) before the next start: the backup's digest is still kept.
+	 */
+	@Test
+	void aRestoredFirstStartKilledDuringTheCheckKeepsTheBackupDigestAfterTheBackupCopyIsDeleted() throws Exception {
+		org.junit.jupiter.api.Assumptions.assumeTrue(StartupChecksTest.birthTimeKnown(root),
+				"the file system of the test keeps no birth times: a link change then counts as another file, by design");
+		cluster = new InProcessCluster(root, 1, config -> config);
+		var backupCopy = createSeed(root.resolve("backup-copy"), 100);
+		var n0 = cluster.config("n0");
+		copyLinkingTables(backupCopy, n0.dbDir());
+		String backupDigest = "0123456789abcdef";
+		NodeStore.recordRestoredSeedDigest(n0.dbDir(), backupDigest);
+		failFirstStartDuringTheCheck("n0");
+		try (Stream<Path> walk = Files.walk(backupCopy)) {
+			for (Path path : walk.sorted(java.util.Comparator.reverseOrder()).toList()) {
+				Files.delete(path);
+			}
+		}
+		assertEquals(backupDigest, NodeStore.recordSeedDigest(n0.dbDir()));
+		assertEquals(backupDigest, NodeStore.readSeedDigest(n0.dbDir()));
+	}
+
+	/**
 	 * R43-2: the start-up check of a first start opens the seed without automatic compactions. With them, the open's
 	 * compaction deleted the seed's table files (here four overlapping L0 files of one column, the default trigger), and
 	 * a kill after it left none of the files the marker listed: the next first start recorded a new digest and stopped
@@ -335,6 +360,22 @@ class StartupClusterTest {
 				Path destination = target.resolve(source.relativize(path).toString());
 				if (Files.isDirectory(path)) {
 					Files.createDirectories(destination);
+				} else {
+					Files.copy(path, destination);
+				}
+			}
+		}
+	}
+
+	/** Like restore-backup on the file system of the backup copy: table files hard-linked, the rest copied. */
+	private static void copyLinkingTables(Path source, Path target) throws IOException {
+		try (Stream<Path> walk = Files.walk(source)) {
+			for (Path path : walk.toList()) {
+				Path destination = target.resolve(source.relativize(path).toString());
+				if (Files.isDirectory(path)) {
+					Files.createDirectories(destination);
+				} else if (path.getFileName().toString().endsWith(".sst")) {
+					Files.createLink(destination, path);
 				} else {
 					Files.copy(path, destination);
 				}
