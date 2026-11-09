@@ -4,12 +4,27 @@ What an operator does to run a cluster: start one, seed it, replace a node, take
 replicas agree, react to the alerts, and upgrade. The reasons behind each step are in [design.md](design.md); this page
 only says what to do and what to check.
 
-In the commands, `rs` stands for the node's launcher:
+In the commands, `rs` stands for the node's launcher. The build makes no runnable jar: the launcher runs the classes
+of a checkout of the version to run, with the JVM flags the in-repo launchers pass (README.md; the process tests'
+`ProcessCluster`, `BenchNodes` and `distributed/bench/load-bench.sh`). Build them once per version, in its checkout
+(this installs nothing into `~/.m2`; `-o` works once the dependencies are there):
 
 ```bash
-alias rs='java -XX:+ExitOnOutOfMemoryError \
-  -cp rockserver-distributed.jar it.cavallium.rockserver.distributed.ReplicatedServerMain'
+mvn -q -f distributed/pom.xml -pl server -am compile
+mvn -q -f distributed/server/pom.xml dependency:build-classpath \
+  -Dmdep.outputFile=distributed/server/target/runtime.classpath -Dmdep.includeScope=runtime
+# The checkout's own core classes, never a rockserver-core jar of another version from ~/.m2:
+RS_CP="$PWD/distributed/server/target/classes:$PWD/target/library/classes:$(tr ':' '\n' \
+  < distributed/server/target/runtime.classpath | grep -v /rockserver-core/ | paste -sd:)"
+alias rs="java -XX:+ExitOnOutOfMemoryError --enable-native-access=ALL-UNNAMED --add-modules jdk.incubator.vector \
+  -cp '$RS_CP' it.cavallium.rockserver.distributed.ReplicatedServerMain"
 ```
+
+`rs` without a command prints the usage and exits with 2: a classpath that misses a class fails there, before any
+data is touched. Without `--enable-native-access=ALL-UNNAMED` the JDK warns about RocksDB's native access (a later
+JDK may refuse it); `--add-modules jdk.incubator.vector` is the README's command line (no Rockserver code of this
+version needs it). For
+a service unit, put the same `java` command line, with the classpath written out, in `ExecStart`.
 
 `run` extracts the RocksDB library into `DATA-DIR/tmp` by itself, with or without `-Djava.io.tmpdir`, and deletes
 there the 17 MB copies that killed runs leave behind. It also points `java.io.tmpdir` there for libraries that read the
@@ -532,7 +547,7 @@ disk problem to look at.
 |---|---|---|---|---|
 | 0 | Not on a stop by signal: see below | `OK` | The log is valid, or was (with `--dry-run`: could be) repaired | Done |
 | 1 | Did not start: a port in use, a refused data directory (another file system, a cluster's database without its Raft state, a pointless `--join`), any other failure of the start (an `Error` too, such as a class that does not load) | `FAILED: ...`: refused (a change of more than one voter included, or every member that answered refused `checksum`/`backup` for the cluster version it has applied: not every member supports it, the leader has not raised the version yet (retry in about 10 s), or they lag behind the leader, see "Upgrades"), a change failed, the replicas differ (`checksum`), a member failed (`backup`), a member's answer cannot be read (`<id>: cannot read its answer (...)`: a member of another version, asking again would not help) | Refused: see its output (also while the node runs: its `in_use.lock` is locked) | Failed: see the exception; `export-seed` also while the node runs (`Not exported: ... in_use.lock is locked: stop the node first.`, nothing touched) and when the replica's latest snapshot is damaged (`Not exported: ...`, nothing written; see "Replacing a node", `--without-damaged-snapshot`); `restore-backup` also for a data directory that is not empty (`FAILED: ...`: a `db/`, a Raft log, or a `db.restore-tmp`, `db.restore-ready` or `db.restore-old` it names; nothing touched, see "Restoring a backup") |
-| 2 | Wrong usage, or no `-XX:+ExitOnOutOfMemoryError`: also an unknown option, a word that is no option's value (a flag given a value, `--join false` or `--pipelined-updates false`, which turned the flag on before), a malformed value (a non-numeric number, an `--election-timeout-ms` that is not MIN:MAX, a `--peer` or `--group-id` that does not parse) or one the node's configuration refuses (`--parallel-apply-threads 1`, a node id not among the peers, a minimum election timeout not below the maximum) | Wrong usage: also an unknown option (a misspelled one), an option of another command (`--allow-skipped` without `checksum`, `--unsafe-multi-voter-change` without `add-peer` or `remove-peer`), a word the command does not take (`status now`), a malformed value (`--timeout-ms`, `--peer`, `--group-id`, the index of `backup-status`, the argument of `add-peer`, a member id with `=` for `remove-peer`, `transfer-leader` or `snapshot`) | Wrong usage: also an unknown option or a stray word (`--dry-run yes`) | Wrong usage: also an unknown option or a stray word; `export-seed` with a group (`--group-id`, or the default without it) that has no directory in a `raft/` holding other groups |
+| 2 | Wrong usage, or no `-XX:+ExitOnOutOfMemoryError`: also an unknown option, a word that is no option's value (a flag given a value, `--join false` or `--pipelined-updates false`, which turned the flag on before), a malformed value (a non-numeric number, an `--election-timeout-ms` that is not MIN:MAX, a `--peer` or `--group-id` that does not parse) or one the node's configuration refuses (`--parallel-apply-threads 1`, a node id not among the peers, a minimum election timeout not below the maximum) | Wrong usage: also an unknown option (a misspelled one), an option of another command (`--allow-skipped` without `checksum`, `--unsafe-multi-voter-change` without `add-peer` or `remove-peer`), a word the command does not take (`status now`), a malformed value (`--timeout-ms`, `--peer`, `--group-id`, the index of `backup-status`, the argument of `add-peer`, a member id with `=` for `remove-peer`, `transfer-leader` or `snapshot`) | Wrong usage: also an unknown option or a stray word (`--dry-run yes`), a `--group-id` that is not a UUID (any case is accepted, as by `run`) | Wrong usage: also an unknown option or a stray word; `export-seed` with a group (`--group-id`, or the default without it) that has no directory in a `raft/` holding other groups |
 | 3 | The node stopped after a failure: its replica failed, Raft closed, a JVM pause beyond `--jvm-pause-limit-ms`, out of direct memory on a thread of replication; also a failure that raced a SIGTERM, and out of heap (the JVM's own status for `-XX:+ExitOnOutOfMemoryError`) | - | - | - |
 | 4 | Removed from the cluster, confirmed by a majority of the current configuration: refused at the start, or found out while it heard no leader. Do not start it again (see "Removed node"; until a majority answers, a removed node waits outside instead) | Incomplete: a member gave no result in time (`checksum`, `backup`, `backup-status`), no member took the request in time (`Nothing was proposed`), or a `checksum` answer that does not tell whether it was proposed (cut by the time limit, or a connection that broke after the member took it): run it again. A `backup` that a member took without answering in time (`may have been proposed`) may still be written: check it with `backup-status` (see "Backups") or use another name | - | - |
 | 5 | Its database, its log or a snapshot it installed has a cluster version with capabilities this version lacks: run the newer version | - | - | The replica's database (`export-seed`) or the backup (`restore-backup`) has a cluster version with capabilities this version lacks; nothing is written (`restore-backup` renames nothing, and deletes the database it built aside to read the version): run the newer version |
