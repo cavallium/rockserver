@@ -66,7 +66,10 @@ leader's stops at genesis with exit code 3 (see "One seed" in the design documen
 truncated file and a copy taken at another moment, but not a table file damaged without a change of size, which only
 the check of step 3 finds.
 
-1. Stop the single node (a clean stop: its database must be closed).
+1. Stop the single node (a clean stop: its database must be closed). Do not copy a database that is running, and
+   if the node crashed, start it once and stop it cleanly before you copy it: a crashed or running database can hold
+   table files its MANIFEST does not reference, which the first start's check deletes as it opens the copy, and a
+   first start killed during that check then no longer recognizes the seed and stops at genesis (Review of R43, 2).
 2. Copy its database directory to every node, as `<data-dir>/db` (for example `rsync -a --delete old-db/
    n1:/srv/rockserver/data/db/`). The data directories must hold nothing else: no `raft/`. Then run `sync` on every
    node (or `sync -f <data-dir>/db`): `rsync`, `cp` and `scp` do not fsync, and a power loss before writeback can
