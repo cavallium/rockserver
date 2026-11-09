@@ -339,6 +339,78 @@ class CheckpointStorageTest {
 		assertEquals(Set.of("snapshot-1-5"), fileNames(snapshotsDir));
 	}
 
+	/**
+	 * R51-2: a crash while Ratis' {@code deleteFully} walks the old snapshots moved aside leaves them partly deleted,
+	 * {@code snapshot.properties} and a {@code db/} still there. With the received snapshot damaged, the aside is
+	 * promoted only if its checkpoint is complete: here one table file is gone (CURRENT and the MANIFEST are not), so
+	 * it is discarded, and the node has no snapshot rather than an incomplete one it could stream to a follower.
+	 */
+	@Test
+	void anAsidePartlyDeletedByACrashIsNotPromoted() throws IOException {
+		Path stateMachineDir = damagedInstallWithTheOldSnapshotsAside();
+		Path aside = stateMachineDir.resolve("snapshots.tmp_installing");
+		Files.delete(firstTable(aside));
+		closeRaftStorages();
+
+		var restarted = initStorage(tempDir.resolve("follower"), RaftStorage.StartupOption.RECOVER);
+		assertNull(restarted.getLatestSnapshot());
+		assertEquals(Set.of("snapshots", "tmp"), fileNames(stateMachineDir));
+		assertEquals(Set.of(), fileNames(stateMachineDir.resolve("snapshots")));
+	}
+
+	/**
+	 * R51-2: the same with {@code CURRENT} gone from the aside's checkpoint, and no file list (a snapshot taken by an
+	 * older version): not promoted either.
+	 */
+	@Test
+	void anAsideWithoutCurrentIsNotPromoted() throws IOException {
+		Path stateMachineDir = damagedInstallWithTheOldSnapshotsAside();
+		Path aside = stateMachineDir.resolve("snapshots.tmp_installing");
+		Path snapshot = aside.resolve("snapshot-1-5");
+		Files.deleteIfExists(snapshot.resolve("snapshot.files"));
+		Files.delete(snapshot.resolve("db").resolve("CURRENT"));
+		closeRaftStorages();
+
+		var restarted = initStorage(tempDir.resolve("follower"), RaftStorage.StartupOption.RECOVER);
+		assertNull(restarted.getLatestSnapshot());
+		assertEquals(Set.of(), fileNames(stateMachineDir.resolve("snapshots")));
+	}
+
+	/**
+	 * R51-2: an aside taken by an older version (no file list) whose checkpoint is whole is still promoted, as before.
+	 */
+	@Test
+	void aWholeAsideWithoutAFileListIsPromoted() throws IOException {
+		Path stateMachineDir = damagedInstallWithTheOldSnapshotsAside();
+		Files.deleteIfExists(stateMachineDir.resolve("snapshots.tmp_installing").resolve("snapshot-1-5")
+				.resolve("snapshot.files"));
+		closeRaftStorages();
+
+		var restarted = initStorage(tempDir.resolve("follower"), RaftStorage.StartupOption.RECOVER);
+		assertEquals(TermIndex.valueOf(1, 5), restarted.getLatestSnapshot().getTermIndex());
+		assertEquals(Set.of("snapshot-1-5"), fileNames(stateMachineDir.resolve("snapshots")));
+	}
+
+	/**
+	 * A follower with snapshot 1-5 that received snapshot 4-40, crashed after the received directory took the place of
+	 * {@code snapshots/} and before the old one, moved aside, was deleted; the received one lost data. Returns the
+	 * follower's state machine directory (its raft directory is {@code follower}).
+	 */
+	private Path damagedInstallWithTheOldSnapshotsAside() throws IOException {
+		var leader = initStorage(tempDir.resolve("leader"), RaftStorage.StartupOption.FORMAT);
+		put(store, column, 7, "installed");
+		setApplied(store, TermIndex.valueOf(4, 40));
+		leader.take(store);
+		var follower = initStorage(tempDir.resolve("follower"), RaftStorage.StartupOption.FORMAT);
+		setApplied(store, TermIndex.valueOf(1, 5));
+		follower.take(store);
+		Path snapshotsDir = follower.getSnapshotDir().toPath();
+		install(leader, leader.getLatestSnapshot(), follower, file -> {
+		}, false);
+		Files.write(firstTable(snapshotsDir), new byte[0]);
+		return snapshotsDir.getParent();
+	}
+
 	@Test
 	void installReadingASnapshotKeepsItUntilItStopsReading() throws IOException {
 		var clock = new AtomicLong();
