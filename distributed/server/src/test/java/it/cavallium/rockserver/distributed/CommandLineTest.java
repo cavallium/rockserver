@@ -300,6 +300,30 @@ class CommandLineTest {
 		assertEquals(2, misplaced.code(), misplaced.toString());
 	}
 
+	/**
+	 * R52-3: Ratis 3.3.1 takes a configuration with the same voter ids and priorities for no change
+	 * ({@code RaftConfigurationImpl.hasNoChange} never compares addresses) and answers success without writing it. A
+	 * call with {@code --change-addresses} that adds and removes nothing (here a re-run of a remove-peer) therefore
+	 * fails with exit code 1 and says that nothing was written, instead of printing the move and {@code OK}.
+	 */
+	@Test
+	void adminRefusesAnAddressChangeThatChangesNoVoter() throws Exception {
+		cluster = new InProcessCluster(Files.createDirectories(temp.resolve("address-only")), 3, c -> c).startAll();
+		cluster.awaitLeader(TIMEOUT);
+		var staying = cluster.anyFollower().config().nodeId();
+		var self = cluster.config(staying).self();
+		var respelled = new PeerConfig(staying, "localhost", self.raftPort(), self.apiHost(), self.apiPort());
+
+		var refused = run(with(List.of(adminWith(List.of("n0", "n1", "n2"), staying, respelled, "remove-peer", "n9")),
+				"--change-addresses"));
+		assertEquals(1, refused.code(), refused.toString());
+		assertTrue(refused.out().contains("FAILED"), refused.out());
+		assertTrue(refused.out().contains("Nothing was written"), refused.out());
+		assertTrue(!refused.out().strip().endsWith("OK"), refused.out());
+		assertVoters(List.of("n0", "n1", "n2"));
+		assertEquals(self.raftAddress(), voterAddress(staying));
+	}
+
 	/** {@link #admin} with member {@code replaced} given as {@code peer} instead of its own address. */
 	private String[] adminWith(List<String> peerIds, String replaced, PeerConfig peer, String... command) {
 		var args = new ArrayList<>(List.of(admin(peerIds, command)));
