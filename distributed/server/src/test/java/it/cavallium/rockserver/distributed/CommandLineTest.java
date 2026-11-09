@@ -638,7 +638,10 @@ class CommandLineTest {
 	/**
 	 * R32-4: when every member that answered refuses for its cluster version, the command fails with 1 and names each of
 	 * them with the version it gave (here in the words of a member of an older version), having asked each once. A
-	 * member that does not answer is not waited for.
+	 * member that does not answer is left out, but only once the capabilities question timed out for it ({@code
+	 * PEER_ANSWER_TIMEOUT}, 3 s): until then the command waits for its answer. The message tells apart the leader that
+	 * has not raised the cluster version yet (every member refuses, the leader too, right after the last member of a
+	 * rolling upgrade restarts: retry in about 10 s) from members that lag behind it (R32 review 1).
 	 */
 	@Test
 	void everyMemberRefusingForItsVersionFailsNamingThem() throws Exception {
@@ -657,6 +660,8 @@ class CommandLineTest {
 			assertTrue(failed.contains("v1") && failed.contains("v2") && !failed.contains("d1"), failed);
 			assertTrue(failed.contains("the cluster version is none"), failed);
 			assertTrue(failed.contains("every member that answered"), failed);
+			assertTrue(failed.contains("the leader has not raised the cluster version yet"), failed);
+			assertTrue(failed.contains("in about 10 s"), failed);
 		}
 	}
 
