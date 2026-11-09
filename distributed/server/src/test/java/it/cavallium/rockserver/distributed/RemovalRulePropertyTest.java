@@ -197,9 +197,12 @@ class RemovalRulePropertyTest {
 		long ledTerm = -1;
 		/**
 		 * The nodes it ran a log appender for while it led {@link #ledTerm}, the only ones its chunks of that term reach
-		 * (round 37): Ratis' LeaderStateImpl creates appenders for the peers of the configuration it is elected under,
-		 * for the nodes it stages, and for the peers of each configuration it appends, and never for another node. It
-		 * only grows within the term, as an appender stopped by a later configuration may still have chunks in flight.
+		 * (round 37): Ratis 3.3.1's LeaderStateImpl creates appenders only in its constructor (the other peers of the
+		 * configuration it is elected under, both halves, and listeners), in startSetConfiguration (the nodes it
+		 * stages) and in restart (a new appender for a peer it already had, addAndStartSenders' only caller). Appending
+		 * a configuration adds none: every configuration a leader appends holds only nodes of those two kinds, which
+		 * {@link Model#appendEntry} checks. It only grows within the term, as an appender stopped by a later
+		 * configuration may still have chunks in flight.
 		 */
 		Set<String> sentTo = new java.util.HashSet<>();
 		/** The whole log, the purged prefix included (index i at position i - 1): the model's truth. */
@@ -288,6 +291,8 @@ class RemovalRulePropertyTest {
 		final List<Entry> chosen = new ArrayList<>();
 		final List<String> trace = new ArrayList<>();
 		int removedVerdicts;
+		/** The node whose record the last applied step's snapshot chunk reached, null if none. */
+		String lastChunkReceiver;
 		private final Map<Node, RaftServer.Division> divisions = new HashMap<>();
 
 		Model(Setup setup) {
@@ -343,6 +348,7 @@ class RemovalRulePropertyTest {
 
 		/** Applies {@code step}; false if its guard fails (then nothing changed). */
 		boolean apply(Step step) {
+			lastChunkReceiver = null;
 			boolean done = switch (step) {
 				case Elect s -> elect(pick(s.n(), n -> n.up && !n.inWindow() && n.current().holds(n.id)));
 				case Append s -> append(leaderNode(s.n()));
@@ -456,9 +462,11 @@ class RemovalRulePropertyTest {
 			leader.log.add(entry);
 			if (entry.conf()) {
 				leader.mem.put(leader.last(), ratisConf(leader.last(), entry));
-				if (leader.leader) {
-					leader.sentTo.addAll(entry.newHalf());
-					leader.sentTo.addAll(entry.oldHalf());
+				// Ratis adds no appender for an appended configuration (round 37 review): its peers must already have one.
+				if (leader.leader && !(leader.sentTo.containsAll(entry.newHalf())
+						&& leader.sentTo.containsAll(entry.oldHalf()))) {
+					throw new IllegalStateException(leader.id + " appends " + entry + " with a peer outside its appenders "
+							+ leader.sentTo);
 				}
 			}
 		}
@@ -712,6 +720,7 @@ class RemovalRulePropertyTest {
 			// RaftTraffic, before Ratis sees the chunk: every chunk, whatever Ratis answers.
 			f.installed = InstalledConfiguration.with(f.installed, n.term, latest.index(), latest.newHalf(),
 					latest.oldHalf());
+			lastChunkReceiver = f.id;
 			takeConfiguration(f, latest);
 			if (notLeader) {
 				if (n.up) {
@@ -1473,10 +1482,11 @@ class RemovalRulePropertyTest {
 	 * (a peer of x's term): b's commit index is past x's snapshot, so Ratis answers ALREADY_INSTALLED and still takes
 	 * x's configuration, without y, at index 2 while b's log keeps J (reachable: repeated errors walk Ratis' nextIndex
 	 * for b down to matchIndex + 1, below x's log start). y keeps J in its own log and in Ratis: it waits. A chunk of x
-	 * to y cannot exist: no configuration x held in its term has y, and Ratis runs log appenders (which send the
-	 * chunks) only for those peers and for the nodes it stages. At f6513af the model delivered it anyway, y's Ratis
-	 * configuration became x's, and y was REMOVED while b, electable without it, holds J (S1 (b), jqwik seed
-	 * 419139274647052654).
+	 * to y cannot exist: x's appenders are those of the configuration it was elected under, which lacks y, and x
+	 * stages nobody. At f6513af the model delivered it anyway, y's Ratis configuration became x's, and y was REMOVED
+	 * while b, electable without it, holds J (S1 (b), jqwik seed 419139274647052654). Now the step's guard has no y
+	 * among x's receivers, and pick() hands the chunk to c, a peer of x's term, instead (round 37 review): asserted, so
+	 * the example names who gets the chunk.
 	 */
 	@Example
 	void aChunkReachesOnlyThePeersOfItsSendersTerm() {
@@ -1489,9 +1499,11 @@ class RemovalRulePropertyTest {
 				&& b.at(2).conf() && b.at(2).newHalf().contains("y") && !b.current().holds("y"),
 				() -> "b holds J in its log, x's configuration in Ratis\n" + model);
 		assertEquals(Reason.OWN_LATER_CONFIGURATION, check(model, y, Map.of()).reason(), model::toString);
+		assertEquals(Set.of("a", "b", "c", "x"), x.sentTo, () -> "x's appenders\n" + model);
 		var before = y.current();
 		var installedBefore = y.installed;
-		model.apply(new StaleInstall(X, Y));
+		assertTrue(model.apply(new StaleInstall(X, Y)), model::toString);
+		assertEquals("c", model.lastChunkReceiver, () -> "the chunk of StaleInstall(x, y)\n" + model);
 		var verdict = check(model, y, Map.of());
 		if (verdict.outcome() == Outcome.REMOVED) {
 			checkRemovedIsSafe(model, y, verdict, Map.of());
@@ -1501,14 +1513,35 @@ class RemovalRulePropertyTest {
 		assertEquals(Reason.OWN_LATER_CONFIGURATION, verdict.reason(), model::toString);
 	}
 
-	/** Round 37: the 32 steps the shrunk failure of seed 419139274647052654 applied, replayed (S1 (b) at f6513af). */
+	/**
+	 * Round 37: the 32 steps the shrunk failure of seed 419139274647052654 applied (S1 (b) at f6513af, where its last
+	 * step, StaleInstall(0, 5), sent x's chunk to y). The first 31 replay that history; the last cannot any more: x's
+	 * appenders do not include y, so pick() hands the chunk to a peer of x's term instead (round 37 review), and the
+	 * example asserts that, with y untouched and the checks of every step passing.
+	 */
 	@Example
-	void theRound37HistoryIsSafe() {
-		run(new Setup(false, false), steps(new Elect(0), new Broadcast(0), new Elect(0), new Elect(0), new Apply(3, 0),
-				new Elect(0), new Elect(0), new Elect(0), new Elect(0), new Broadcast(0), new Elect(3), new Elect(1),
-				new Append(0), new Append(0), new Append(0), new Broadcast(3), new Restart(0), new Broadcast(4),
-				new Broadcast(4), new Replicate(1, 2, 1), new Change(0, 5, false), new Crash(3), new Elect(1),
-				new Elect(5), new Elect(1), new Snapshot(1, 0), new Replicate(1, 5, 0), new Append(0), new Append(2),
-				new Elect(4), new StaleInstall(2, 1), new StaleInstall(0, 5)), 1, false);
+	void theRound37HistoryNoLongerSendsYTheChunk() {
+		var model = run(new Setup(false, false), steps(new Elect(0), new Broadcast(0), new Elect(0), new Elect(0),
+				new Apply(3, 0), new Elect(0), new Elect(0), new Elect(0), new Elect(0), new Broadcast(0), new Elect(3),
+				new Elect(1), new Append(0), new Append(0), new Append(0), new Broadcast(3), new Restart(0),
+				new Broadcast(4), new Broadcast(4), new Replicate(1, 2, 1), new Change(0, 5, false), new Crash(3),
+				new Elect(1), new Elect(5), new Elect(1), new Snapshot(1, 0), new Replicate(1, 5, 0), new Append(0),
+				new Append(2), new Elect(4), new StaleInstall(2, 1)), 1, false);
+		assertEquals(31, model.trace.size(), () -> "the 31 steps before the chunk to y apply\n" + model);
+		var x = model.nodes.get("x");
+		var y = model.nodes.get("y");
+		// At f6513af the last step's sender was x (the only node still leading its term with a snapshot) and its
+		// receiver y (node 5, up and out of any install window).
+		assertEquals(List.of(x), model.nodes.values().stream()
+				.filter(node -> node.ledTerm == node.term && node.snapshot > 0 && !node.inWindow()).toList(),
+				model::toString);
+		assertTrue(y.up && !y.inWindow() && !x.sentTo.contains("y"), () -> "y is not among x's receivers\n" + model);
+		var before = y.current();
+		var installedBefore = y.installed;
+		assertTrue(model.apply(new StaleInstall(0, 5)), model::toString);
+		checkState(model, new Random(1));
+		assertTrue(model.lastChunkReceiver != null && !model.lastChunkReceiver.equals("y")
+				&& x.sentTo.contains(model.lastChunkReceiver), () -> "receiver " + model.lastChunkReceiver + "\n" + model);
+		assertTrue(y.current().equals(before) && y.installed == installedBefore, () -> "y untouched\n" + model);
 	}
 }
