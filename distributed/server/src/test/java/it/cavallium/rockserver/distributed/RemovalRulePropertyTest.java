@@ -53,7 +53,7 @@ import org.apache.ratis.server.protocol.TermIndex;
  * stable, each only after the one before is committed; an add of a node that has a log is refused, but x and y are
  * wiped and join as a new incarnation), replication with truncation only on conflict, commit, apply, snapshots,
  * installs (also one that stops between Ratis' snapshot index and the history swap, R12-2), chunks of deposed leaders
- * or of leaders cut off from the others, to any node, crashes and restarts (commit index back to the applied one).</p>
+ * or of leaders cut off from the others, to the nodes the sender ran a log appender for in its term (round 37), crashes and restarts (commit index back to the applied one).</p>
  *
  * <p>Checked after every step: the committed prefixes of all nodes agree (sanity of the model); every committed
  * configuration a running node reports, and every probe it answers committed, is a configuration entry the model
@@ -135,7 +135,8 @@ class RemovalRulePropertyTest {
 	/**
 	 * A snapshot chunk of node {@code n}, sent while it led its current term, reaches {@code f}: a deposed leader's
 	 * chunk, or one of a leader that is down here (cut off from the others, it still runs as the leader of its term,
-	 * so it neither votes nor answers). Whatever {@code f} answers, Ratis takes the chunk's configuration (round 15),
+	 * so it neither votes nor answers), to a node it ran a log appender for in that term ({@link Node#sentTo}, round 37).
+	 * Whatever {@code f} answers, Ratis takes the chunk's configuration (round 15),
 	 * except that RaftTraffic answers NOT_LEADER itself to a chunk below {@code f}'s term (round 15 review, N-R15-1).
 	 */
 	record StaleInstall(int n, int f) implements Step {}
@@ -143,9 +144,17 @@ class RemovalRulePropertyTest {
 	/**
 	 * As {@link StaleInstall}, but the chunk passed {@link RaftTraffic}'s term check before {@code f}'s term rose past the
 	 * sender's (round 15, N-R15-1: the window between that check and Ratis' own): Ratis answers NOT_LEADER and takes its
-	 * configuration. Examples only: random histories never contain it (a residual, see the design document).
+	 * configuration. Examples only: random histories never contain it (a residual, see the design document). Its
+	 * receiver need not be in {@link Node#sentTo}: the round-15 examples send it to nodes outside the sender's term,
+	 * which Ratis' appenders never reach (round 37); they keep checking RaftTraffic and the record beyond that.
 	 */
 	record RacedStaleInstall(int n, int f) implements Step {}
+
+	/**
+	 * As {@link StaleInstall}, between the nodes named, also to a node outside {@link Node#sentTo}: a chunk Ratis'
+	 * appenders never send (round 37). Examples only, to keep the round-15 check of RaftTraffic's term check.
+	 */
+	record StrayStaleInstall(int n, int f) implements Step {}
 
 	/** Node {@code n} swaps in the history of the snapshot it installs. */
 	record FinishInstall(int n) implements Step {}
@@ -186,6 +195,13 @@ class RemovalRulePropertyTest {
 		long term;
 		/** The term it last led, -1 if none: while it equals {@link #term}, it may still send chunks of that term. */
 		long ledTerm = -1;
+		/**
+		 * The nodes it ran a log appender for while it led {@link #ledTerm}, the only ones its chunks of that term reach
+		 * (round 37): Ratis' LeaderStateImpl creates appenders for the peers of the configuration it is elected under,
+		 * for the nodes it stages, and for the peers of each configuration it appends, and never for another node. It
+		 * only grows within the term, as an appender stopped by a later configuration may still have chunks in flight.
+		 */
+		Set<String> sentTo = new java.util.HashSet<>();
 		/** The whole log, the purged prefix included (index i at position i - 1): the model's truth. */
 		List<Entry> log = new ArrayList<>();
 		long snapshot;
@@ -372,15 +388,22 @@ class RemovalRulePropertyTest {
 				}
 				case StaleInstall s -> {
 					var sender = pick(s.n(), node -> node.ledTerm == node.term && node.snapshot > 0 && !node.inWindow());
+					var f = pick(s.f(), node -> node != sender && node.up && !node.inWindow()
+							&& sender.sentTo.contains(node.id));
 					yield sender.ledTerm == sender.term && sender.snapshot > 0 && !sender.inWindow()
-							&& install(sender, pick(s.f(), node -> node != sender && node.up && !node.inWindow()), false, true,
-							false);
+							&& sender.sentTo.contains(f.id) && install(sender, f, false, true, false);
 				}
 				case RacedStaleInstall s -> {
 					var sender = nodes.get(UNIVERSE.get(s.n()));
 					var f = nodes.get(UNIVERSE.get(s.f()));
 					yield sender.ledTerm == sender.term && sender.snapshot > 0 && !sender.inWindow() && f.term > sender.term
 							&& install(sender, f, false, true, true);
+				}
+				case StrayStaleInstall s -> {
+					var sender = nodes.get(UNIVERSE.get(s.n()));
+					var f = nodes.get(UNIVERSE.get(s.f()));
+					yield sender.ledTerm == sender.term && sender.snapshot > 0 && !sender.inWindow()
+							&& install(sender, f, false, true, false);
 				}
 				case FinishInstall s -> finishInstall(pick(s.n(), Node::inWindow));
 				case Crash s -> crash(pick(s.n(), n -> n.up && !n.inWindow()));
@@ -423,6 +446,8 @@ class RemovalRulePropertyTest {
 			n.term = term;
 			n.leader = true;
 			n.ledTerm = term;
+			n.sentTo = new java.util.HashSet<>(conf.newHalf());
+			n.sentTo.addAll(conf.oldHalf());
 			appendEntry(n, new Entry(term, conf.newHalf(), List.of()));
 			return true;
 		}
@@ -431,6 +456,10 @@ class RemovalRulePropertyTest {
 			leader.log.add(entry);
 			if (entry.conf()) {
 				leader.mem.put(leader.last(), ratisConf(leader.last(), entry));
+				if (leader.leader) {
+					leader.sentTo.addAll(entry.newHalf());
+					leader.sentTo.addAll(entry.oldHalf());
+				}
 			}
 		}
 
@@ -466,6 +495,7 @@ class RemovalRulePropertyTest {
 					wipe(a);
 				}
 				a.up = true;
+				n.sentTo.add(a.id);
 				// add-peer brings it up to date first (staging): no member file from this.
 				if (!replicate(n, a, 0, true)) {
 					install(n, a, false, true, false);
@@ -494,6 +524,7 @@ class RemovalRulePropertyTest {
 			a.leader = false;
 			a.term = 0;
 			a.ledTerm = -1;
+			a.sentTo = new java.util.HashSet<>();
 			a.log = new ArrayList<>();
 			a.snapshot = 0;
 			a.commit = 0;
@@ -1379,7 +1410,7 @@ class RemovalRulePropertyTest {
 		var c = model.nodes.get("c");
 		assertTrue(a.ledTerm == a.term && a.term < x.term && x.current().index() == 7 && x.current().inNew("x"),
 				() -> "a led a lower term than x's, and x holds D_L\n" + model);
-		for (var step : steps(new StaleInstall(A, X), new Restart(A), new Replicate(C, A, 1), new Apply(A, 0))) {
+		for (var step : steps(new StrayStaleInstall(A, X), new Restart(A), new Replicate(C, A, 1), new Apply(A, 0))) {
 			assertTrue(model.apply(step), () -> "step not applicable: " + step + "\n" + model);
 		}
 		var kStar = model.newestCommitted();
@@ -1458,14 +1489,16 @@ class RemovalRulePropertyTest {
 				&& b.at(2).conf() && b.at(2).newHalf().contains("y") && !b.current().holds("y"),
 				() -> "b holds J in its log, x's configuration in Ratis\n" + model);
 		assertEquals(Reason.OWN_LATER_CONFIGURATION, check(model, y, Map.of()).reason(), model::toString);
-		boolean delivered = model.apply(new StaleInstall(X, Y));
-		if (delivered) {
-			var verdict = check(model, y, Map.of());
-			if (verdict.outcome() == Outcome.REMOVED) {
-				checkRemovedIsSafe(model, y, verdict, Map.of());
-			}
+		var before = y.current();
+		var installedBefore = y.installed;
+		model.apply(new StaleInstall(X, Y));
+		var verdict = check(model, y, Map.of());
+		if (verdict.outcome() == Outcome.REMOVED) {
+			checkRemovedIsSafe(model, y, verdict, Map.of());
 		}
-		assertTrue(!delivered, () -> "a chunk of x reached y, which x never sends to\n" + model);
+		assertTrue(y.current().equals(before) && y.installed == installedBefore,
+				() -> "a chunk of x reached y, which x never sends to\n" + model);
+		assertEquals(Reason.OWN_LATER_CONFIGURATION, verdict.reason(), model::toString);
 	}
 
 	/** Round 37: the 32 steps the shrunk failure of seed 419139274647052654 applied, replayed (S1 (b) at f6513af). */
