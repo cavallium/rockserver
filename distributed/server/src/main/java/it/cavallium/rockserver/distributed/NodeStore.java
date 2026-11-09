@@ -664,10 +664,6 @@ final class NodeStore implements Closeable {
 	}
 
 	/**
-	 * The cluster version ({@link Capabilities}) applied here: written by {@link LogEntry.Genesis} and raised by
-	 * {@link LogEntry.ClusterVersion}. 0 on a cluster created before the version existed, until a leader raises it.
-	 */
-	/**
 	 * The log index of the first {@link LogEntry.Backup} entry applied for the backup request {@code requestId} (R41-3),
 	 * null if none was: the same request proposed again (admin's first answer was lost) names the backup taken at that
 	 * index, on every replica, also on one that installed a snapshot past it and never applied it (the meta column is in
@@ -684,6 +680,10 @@ final class NodeStore implements Closeable {
 				Buf.wrap(ByteBuffer.allocate(Long.BYTES).putLong(index).array()), RequestType.none());
 	}
 
+	/**
+	 * The cluster version ({@link Capabilities}) applied here: written by {@link LogEntry.Genesis} and raised by
+	 * {@link LogEntry.ClusterVersion}. 0 on a cluster created before the version existed, until a leader raises it.
+	 */
 	long clusterVersion() {
 		Buf value = readMeta(CLUSTER_VERSION);
 		return value == null || value.size() != Long.BYTES ? 0 : ByteBuffer.wrap(value.toByteArray()).getLong();
@@ -773,12 +773,13 @@ final class NodeStore implements Closeable {
 		return Files.readString(file, StandardCharsets.UTF_8).strip().lines().map(String::strip).toList();
 	}
 
-	/** Next to the database directory, so that a restore, which swaps the database directory, keeps it. */
 	private static final String OPENED_LINE = "opened ";
 	/** See {@link #noteSeedOpening}. */
 	static final String OPENING = "opening";
 	private static final String TABLE_LINE = "table ";
+	private static final String IDENTITY_LINE = "identity ";
 
+	/** Next to the database directory, so that a restore, which swaps the database directory, keeps it. */
 	private static Path seedDigestFile(Path dbDir) {
 		Path absolute = dbDir.toAbsolutePath().normalize();
 		return absolute.resolveSibling(absolute.getFileName() + ".seed-digest");
@@ -802,8 +803,13 @@ final class NodeStore implements Closeable {
 	 * those the start-up check left, or, when the check was stopped during its open ({@value #OPENING}, written by
 	 * {@link #noteSeedOpening} before it), files that only that open can have changed: every table or blob file the
 	 * marker listed that is still there is the same file (same inode and change time, same size), and at least one of
-	 * them is still there (a seed without table files cannot be compared, and is not kept). Otherwise the database was
-	 * replaced since (the operator copied the seed again) and the digest is taken again. Once Raft has its group directory the node no longer calls this.</p>
+	 * them is still there (a seed without table files cannot be compared, and is not kept), and IDENTITY, if the seed had
+	 * one, is the same file with the same content (Review of R41, 1: another database copied over {@code db/} without
+	 * deleting it first leaves the seed's table files next to its own, with other numbers, but brings its IDENTITY).
+	 * Otherwise the database was replaced since (the operator copied the seed again) and the digest is taken again. Not
+	 * found: a later copy of the seed's own source database (same IDENTITY) copied over {@code db/} by {@code rsync}
+	 * without {@code --delete}, which skips the unchanged IDENTITY; the runbooks say to delete {@code db/} and the digest
+	 * file before copying again. Once Raft has its group directory the node no longer calls this.</p>
 	 *
 	 * <p>The seed's files are fsynced first ({@link #syncSeed}, R34-1).</p>
 	 *
@@ -873,7 +879,8 @@ final class NodeStore implements Closeable {
 	 * the digest of those files, which no other copy of the seed has. With the marker it keeps the seed digest as long
 	 * as the files listed here that are still there are the same files, and one at least is: the open adds and deletes
 	 * table files but never rewrites one, while a copy made again ({@code cp}, {@code rsync}, restore-backup) makes new
-	 * ones. Does nothing
+	 * ones. It also lists IDENTITY ({@code identity <size> <identity> <sha-256>}, or {@code identity none}), which the
+	 * open keeps and another database copied over this one replaces. Does nothing
 	 * when no seed digest was recorded or {@code dbDir} holds no database; {@link #noteSeedOpened} drops the marker.
 	 */
 	static void noteSeedOpening(Path dbDir) throws IOException {
@@ -887,6 +894,7 @@ final class NodeStore implements Closeable {
 			content.append(OPENED_LINE).append(opened).append('\n');
 		}
 		content.append(OPENING).append('\n');
+		content.append(IDENTITY_LINE).append(identityFile(dbDir)).append('\n');
 		for (var table : tableFiles(dbDir).entrySet()) {
 			content.append(TABLE_LINE).append(table.getValue()).append(' ').append(table.getKey()).append('\n');
 		}
@@ -895,8 +903,8 @@ final class NodeStore implements Closeable {
 
 	/**
 	 * Null if every table or blob file that {@code lines} (the marker of {@link #noteSeedOpening}) listed and that is
-	 * still under {@code dbDir} is the same file, with the same size, and at least one of them is still there; otherwise
-	 * what differs.
+	 * still under {@code dbDir} is the same file, with the same size, at least one of them is still there, and IDENTITY
+	 * is the file the marker listed; otherwise what differs.
 	 */
 	private static @Nullable String tablesChangedSinceOpening(Path dbDir, List<String> lines) throws IOException {
 		var listed = new HashMap<String, String>();
@@ -906,6 +914,20 @@ final class NodeStore implements Closeable {
 				if (parts.length == 3) {
 					listed.put(parts[2], parts[0] + " " + parts[1]);
 				}
+			}
+		}
+		String identityBefore = lines.stream().filter(line -> line.startsWith(IDENTITY_LINE)).findFirst()
+				.map(line -> line.substring(IDENTITY_LINE.length())).orElse(null);
+		// IDENTITY (the database id) is the seed's, the same file: the open keeps an IDENTITY that matches its MANIFEST,
+		// another database copied over db/ brings its own (in place with cp, renamed over it with rsync). A seed without
+		// one (none) gets one from the open.
+		if (identityBefore != null && !identityBefore.equals("none")) {
+			String identityNow = identityFile(dbDir);
+			var before = identityBefore.split(" ", 3);
+			var now = identityNow.split(" ", 3);
+			if (now.length != 3 || before.length != 3 || !before[2].equals(now[2])
+					|| !sameTable(before[0] + " " + before[1], now[0] + " " + now[1])) {
+				return "IDENTITY is not the file it was before the open";
 			}
 		}
 		int same = 0;
@@ -924,24 +946,51 @@ final class NodeStore implements Closeable {
 	}
 
 	/**
-	 * The file system's key of {@code file} (device and inode on Linux) and its status change time, without spaces;
-	 * {@code -} if the file system has neither. An inode number is reused once its file is deleted, so a copy made again
+	 * The inode number of {@code file} and its status change time, without spaces; {@code -} if the file system has
+	 * neither. Not the device number ({@code fileKey()} on Linux is device and inode): on btrfs subvolumes, NFS, overlayfs
+	 * and some LVM or md setups it is assigned at mount time and can change across the reboot after a power loss during
+	 * the start-up check's open, which would make every listed file look like another one (Review of R41, 2). An inode number is reused once its file is deleted, so a copy made again
 	 * after {@code rm -r} can get the inode of the file it replaces, with its size and (rsync) its modification time; its
 	 * change time is the moment it was made, which no copy tool sets. Opening a database neither links nor rewrites a
 	 * table file, so the identity of one it keeps does not change.
 	 */
 	private static String fileIdentity(Path file, BasicFileAttributes attributes) {
-		Object key = attributes.fileKey();
+		Object inode;
 		Object changed;
 		try {
-			changed = Files.getAttribute(file, "unix:ctime", LinkOption.NOFOLLOW_LINKS);
+			var unix = Files.readAttributes(file, "unix:ino,ctime", LinkOption.NOFOLLOW_LINKS);
+			inode = unix.get("ino");
+			changed = unix.get("ctime");
 		} catch (IOException | UnsupportedOperationException | IllegalArgumentException e) {
+			inode = null;
 			changed = null;
 		}
-		if (key == null && changed == null) {
+		if (inode == null && changed == null) {
 			return "-";
 		}
-		return (key + "@" + changed).replaceAll("\\s", "");
+		return (inode + "@" + changed).replaceAll("\\s", "");
+	}
+
+	/**
+	 * {@code <size> <identity> <SHA-256 of the content>} of the {@code IDENTITY} file of {@code dbDir} (the database id),
+	 * {@code none} if there is none.
+	 */
+	private static String identityFile(Path dbDir) throws IOException {
+		Path file = dbDir.resolve("IDENTITY");
+		BasicFileAttributes attributes;
+		byte[] content;
+		try {
+			attributes = Files.readAttributes(file, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS);
+			content = Files.readAllBytes(file);
+		} catch (NoSuchFileException missing) {
+			return "none";
+		}
+		try {
+			var sha = java.security.MessageDigest.getInstance("SHA-256").digest(content);
+			return attributes.size() + " " + fileIdentity(file, attributes) + " " + java.util.HexFormat.of().formatHex(sha);
+		} catch (java.security.NoSuchAlgorithmException e) {
+			throw new IllegalStateException(e);
+		}
 	}
 
 	/** Two {@code <size> <identity>} values: same size, and same identity unless one of them is unknown ({@code -}). */

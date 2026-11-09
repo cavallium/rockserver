@@ -537,6 +537,18 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 					record(name, result);
 					return;
 				}
+				if (requestId != 0 && String.valueOf(requestId).equals(existing.getProperty("request"))
+						&& Long.parseLong(existing.getProperty("index", "-1")) != firstIndex) {
+					// The copy of this request is not at the request's first entry as this node knows it (Review of R41,
+					// 3): mixed versions only, a database from a snapshot of an older leader, which records no first index
+					// (this node then took this entry for the first), or a copy an older version took. Other nodes may hold
+					// a copy at another index under this name: FAILED, not DONE, so that admin does not report OK.
+					throw new IOException("The backup " + name + " of this request here was taken at log index "
+							+ existing.getProperty("index") + ", but this node has log index " + firstIndex + " for the"
+							+ " request's first entry (a snapshot of an older version's leader, or a copy an older version"
+							+ " took): the copies of this request on the nodes may be at different log positions. Check the"
+							+ " index in each node's backup.properties, or take a backup under another name");
+				}
 				if (requestId != 0 && String.valueOf(requestId).equals(existing.getProperty("request"))) {
 					// The same request proposed again, after its first answer was lost: that backup is this one, at the
 					// index where it was taken, which the result says (R41-3).
