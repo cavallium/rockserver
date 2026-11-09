@@ -21,10 +21,12 @@ import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.PosixFilePermission;
 import java.nio.file.attribute.PosixFilePermissions;
+import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
@@ -1246,6 +1248,181 @@ class NodeStoreTest {
 				() -> ReplicaOps.restore(dataDir.resolve(ReplicaOps.BACKUPS_DIR).resolve("b1"), dataDir, null));
 		assertTrue(refused.getMessage().contains("holds a database"), refused.getMessage());
 		assertFalse(refused.getMessage().contains("run again with"), refused.getMessage());
+	}
+
+	/**
+	 * R38-RESTORE-STALE-RESTORE-READY: a data directory without {@code db/} but with a complete {@code db.restore-ready}
+	 * of another cluster (and its {@code db.restore-old}: the layout a crash between the two renames of a snapshot
+	 * install's swap leaves, R33-1) is refused before anything is read, built or renamed, with a message that names the
+	 * leftover. Since R36-1 the database is built aside, so nothing rolled that directory in first: the restore printed
+	 * OK, and the first start's open swapped the old cluster's database over the restored {@code db/} and deleted it.
+	 */
+	@Test
+	void restoreBackupRefusesAnInterruptedSwapOfAnotherClusterAndTouchesNothing() throws IOException {
+		Path backupDir = tempDir.resolve("backup");
+		checkpointWithData(backupDir.resolve(ReplicaOps.BACKUP_DB_DIR), 10, TermIndex.valueOf(1, 10));
+		Files.writeString(backupDir.resolve(ReplicaOps.BACKUP_PROPERTIES), "name=b\nindex=10\ncluster=c\n");
+		Path dataDir = Files.createDirectories(tempDir.resolve("data")).toAbsolutePath().normalize();
+		for (String name : List.of("db.restore-ready", "db.restore-old")) {
+			try (var store = NodeStore.open(dataDir.resolve(name), null, "old")) {
+				long column = store.db().createColumn(DATA_COLUMN, DATA_SCHEMA);
+				put(store, column, 7, name);
+				setApplied(store, TermIndex.valueOf(4, 40));
+				setClusterId(store, "old-cluster");
+			}
+		}
+		Files.writeString(dataDir.resolve("replica-ops.log"), "old cluster\n");
+		var before = tree(dataDir);
+		var backupBefore = tree(backupDir);
+
+		var refused = assertThrows(IOException.class, () -> ReplicaOps.restore(backupDir, dataDir, null));
+
+		assertTrue(refused.getMessage().contains(dataDir.resolve("db.restore-ready").toString()), refused.getMessage());
+		assertTrue(refused.getMessage().contains("delete"), refused.getMessage());
+		assertEquals(before, tree(dataDir), "the refused restore changed the data directory");
+		assertEquals(backupBefore, tree(backupDir), "the refused restore changed the backup");
+	}
+
+	/**
+	 * R38-RESTORE-READY-LEFTOVER: each restore directory of {@code db/} alone ({@code db.restore-ready},
+	 * {@code db.restore-old}, {@code db.restore-tmp}, which the first start's open would swap in or delete) is refused
+	 * the same way, naming it, with nothing touched.
+	 */
+	@Test
+	void restoreBackupRefusesEachLeftoverRestoreDirectoryOfTheDatabase() throws IOException {
+		Path backupDir = tempDir.resolve("backup");
+		checkpointWithData(backupDir.resolve(ReplicaOps.BACKUP_DB_DIR), 10, TermIndex.valueOf(1, 10));
+		Files.writeString(backupDir.resolve(ReplicaOps.BACKUP_PROPERTIES), "name=b\nindex=10\ncluster=c\n");
+		for (String name : List.of("db.restore-ready", "db.restore-old", "db.restore-tmp")) {
+			Path dataDir = Files.createDirectories(tempDir.resolve("data-" + name)).toAbsolutePath().normalize();
+			Path leftover = Files.createDirectories(dataDir.resolve(name));
+			Files.writeString(leftover.resolve("CURRENT"), "kept");
+			var before = tree(dataDir);
+
+			var refused = assertThrows(IOException.class, () -> ReplicaOps.restore(backupDir, dataDir, null), name);
+
+			assertTrue(refused.getMessage().contains(leftover.toString()), refused.getMessage());
+			assertEquals(before, tree(dataDir), name);
+		}
+	}
+
+	/**
+	 * R38 review 2: a rerun of a {@code restore-backup} that stopped while it built the database aside still deletes
+	 * what that run left in {@code db.restore-backup} and in that directory's own restore directories
+	 * ({@code db.restore-backup.restore-tmp}, {@code -ready}, {@code -old}), after the refusal of {@code db/}'s restore
+	 * directories: those are other names (none is a prefix of {@code db.restore-backup}), so the refusal leaves the
+	 * staging leftovers to the cleanup that follows it, and the rerun restores.
+	 */
+	@Test
+	void restoreBackupRerunDeletesWhatAStoppedRunLeftAside() throws IOException {
+		Path backupDir = tempDir.resolve("backup");
+		checkpointWithData(backupDir.resolve(ReplicaOps.BACKUP_DB_DIR), 10, TermIndex.valueOf(1, 10));
+		Files.writeString(backupDir.resolve(ReplicaOps.BACKUP_PROPERTIES), "name=b\nindex=10\ncluster=c\n");
+		Path dataDir = Files.createDirectories(tempDir.resolve("data")).toAbsolutePath().normalize();
+		var leftovers = new ArrayList<Path>();
+		Path staging = dataDir.resolve(ReplicaOps.RESTORE_STAGING_DIR);
+		leftovers.add(staging);
+		leftovers.addAll(NodeStore.restoreDirectories(staging));
+		for (Path leftover : leftovers) {
+			Files.createDirectories(leftover);
+			Files.writeString(leftover.resolve("CURRENT"), "left by the stopped run");
+		}
+
+		assertEquals(TermIndex.valueOf(1, 10), ReplicaOps.restore(backupDir, dataDir, null));
+
+		for (Path leftover : leftovers) {
+			assertFalse(Files.exists(leftover, LinkOption.NOFOLLOW_LINKS), leftover + " is still there");
+		}
+		try (var store = NodeStore.open(dataDir.resolve("db"), null, "restored")) {
+			assertEquals(TermIndex.INITIAL_VALUE, store.applied());
+			assertEquals(10, contents(store, store.db().getColumnId(DATA_COLUMN)).size());
+		}
+	}
+
+	/**
+	 * R38-EXPORT-WALPATH-UNTESTED (R36 review 1 on export-seed's side): a Rockserver config whose {@code wal-path} is an
+	 * absolute path inside the source's {@code db/} exports a seed whose copy opens its WAL under the target, not in the
+	 * source's WAL directory; the source and the seed both open with their data.
+	 */
+	@Test
+	void exportSeedWithAnAbsoluteWalPathInsideTheSourceDatabase() throws IOException {
+		assertExportsWithAnAbsolutePathInsideTheSourceDatabase("wal-path", "wal");
+	}
+
+	/** The same for {@code log-path}: the copy's info log goes under the target, not into the source's log directory. */
+	@Test
+	void exportSeedWithAnAbsoluteLogPathInsideTheSourceDatabase() throws IOException {
+		assertExportsWithAnAbsolutePathInsideTheSourceDatabase("log-path", "logs");
+	}
+
+	private void assertExportsWithAnAbsolutePathInsideTheSourceDatabase(String key, String child) throws IOException {
+		Path dataDir = Files.createDirectories(tempDir.resolve("node")).toAbsolutePath().normalize();
+		Path source = dataDir.resolve("db");
+		Path config = tempDir.resolve("absolute.conf");
+		Files.writeString(config, "database.global.%s = \"%s\"\n".formatted(key, source.resolve(child)));
+		try (var store = NodeStore.open(source, config, "source")) {
+			long column = store.db().createColumn(DATA_COLUMN, DATA_SCHEMA);
+			for (int i = 0; i < 10; i++) {
+				put(store, column, i, "v" + i);
+			}
+			setApplied(store, TermIndex.valueOf(1, 10));
+		}
+		assertTrue(Files.isDirectory(source.resolve(child)), "the source's " + key + " is inside its db/");
+		Path target = tempDir.resolve("exported-seed").toAbsolutePath().normalize();
+
+		// What the checkpoint put in the target's directory for it (the WAL is copied there), before the copy opens.
+		var checkpointed = new AtomicReference<List<String>>(List.of());
+		var sourceAtCheckpoint = new AtomicReference<Map<String, String>>();
+		NodeStore.checkpointBuiltForTesting = building -> {
+			sourceAtCheckpoint.set(fileDigests(source.resolve(child)));
+			if (Files.isDirectory(building.resolve(child))) {
+				checkpointed.set(entryNames(building.resolve(child)));
+			}
+		};
+		try {
+			assertEquals(TermIndex.valueOf(1, 10), NodeStore.exportSeed(source, config, target).applied());
+		} finally {
+			NodeStore.checkpointBuiltForTesting = null;
+		}
+
+		assertTrue(Files.isDirectory(target.resolve(child)), "the copy's " + key + " directory is inside the target");
+		// The copy's open writes a new WAL, or its info log, under the target: before, into the source's directory.
+		var written = new ArrayList<>(entryNames(target.resolve(child)));
+		written.removeAll(checkpointed.get());
+		assertFalse(written.isEmpty(), "the copy wrote no file into " + target.resolve(child) + ", which holds only "
+				+ checkpointed.get());
+		// The source's directory as the source left it, against its state when the checkpoint was built (the source
+		// open, before its close and the copy's open). RocksDB numbers WAL files NNNNNN.log: a copy that opened the
+		// source's WAL directory would add a WAL there (or change one); a file the source deleted as obsolete is fine.
+		// The source's close appends to its own info log, so only the WAL files are compared by content (R38 review 1).
+		var after = fileDigests(source.resolve(child));
+		var added = new java.util.TreeSet<>(after.keySet());
+		added.removeAll(sourceAtCheckpoint.get().keySet());
+		assertEquals(Set.of(), added, "the copy wrote into the source's " + key);
+		if (key.equals("wal-path")) {
+			for (var file : after.entrySet()) {
+				assertEquals(sourceAtCheckpoint.get().get(file.getKey()), file.getValue(),
+						"the copy changed the source's WAL file " + file.getKey());
+			}
+		}
+		try (var seed = NodeStore.open(target, null, "seed")) {
+			assertEquals(10, contents(seed, seed.db().getColumnId(DATA_COLUMN)).size());
+		}
+		try (var store = NodeStore.open(source, config, "source")) {
+			assertEquals(TermIndex.valueOf(1, 10), store.applied());
+			assertEquals(10, contents(store, store.db().getColumnId(DATA_COLUMN)).size());
+		}
+	}
+
+	/** Every entry under {@code dir}: a directory as "dir", a file by its size and content digest. */
+	private static Map<String, String> tree(Path dir) throws IOException {
+		var result = new TreeMap<String, String>(fileDigests(dir));
+		try (Stream<Path> walk = Files.walk(dir)) {
+			for (Path path : walk.filter(Files::isDirectory).toList()) {
+				result.put(dir.relativize(path) + "/", "dir");
+			}
+		}
+		return result;
 	}
 
 	private void assertRestoredWithTheBackupMovedAside(Path dataDir, String name) throws IOException {
