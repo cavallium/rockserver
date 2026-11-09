@@ -923,6 +923,10 @@ final class NodeStore implements Closeable {
 	 * snapshot with {@code db/} closed and so without RocksDB's LOCK, and the open would otherwise finish or delete the
 	 * restore directories it is building ({@link #open} recovers them before RocksDB locks the database).</p>
 	 *
+	 * <p>A missing {@code dbDir} is accepted when {@code <db>.restore-ready} exists (R33-1): a crash during a restore's
+	 * swap left the complete new database there, and the open, under the lock, swaps it in as the node's start would.
+	 * With neither {@code dbDir/CURRENT} nor that directory, it throws "No database in" before anything is touched.</p>
+	 *
 	 * @throws NodeRunningException if the node holds its group's lock: nothing of the node is touched, nothing written
 	 */
 	static ExportedSeed exportSeed(Path dbDir, @Nullable Path stateMachineDir, @Nullable Path rockserverConfig,
