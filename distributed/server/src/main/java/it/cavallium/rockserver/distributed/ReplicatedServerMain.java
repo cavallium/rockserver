@@ -745,10 +745,17 @@ public final class ReplicatedServerMain {
 				}
 				case "remove-peer" -> {
 					var removed = peerId(command);
-					yield changeVoters(client, peers, groupId, peers.stream()
+					var target = peers.stream()
 							.filter(p -> !p.id().equals(removed))
 							.map(ReplicatedServerMain::raftPeer)
-							.toList(), unsafe, changeAddresses, timeout, deadline);
+							.toList();
+					// R59-1: not a voter (a re-run of a removal that committed, or a mistyped id): said so, and OK without
+					// proposing anything; an id that differs from a voter only by case fails as a likely typo.
+					if (!isVoterToRemove(removed, peers, groupId, target, changeAddresses, deadline)) {
+						System.out.println("OK");
+						yield null;
+					}
+					yield changeVoters(client, peers, groupId, target, unsafe, changeAddresses, timeout, deadline);
 				}
 				case "snapshot" -> {
 					var member = peerId(command);
@@ -1379,6 +1386,53 @@ public final class ReplicatedServerMain {
 		}
 		System.out.println("node " + added.id() + " is already a voter at " + voter.getAddress() + ": nothing to do");
 		return true;
+	}
+
+	/**
+	 * Whether {@code removed} is a voter of the leader's settled configuration, which {@code remove-peer} then proposes
+	 * to remove ({@link #changeVoters}) (R59-1). Otherwise nothing is proposed: Ratis 3.3.1 answers success to a
+	 * configuration with the same voters without writing it ({@code RaftConfigurationImpl.hasNoChange}), so the call
+	 * printed {@code OK} after "removes []" for a mistyped id too. Fails, before anything is proposed, for an id that
+	 * differs from a voter only by case ({@link VoterChange#caseVariants}): Ratis compares ids case-sensitively, and such
+	 * an id is a typo unless the cluster had ids that differ only by case (then the message says to check the voters).
+	 * For any other id it prints {@code ID is not a voter: nothing to remove} with the voters and returns false, and the
+	 * caller prints {@code OK} with exit code 0: the tool cannot tell a mistyped id from the re-run of a removal that
+	 * committed, whose id is gone from the configuration (and, in the {@code --peer <the others>} form, from
+	 * {@code --peer}), and a re-run of a call that succeeded prints {@code OK} again. The addresses of the members that
+	 * stay are checked as {@link #changeVoters} would (R51-1, R52-3: a call that changes no voter writes no address).
+	 */
+	private static boolean isVoterToRemove(String removed, List<PeerConfig> peers, RaftGroupId groupId,
+			List<RaftPeer> target, boolean changeAddresses, long deadlineNanos) throws InterruptedException {
+		Membership current;
+		try (var infoClient = infoClient(peers, groupId)) {
+			current = leaderConfiguration(infoClient, peers, groupId, deadlineNanos);
+		} catch (IOException closing) {
+			fail("cannot close the client: " + closing);
+			throw new AssertionError(closing);
+		}
+		var voters = VoterChange.ids(current.servers());
+		if (voters.contains(removed)) {
+			return true;
+		}
+		System.out.println("leader " + current.leader() + ": voters " + voters
+				+ (current.listeners().isEmpty() ? "" : ", listeners " + VoterChange.ids(current.listeners())));
+		var variants = VoterChange.caseVariants(removed, current.servers());
+		if (!variants.isEmpty()) {
+			fail(removed + " is not a voter (voters " + voters + "): likely a typo of " + String.join(" or ", variants)
+					+ ", as ids are case-sensitive. Nothing was proposed. Run remove-peer with the id as the voters list it;"
+					+ " if the cluster had ids that differ only by case and " + removed + " was removed already, the"
+					+ " removal is done (\"Replacing a node\" in docs/distributed/runbooks.md)");
+		}
+		var moved = VoterChange.addressChanges(current.servers(), target);
+		if (!moved.isEmpty()) {
+			refuseAddressChanges(moved, changeAddresses, true);
+		}
+		boolean listener = VoterChange.ids(current.listeners()).contains(removed);
+		System.out.println(removed + " is not a voter: nothing to remove (voters " + voters + ")"
+				+ (listener ? "; it is a listener, which remove-peer does not remove" : "")
+				+ ". Nothing was proposed. A re-run of a removal that succeeded prints this; otherwise check the id"
+				+ " against the voters");
+		return false;
 	}
 
 	/**

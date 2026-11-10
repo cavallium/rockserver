@@ -731,6 +731,87 @@ class CommandLineTest {
 		assertEquals(self.raftAddress(), voterAddress(staying));
 	}
 
+	/**
+	 * R59-1: {@code remove-peer ID} of an id that is not a voter of the leader's configuration says so instead of a bare
+	 * {@code OK}. An id that differs from a voter only by case ({@code N1} for {@code n1}; Ratis compares ids
+	 * case-sensitively) is refused with exit code 1 as a likely typo, before anything is proposed: it cannot be the re-run
+	 * of a removal that succeeded unless the cluster holds ids that differ only by case. Any other id that is not a voter
+	 * prints {@code ID is not a voter: nothing to remove} with the voters, then {@code OK} with exit code 0, because the
+	 * tool cannot tell a mistyped id from the re-run of a removal that already committed (documented idempotence: the
+	 * re-run of a call that succeeded prints OK again), in both the all-members and the {@code --peer <the others>} form.
+	 */
+	@Test
+	void adminRemovePeerOfAnIdThatIsNotAVoterSaysSo() throws Exception {
+		cluster = new InProcessCluster(Files.createDirectories(temp.resolve("not-a-voter")), 3, c -> c).startAll();
+		cluster.awaitLeader(TIMEOUT);
+		var all = List.of("n0", "n1", "n2");
+		var removed = cluster.anyFollower().config().nodeId();
+
+		var typo = run(admin(all, "remove-peer", removed.toUpperCase(Locale.ROOT)));
+		assertEquals(1, typo.code(), typo.toString());
+		assertTrue(typo.out().contains("FAILED"), typo.out());
+		assertTrue(typo.out().contains(removed.toUpperCase(Locale.ROOT) + " is not a voter"), typo.out());
+		assertTrue(typo.out().contains("likely a typo of " + removed), typo.out());
+		assertTrue(typo.out().contains("Nothing was proposed"), typo.out());
+		assertTrue(!typo.out().strip().endsWith("OK"), typo.out());
+		// Review of R59, 2: changeVoters, the only caller of setConfiguration for remove-peer, prints this line before it
+		// proposes; assertVoters alone cannot tell a no-op proposal (Ratis writes nothing for the same voters) from none.
+		assertTrue(!typo.out().contains("this change adds"), typo.out());
+		assertVoters(all);
+
+		var unknown = run(admin(all, "remove-peer", "n9"));
+		assertEquals(0, unknown.code(), unknown.toString());
+		assertTrue(unknown.out().contains("n9 is not a voter: nothing to remove (voters [n0, n1, n2])"), unknown.out());
+		assertTrue(unknown.out().strip().endsWith("OK"), unknown.out());
+		assertTrue(!unknown.out().contains("this change adds"), unknown.out());
+		assertVoters(all);
+
+		var remove = run(admin(all, "remove-peer", removed));
+		assertEquals(0, remove.code(), remove.toString());
+		assertTrue(!remove.out().contains("is not a voter"), remove.out());
+		// Review of R59, 1: the removing call prints the voters read before its proposal, the removed id among them.
+		assertTrue(remove.out().contains("voters " + all + "; this change adds [] and removes [" + removed + "]"),
+				remove.out());
+		assertTrue(remove.out().strip().endsWith("OK"), remove.out());
+		var survivors = new ArrayList<>(all);
+		survivors.remove(removed);
+		assertVoters(survivors);
+
+		// Re-runs of the removal that succeeded, as after a timeout: still OK, and the output says nothing was removed.
+		for (var peerIds : List.of(all, survivors)) {
+			var again = run(admin(peerIds, "remove-peer", removed));
+			assertEquals(0, again.code(), again.toString());
+			assertTrue(again.out().contains(removed + " is not a voter: nothing to remove (voters " + survivors + ")"),
+					again.out());
+			assertTrue(again.out().strip().endsWith("OK"), again.out());
+			assertTrue(!again.out().contains("this change adds"), again.out());
+			assertVoters(survivors);
+		}
+	}
+
+	/**
+	 * Review of R59, 2: a {@code --peer} that misses a voter, with {@code remove-peer} of an id that is not a voter,
+	 * proposes nothing. Before R59-1 the target was {@code --peer} minus the id, so the call proposed removing the voter
+	 * missing from {@code --peer} (one voter, a safe change) and printed OK.
+	 */
+	@Test
+	void adminRemovePeerOfANonVoterWithAVoterMissingFromPeerProposesNothing() throws Exception {
+		cluster = new InProcessCluster(Files.createDirectories(temp.resolve("not-a-voter-short-peer")), 3, c -> c)
+				.startAll();
+		cluster.awaitLeader(TIMEOUT);
+		var all = List.of("n0", "n1", "n2");
+		var missing = cluster.anyFollower().config().nodeId();
+		var given = new ArrayList<>(all);
+		given.remove(missing);
+
+		var result = run(admin(given, "remove-peer", "n9"));
+		assertEquals(0, result.code(), result.toString());
+		assertTrue(result.out().contains("n9 is not a voter: nothing to remove (voters " + all + ")"), result.out());
+		assertTrue(!result.out().contains("this change adds"), result.out());
+		assertTrue(result.out().strip().endsWith("OK"), result.out());
+		assertVoters(all);
+	}
+
 	/** {@link #admin} with member {@code replaced} given as {@code peer} instead of its own address. */
 	private String[] adminWith(List<String> peerIds, String replaced, PeerConfig peer, String... command) {
 		var args = new ArrayList<>(List.of(admin(peerIds, command)));
