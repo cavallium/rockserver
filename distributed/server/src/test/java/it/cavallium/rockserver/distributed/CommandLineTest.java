@@ -611,6 +611,85 @@ class CommandLineTest {
 			ReplicatedServerMain.snapshotRequestWait = wait;
 		}
 	}
+
+	/**
+	 * Review of R57, 1: {@code requestSnapshot} decided to send a retryable attempt again before its 500 ms sleep and
+	 * did not look at the clock after it, so a retryable failure in the last 500 ms of the wait sent one more attempt
+	 * after the wait had ended (its {@code left} clamped to 1 ms), which on a real member can start a take after the
+	 * command has given up. Here a fake member holds the first snapshot request until 200 ms before the end of a 3 s
+	 * wait and answers it {@code UNAVAILABLE} (a retryable transport error), and every later one at once: the command
+	 * must end with {@code took no snapshot within} without sending a second request.
+	 */
+	@Test
+	void noSnapshotRequestIsSentAfterTheWaitEnded() throws Exception {
+		var wait = ReplicatedServerMain.snapshotRequestWait;
+		ReplicatedServerMain.snapshotRequestWait = Duration.ofSeconds(20);
+		long timeoutMs = 3000;
+		var calls = new CopyOnWriteArrayList<Long>();
+		var start = new java.util.concurrent.atomic.AtomicLong();
+		var bytes = new org.apache.ratis.thirdparty.io.grpc.MethodDescriptor.Marshaller<byte[]>() {
+			@Override
+			public java.io.InputStream stream(byte[] value) {
+				return new java.io.ByteArrayInputStream(value);
+			}
+
+			@Override
+			public byte[] parse(java.io.InputStream stream) {
+				try {
+					return stream.readAllBytes();
+				} catch (IOException ex) {
+					throw new java.io.UncheckedIOException(ex);
+				}
+			}
+		};
+		ServerCalls.UnaryMethod<byte[], byte[]> refuse = (request, response) -> {
+			calls.add(System.nanoTime());
+			if (calls.size() == 1) {
+				long until = start.get() + TimeUnit.MILLISECONDS.toNanos(timeoutMs - 200);
+				try {
+					Thread.sleep(Math.max(0, TimeUnit.NANOSECONDS.toMillis(until - System.nanoTime())));
+				} catch (InterruptedException ex) {
+					Thread.currentThread().interrupt();
+				}
+			}
+			response.onError(Status.UNAVAILABLE.withDescription("not up yet").asRuntimeException());
+		};
+		var registry = new org.apache.ratis.thirdparty.io.grpc.HandlerRegistry() {
+			@Override
+			public org.apache.ratis.thirdparty.io.grpc.ServerMethodDefinition<?, ?> lookupMethod(String method,
+					@Nullable String authority) {
+				if (!method.endsWith("/snapshotManagement")) {
+					return null;
+				}
+				return org.apache.ratis.thirdparty.io.grpc.ServerMethodDefinition.create(
+						org.apache.ratis.thirdparty.io.grpc.MethodDescriptor.<byte[], byte[]>newBuilder()
+								.setType(org.apache.ratis.thirdparty.io.grpc.MethodDescriptor.MethodType.UNARY)
+								.setFullMethodName(method).setRequestMarshaller(bytes).setResponseMarshaller(bytes).build(),
+						ServerCalls.asyncUnaryCall(refuse));
+			}
+		};
+		var member = NettyServerBuilder.forAddress(new java.net.InetSocketAddress("127.0.0.1", 0))
+				.fallbackHandlerRegistry(registry).build().start();
+		try {
+			start.set(System.nanoTime());
+			var result = run("admin", "--peer", "f1=127.0.0.1:" + member.getPort() + "/127.0.0.1:" + member.getPort(),
+					"--timeout-ms", Long.toString(timeoutMs), "snapshot", "f1");
+			long tookMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - start.get());
+			assertTrue(!calls.isEmpty(), result.toString());
+			long firstMs = TimeUnit.NANOSECONDS.toMillis(calls.getFirst() - start.get());
+			assertTrue(firstMs < timeoutMs - 400, "the first request came " + firstMs + " ms after the start: " + result);
+			assertEquals(1, result.code(), result.toString());
+			assertTrue(result.out().contains("f1 took no snapshot within"), result.toString());
+			assertEquals(1, calls.size(), () -> "requests at " + calls.stream()
+					.map(at -> TimeUnit.NANOSECONDS.toMillis(at - start.get()) + " ms").toList() + ", the wait " + timeoutMs
+					+ " ms, the command took " + tookMs + " ms: " + result);
+			assertTrue(tookMs < timeoutMs + 1500, "the command took " + tookMs + " ms");
+		} finally {
+			member.shutdownNow().awaitTermination(5, TimeUnit.SECONDS);
+			ReplicatedServerMain.snapshotRequestWait = wait;
+		}
+	}
+
 	/**
 	 * R52-3: Ratis 3.3.1 takes a configuration with the same voter ids and priorities for no change
 	 * ({@code RaftConfigurationImpl.hasNoChange} never compares addresses) and answers success without writing it. A
