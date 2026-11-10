@@ -143,7 +143,9 @@ import org.rocksdb.NativeLibraryLoader;
  * after that: see {@code status}, and run the command again. {@code add-peer} first reads the leader's configuration:
  * for a node that is a voter there at the same address it prints {@code OK} (a re-run) without asking the node. Else
  * it asks the new node what it holds, and refuses a node that does not run or that has a log of its own (after reading
- * the configuration again: a node that became a voter meanwhile is {@code OK}). {@code snapshot} makes a member take a snapshot now.</p>
+ * the configuration again: a node that became a voter meanwhile is {@code OK}). {@code snapshot} makes a member take a snapshot now, and fails with exit code 1 when it takes none (its retry
+ * backoff, a replay after a start, an install: Ratis answers that with success and log index -1, R54-3).
+ * {@code status} prints each member's role, applied and commit index (R54-4).</p>
  *
  * <p>{@code add-peer} and {@code remove-peer} build the new voters from {@code --peer} (plus or minus the one node), read
  * the leader's configuration (waiting while a change is under way), and refuse with exit code 1, before proposing
@@ -1408,7 +1410,7 @@ public final class ReplicatedServerMain {
 	}
 
 	/**
-	 * Prints each member's role and commit infos, in the {@code --peer} order. The members are asked at once, each once
+	 * Prints each member's role, applied and commit index ({@link #logInfo}) and commit infos, in the {@code --peer} order. The members are asked at once, each once
 	 * (no retry) and for at most {@link #PEER_ANSWER_TIMEOUT}: a dead or unroutable member prints "unreachable" after
 	 * that, instead of holding the others for the admin time limit, as the shared client's retries until the deadline
 	 * did (R27-1). Status is what the runbooks tell to look at exactly when members are down.
