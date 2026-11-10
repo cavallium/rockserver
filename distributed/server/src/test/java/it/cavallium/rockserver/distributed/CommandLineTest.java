@@ -486,7 +486,9 @@ class CommandLineTest {
 	 * the handler's {@code timeout()} fails whatever request is pending when it fires. A timer left by an earlier request
 	 * that finished in time (here one with a 3 s timeout, answered at once) therefore fails an {@code admin snapshot}
 	 * whose take is still running at that moment (here a take of 2.5 s started 1.5 s after the earlier request). The
-	 * command must not print {@code FAILED} for it: it asks again and reports the take.
+	 * command must not print {@code FAILED} for it: it asks again and reports the take. Review of R56, 5: the test checks
+	 * that the earlier request's timer fired while the command's take ran and that the client sent its request again,
+	 * so a drift of the timing (a take that starts late or ends before the timer) fails instead of passing untested.
 	 */
 	@Test
 	void aTimerLeftByAnEarlierSnapshotRequestDoesNotFailALaterAdminSnapshot() throws Exception {
@@ -508,6 +510,8 @@ class CommandLineTest {
 			var first = division.getRaftServer().snapshotManagementAsync(
 					org.apache.ratis.protocol.SnapshotManagementRequest.newCreate(org.apache.ratis.protocol.ClientId.randomId(),
 							division.getId(), division.getGroup().getGroupId(), 1, 3000)).get(TIMEOUT.toSeconds(), TimeUnit.SECONDS);
+			// The earlier request's timer was armed between these two moments, so it fires between them plus 3 s.
+			long answered = System.nanoTime();
 			assertTrue(first.isSuccess() && first.getLogIndex() >= 0, first.toString());
 			api.put(0, column, key(2), value("v2"), RequestType.none());
 			InProcessCluster.await(TIMEOUT, () -> stateMachine.handedOverForTesting() >= stateMachine.appliedIndex().get());
@@ -516,12 +520,25 @@ class CommandLineTest {
 			assertTrue(sleep > 0, "the earlier request took " + (1500 - sleep) + " ms");
 			Thread.sleep(sleep);
 
+			long attempts = stateMachine.snapshotAttempts.get();
+			long retries = ReplicatedServerMain.adminRetriesForTests.get();
 			var taken = run(admin(List.of(id), "snapshot", id));
 			assertEquals(0, taken.code(), taken.toString());
 			assertTrue(!taken.out().contains("FAILED"), taken.out());
 			var latest = stateMachine.getLatestSnapshot();
 			assertTrue(latest != null && latest.getIndex() > first.getLogIndex(), "a later snapshot was taken: " + latest);
 			assertTrue(taken.out().contains(id + " took a snapshot at log index "), taken.out());
+			assertEquals(attempts + 1, stateMachine.snapshotAttempts.get(), "one take, for the command");
+			long fireFrom = earlier + TimeUnit.SECONDS.toNanos(3);
+			long fireTo = answered + TimeUnit.SECONDS.toNanos(3);
+			long takeStarted = stateMachine.takeStartedForTests;
+			long takeEnded = stateMachine.takeEndedForTests;
+			assertTrue(takeStarted - fireFrom < 0 && takeEnded - fireTo > 0, () -> "the earlier timer fired between "
+					+ TimeUnit.NANOSECONDS.toMillis(fireFrom - earlier) + " and " + TimeUnit.NANOSECONDS.toMillis(fireTo - earlier)
+					+ " ms, the take ran from " + TimeUnit.NANOSECONDS.toMillis(takeStarted - earlier) + " to "
+					+ TimeUnit.NANOSECONDS.toMillis(takeEnded - earlier) + " ms");
+			assertTrue(ReplicatedServerMain.adminRetriesForTests.get() > retries,
+					"the timer cleared the command's request and the client sent it again");
 		} finally {
 			ReplicatedServerMain.snapshotRequestWait = wait;
 		}

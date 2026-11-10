@@ -1683,9 +1683,17 @@ public final class ReplicatedServerMain {
 	 * client sends a request again until the time {@code deadlineNanos} gives at that moment.
 	 */
 	private static RetryPolicy retryUntil(java.util.function.LongSupplier deadlineNanos) {
-		return _ -> System.nanoTime() - deadlineNanos.getAsLong() < 0 ? () -> ADMIN_RETRY_SLEEP
-				: RetryPolicy.NO_RETRY_ACTION;
+		return _ -> {
+			if (System.nanoTime() - deadlineNanos.getAsLong() < 0) {
+				adminRetriesForTests.incrementAndGet();
+				return () -> ADMIN_RETRY_SLEEP;
+			}
+			return RetryPolicy.NO_RETRY_ACTION;
+		};
 	}
+
+	/** Tests only: the retries that {@code admin}'s Ratis client was allowed ({@link #retryUntil}). */
+	static final java.util.concurrent.atomic.AtomicLong adminRetriesForTests = new java.util.concurrent.atomic.AtomicLong();
 
 	/**
 	 * How long, in ms, {@code admin snapshot} waits for the member's snapshot (R55-3): {@code wait}, at most the time
@@ -1695,7 +1703,10 @@ public final class ReplicatedServerMain {
 	 * {@code TimeoutIOException("Failed to take a snapshot within timeout")}; every retry of the client in the meantime
 	 * joins the same request. The answer therefore comes at this wait, which was the whole {@code --timeout-ms}, 10
 	 * minutes by default. A request that joined another one's (the byte trigger's, whose take failed) ends at that one's
-	 * timeout, at most 120 s, and the client then sends it again, which runs a take (R56-1). A timer left by an earlier
+	 * timeout, 30 s to 120 s after the byte trigger asked, and the client then sends it again, which runs a take
+	 * (R56-1), if this wait has not ended first: with a short {@code --timeout-ms} (30 s, say) the command still ends
+	 * with {@code took no snapshot within}, and a run at least 2 minutes after the failed take gets one (review of R56,
+	 * 4). A timer left by an earlier
 	 * request also clears the pending one when it fires (Ratis never cancels it): the client sends it again, and the
 	 * take that runs completes it (R56-2).
 	 */
