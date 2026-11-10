@@ -148,8 +148,9 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 	 */
 	private boolean resultsFileTorn;
 	/**
-	 * The results file holds a checked line ({@link #checkedLine}, R54-2): from then on a line without a valid check is
-	 * a cut or damaged one and is rejected. The first {@link #persist} of a file without one writes {@link #FORMAT_LINE}
+	 * The results file holds a checked line (one followed by its check line, {@link #checkedLines}, R55-1, or one of
+	 * round 54 with its check at its end, R54-2): from then on a line without a valid check is a cut or damaged one and
+	 * is rejected. The first {@link #persist} of a file without one writes {@link #FORMAT_LINE}
 	 * first, so that every line after it is checked, also when that first append is cut.
 	 */
 	private boolean resultsFileChecked;
@@ -861,15 +862,38 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 	 */
 	volatile java.util.function.@Nullable ToIntFunction<String> cutNextAppendForTesting;
 
-	/** The content of the line that the first append of this version to a results file writes (R54-2). */
+	/** The content of the line that the first append of a checking version to a results file writes (R54-2). */
 	private static final String FORMAT_LINE = "format checked";
-	/** A checked line: its time, its content, and {@code " #"} with the CRC-32 of the content in 8 hex digits. */
+	/**
+	 * A line that round 54 wrote (R54-2): its time, its content, and {@code " #"} with the CRC-32 of the content in 8
+	 * hex digits. Still read, not written: a binary of round 53, to which a node may be rolled back, took the check for
+	 * the end of the digest or directory (R55-1).
+	 */
 	private static final java.util.regex.Pattern CHECKED_LINE =
 			java.util.regex.Pattern.compile("(\\S+) (.*) #([0-9a-f]{8})");
+	/**
+	 * The check line that this version writes after each line (R55-1): {@code #} and the CRC-32 of the line before it
+	 * past its time ({@link #lineCrc}), in 8 hex digits. One field, so a binary of round 53 or 54 skips it (it needs 6)
+	 * and reads the line before it as it wrote its own.
+	 */
+	private static final java.util.regex.Pattern CHECK_LINE = java.util.regex.Pattern.compile("#([0-9a-f]{8})");
 
-	/** The line of the results file for {@code content} written at {@code time}, with its check (R54-2). */
-	static String checkedLine(String time, String content) {
-		return time + " " + content + " #" + crc(content);
+	/**
+	 * The two lines of the results file for {@code content} written at {@code time} (R55-1): the line as a binary of
+	 * round 53 writes and reads it, and its check line ({@link #CHECK_LINE}), each with its {@code \n}.
+	 */
+	static String checkedLines(String time, String content) {
+		return time + " " + content + "\n#" + crc(content) + "\n";
+	}
+
+	/**
+	 * The check of {@code line} as {@link #CHECK_LINE} holds it: the CRC-32 of what follows its time, as R54-2's check
+	 * (the time is left out: {@code ChecksumTest} rewrites it by hand, and a changed time costs only the schedule's
+	 * fallback); null for a line without a time.
+	 */
+	private static @Nullable String lineCrc(String line) {
+		int space = line.indexOf(' ');
+		return space < 0 ? null : crc(line.substring(space + 1));
 	}
 
 	private static String crc(String content) {
@@ -879,9 +903,10 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 	}
 
 	/**
-	 * Appends one line to the results file, so that a restarted node still answers about its past results. The line
-	 * ends with a check of its content ({@link #checkedLine}), so that a line cut short (by a power loss, the file is
-	 * not synced, or a full disk) is told from a whole one wherever it ends up in the file (R54-2). An append that
+	 * Appends one line to the results file, so that a restarted node still answers about its past results. A check line
+	 * follows it ({@link #checkedLines}), so that a line cut short (by a power loss, the file is not synced, or a full
+	 * disk) is told from a whole one wherever it ends up in the file (R54-2), while a binary of round 53 still reads the
+	 * line right (R55-1). An append that
 	 * fails may have written part of its line (a short write cut by ENOSPC or EIO while the node keeps running), so the
 	 * next one starts on a new line (R54-1).
 	 */
@@ -889,8 +914,8 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 		try {
 			Files.createDirectories(resultsFile.getParent());
 			var time = Instant.now().toString();
-			var record = (resultsFileTorn ? "\n" : "") + (resultsFileChecked ? "" : checkedLine(time, FORMAT_LINE) + "\n")
-					+ checkedLine(time, line) + "\n";
+			var record = (resultsFileTorn ? "\n" : "") + (resultsFileChecked ? "" : checkedLines(time, FORMAT_LINE))
+					+ checkedLines(time, line);
 			byte[] bytes = record.getBytes(StandardCharsets.UTF_8);
 			var cut = cutNextAppendForTesting;
 			cutNextAppendForTesting = null;
@@ -917,7 +942,8 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 	 * the whole file, so no line loaded at any start until the file was moved by hand. A last line without its
 	 * {@code \n} is torn: it is not returned among the lines, also when it decodes (R54-2: cut inside its last field it
 	 * parsed as a {@code DONE} result with a cut digest or directory), {@code torn} is set, and {@code tornLast} gets
-	 * it when it decodes, for {@link #loadResults} to keep if its check proves it whole (review of R54, 2). The file is a cache
+	 * it when it decodes, for {@link #loadResults} to keep if its check proves it whole (review of R54, 2; this
+	 * version's torn last line is a check line that lost its {@code \n}, R55-1). The file is a cache
 	 * ({@code backup.properties} is the record of a backup, {@code checksum-schedule} the schedule's fallback): a
 	 * damaged line costs only its own result; see {@link #loadResults} for the lines cut elsewhere.
 	 */
@@ -992,9 +1018,11 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 			if (torn.get()) {
 				var last = tornLast.get();
 				var checked = last == null ? null : CHECKED_LINE.matcher(last);
-				if (checked != null && checked.matches() && crc(checked.group(2)).equals(checked.group(3))) {
-					// Only its \n was lost, its check proves the rest whole (review of R54, 2): kept, and the next append
-					// starts with the \n.
+				var check = last == null ? null : CHECK_LINE.matcher(last);
+				if (check != null && check.matches() && !lines.isEmpty() && check.group(1).equals(lineCrc(lines.getLast()))
+						|| checked != null && checked.matches() && crc(checked.group(2)).equals(checked.group(3))) {
+					// Only its \n was lost, its check proves the rest whole (review of R54, 2; for this version's check line,
+					// the line before it, R55-1): kept, and the next append starts with the \n.
 					LOG.info("{}: the last line of {} has no line end (an append cut by a full disk or a crash right before"
 							+ " it); its check verifies, so it is kept", config.nodeId(), resultsFile);
 					lines = new ArrayList<>(lines);
@@ -1007,13 +1035,26 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 				}
 			}
 			int damaged = 0;
-			for (String text : lines) {
-				if (text.isEmpty()) {
+			for (int at = 0; at < lines.size(); at++) {
+				String text = lines.get(at);
+				if (text.isEmpty() || text.startsWith("#")) {
+					// A check line whose line was skipped (not valid UTF-8), or a cut one: counted with its line.
 					continue;
 				}
 				String line;
+				var check = at + 1 < lines.size() ? CHECK_LINE.matcher(lines.get(at + 1)) : null;
 				var checked = CHECKED_LINE.matcher(text);
-				if (checked.matches()) {
+				if (check != null && check.matches()) {
+					// A line of this version and its check line (R55-1).
+					at++;
+					if (!check.group(1).equals(lineCrc(text))) {
+						damaged++;
+						continue;
+					}
+					resultsFileChecked = true;
+					line = text;
+				} else if (checked.matches()) {
+					// A line of round 54.
 					if (!crc(checked.group(2)).equals(checked.group(3))) {
 						damaged++;
 						continue;
@@ -1021,7 +1062,7 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 					resultsFileChecked = true;
 					line = checked.group(1) + " " + checked.group(2);
 				} else if (resultsFileChecked) {
-					// After a checked line every line of this version is checked: this one was cut short.
+					// After a checked line every line of a checking version is checked: this one was cut short.
 					damaged++;
 					continue;
 				} else {

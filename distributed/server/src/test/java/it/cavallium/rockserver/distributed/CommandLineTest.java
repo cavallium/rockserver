@@ -365,6 +365,73 @@ class CommandLineTest {
 				status.out());
 	}
 
+	/** R55-3: admin snapshot waits for the member's snapshot at most its own wait, and at most the time left. */
+	@Test
+	void theSnapshotWaitIsAtMostTheTimeLeft() {
+		assertEquals(120_000, ReplicatedServerMain.snapshotWaitMillis(Duration.ofSeconds(120), Duration.ofMinutes(10).toNanos()));
+		assertEquals(5_000, ReplicatedServerMain.snapshotWaitMillis(Duration.ofSeconds(120), Duration.ofSeconds(5).toNanos()));
+		assertEquals(1, ReplicatedServerMain.snapshotWaitMillis(Duration.ofSeconds(120), -5));
+	}
+
+	/**
+	 * R56-1: only a request that ran out of time or of retries (the member's own timeout, or the client's) gets the text
+	 * of a wait that ran out; an exception the blocking client rethrows at once (a member of another group) says that
+	 * the member refused, without a wait and without a failed snapshot.
+	 */
+	@Test
+	void aSnapshotRequestRefusedAtOnceIsNotCalledATimeout() {
+		var refused = ReplicatedServerMain.snapshotNotTaken("n1", 3000,
+				new org.apache.ratis.protocol.exceptions.GroupMismatchException("n1: group-AAAA not found"));
+		assertTrue(refused.startsWith("n1 took no snapshot: it refused the request"), refused);
+		assertTrue(refused.contains("group-AAAA not found"), refused);
+		assertTrue(!refused.contains("within"), refused);
+		assertTrue(!refused.contains("snapshot failed"), refused);
+
+		var timedOut = ReplicatedServerMain.snapshotNotTaken("n1", 3000,
+				new org.apache.ratis.protocol.exceptions.TimeoutIOException("Failed to take a snapshot within timeout"));
+		assertTrue(timedOut.startsWith("n1 took no snapshot within 3000 ms: its snapshot failed"), timedOut);
+		var wrapped = ReplicatedServerMain.snapshotNotTaken("n1", 3000, new IOException("wrapped",
+				new org.apache.ratis.protocol.exceptions.TimeoutIOException("Failed to take a snapshot within timeout")));
+		assertTrue(wrapped.startsWith("n1 took no snapshot within 3000 ms"), wrapped);
+	}
+
+	/**
+	 * R55-3: a snapshot that fails on the member while {@code admin snapshot} waits (a full disk) ends the command soon,
+	 * with a snapshot-specific {@code FAILED} line and exit code 1. Ratis 3.3.1 answers a request whose take threw only
+	 * at the request's own timeout ({@code TimeoutIOException}): the command waited for the whole {@code --timeout-ms}
+	 * (10 minutes by default) and then printed the membership-change advice of {@code attempt()}.
+	 */
+	@Test
+	void adminSnapshotWhoseTakeFailsEndsSoonAndSaysSo() throws Exception {
+		cluster = new InProcessCluster(Files.createDirectories(temp.resolve("snapshot-fails")), 1,
+				c -> c.withSnapshotEveryEntries(1_000_000)).startAll();
+		var leader = cluster.awaitLeader(TIMEOUT);
+		var api = leader.connection().getSyncApi(RequestContext.batch(TIMEOUT));
+		long column = api.createColumn("c", SCHEMA);
+		api.put(0, column, key(1), value("v1"), RequestType.none());
+		var stateMachine = leader.stateMachine();
+		InProcessCluster.await(TIMEOUT, () -> stateMachine.handedOverForTesting() >= stateMachine.appliedIndex().get());
+		var id = leader.config().nodeId();
+
+		var wait = ReplicatedServerMain.snapshotRequestWait;
+		ReplicatedServerMain.snapshotRequestWait = Duration.ofSeconds(3);
+		stateMachine.snapshotFailureForTests = new java.io.IOException("No space left on device (injected)");
+		try {
+			long start = System.nanoTime();
+			var failed = run(admin(List.of(id), "snapshot", id));
+			var elapsed = Duration.ofNanos(System.nanoTime() - start);
+			assertEquals(1, failed.code(), failed.toString());
+			assertTrue(failed.out().contains("FAILED: " + id + " took no snapshot within 3000 ms"), failed.out());
+			assertTrue(failed.out().contains("see its log"), failed.out());
+			assertTrue(!failed.out().contains("A leader that started a change"), failed.out());
+			assertTrue(!failed.out().contains("OK"), failed.out());
+			assertTrue(elapsed.compareTo(Duration.ofSeconds(20)) < 0, () -> "took " + elapsed + " with --timeout-ms 30000: "
+					+ failed.out());
+		} finally {
+			stateMachine.snapshotFailureForTests = null;
+			ReplicatedServerMain.snapshotRequestWait = wait;
+		}
+	}
 	/**
 	 * R52-3: Ratis 3.3.1 takes a configuration with the same voter ids and priorities for no change
 	 * ({@code RaftConfigurationImpl.hasNoChange} never compares addresses) and answers success without writing it. A

@@ -31,8 +31,10 @@ import org.apache.ratis.client.RaftClient;
 import org.apache.ratis.proto.RaftProtos;
 import org.apache.ratis.proto.RaftProtos.RaftPeerRole;
 import org.apache.ratis.protocol.GroupInfoReply;
+import org.apache.ratis.protocol.exceptions.RaftRetryFailureException;
 import org.apache.ratis.protocol.exceptions.ReconfigurationInProgressException;
 import org.apache.ratis.protocol.exceptions.SetConfigurationException;
+import org.apache.ratis.protocol.exceptions.TimeoutIOException;
 import org.apache.ratis.retry.RetryPolicies;
 import org.apache.ratis.util.ProtoUtils;
 import org.apache.ratis.client.impl.ClientProtoUtils;
@@ -188,6 +190,11 @@ public final class ReplicatedServerMain {
 
 	private static final Duration DEFAULT_ADMIN_TIMEOUT = Duration.ofMinutes(10);
 	private static final TimeDuration ADMIN_RETRY_SLEEP = TimeDuration.valueOf(500, TimeUnit.MILLISECONDS);
+	/**
+	 * How long {@code admin snapshot} asks the member to wait for its snapshot, at most the time left of
+	 * {@code --timeout-ms} (R55-3); tests shorten it.
+	 */
+	static volatile Duration snapshotRequestWait = Duration.ofSeconds(120);
 	/**
 	 * How long {@code add-peer} waits for an answer of the new node and of each member, per round, and {@code status}
 	 * for each member.
@@ -701,13 +708,15 @@ public final class ReplicatedServerMain {
 			usage(CHANGE_ADDRESSES + " is an option of add-peer and remove-peer only");
 		}
 		long deadline = System.nanoTime() + timeout.toNanos();
+		// Until when the client sends a request again; admin snapshot moves it earlier (R55-3).
+		var retryDeadline = new java.util.concurrent.atomic.AtomicLong(deadline);
 		var group = RaftGroup.valueOf(groupId, peers.stream().map(ReplicatedServerMain::raftPeer).toList());
 		var anyConfig = NodeConfig.defaults(peers.getFirst().id(), peers, Path.of("."));
 		try (var client = RaftClient.newBuilder()
 				.setClientId(ClientId.randomId())
 				.setRaftGroup(group)
 				.setProperties(RaftSettings.client(anyConfig))
-				.setRetryPolicy(retryUntil(deadline))
+				.setRetryPolicy(retryUntil(retryDeadline::get))
 				.build()) {
 			RaftClientReply reply = switch (command.getFirst()) {
 				case "status" -> {
@@ -746,7 +755,15 @@ public final class ReplicatedServerMain {
 				case "snapshot" -> {
 					var member = peerId(command);
 					var api = client.getSnapshotManagementApi(RaftPeerId.valueOf(member));
-					var taken = attempt(timeout, () -> api.create(timeout.toMillis()));
+					long wait = snapshotWaitMillis(snapshotRequestWait, deadline - System.nanoTime());
+					retryDeadline.set(System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(wait));
+					RaftClientReply taken;
+					try {
+						taken = api.create(wait);
+					} catch (IOException ex) {
+						fail(snapshotNotTaken(member, wait, ex));
+						throw new AssertionError(ex);
+					}
 					if (taken.isSuccess()) {
 						var none = noSnapshotReason(taken.getLogIndex());
 						if (none != null) {
@@ -1661,9 +1678,47 @@ public final class ReplicatedServerMain {
 		return (clusterVersion | membersSupport) & ~supported;
 	}
 
-	/** Ratis' default retries at once and for ever: a change that cannot happen would flood the leader, with no end. */
-	private static RetryPolicy retryUntil(long deadlineNanos) {
-		return _ -> System.nanoTime() - deadlineNanos < 0 ? () -> ADMIN_RETRY_SLEEP : RetryPolicy.NO_RETRY_ACTION;
+	/**
+	 * Ratis' default retries at once and for ever: a change that cannot happen would flood the leader, with no end. The
+	 * client sends a request again until the time {@code deadlineNanos} gives at that moment.
+	 */
+	private static RetryPolicy retryUntil(java.util.function.LongSupplier deadlineNanos) {
+		return _ -> System.nanoTime() - deadlineNanos.getAsLong() < 0 ? () -> ADMIN_RETRY_SLEEP
+				: RetryPolicy.NO_RETRY_ACTION;
+	}
+
+	/**
+	 * How long, in ms, {@code admin snapshot} waits for the member's snapshot (R55-3): {@code wait}, at most the time
+	 * left of {@code --timeout-ms}, at least 1 ms. Ratis 3.3.1 answers a snapshot request whose take threw only at the
+	 * request's own timeout: {@code SnapshotManagementRequestHandler.takingSnapshotAsync} logs the failure and leaves the
+	 * request pending, and {@code TimeoutExecutor.onTimeout(request.getTimeoutMs())} clears it and completes it with
+	 * {@code TimeoutIOException("Failed to take a snapshot within timeout")}; every retry of the client in the meantime
+	 * joins the same request. The answer therefore comes at this wait, which was the whole {@code --timeout-ms}, 10
+	 * minutes by default.
+	 */
+	static long snapshotWaitMillis(Duration wait, long leftNanos) {
+		return Math.max(1, Math.min(wait.toMillis(), TimeUnit.NANOSECONDS.toMillis(leftNanos)));
+	}
+
+	/**
+	 * The {@code FAILED} text of {@code admin snapshot} when the request to {@code member} threw {@code ex}. Only a
+	 * request that ran out of time ({@link TimeoutIOException}, the member's answer at the request's timeout) or of
+	 * retries ({@link RaftRetryFailureException}, the client's deadline at the same moment) gets the text of a wait that
+	 * ran out (R56-1); an exception the blocking client rethrows at once, a {@code GroupMismatchException} from a member
+	 * started with another {@code --group-id} for example, says that the member refused.
+	 */
+	static String snapshotNotTaken(String member, long waitMillis, IOException ex) {
+		for (Throwable t = ex; t != null; t = t.getCause() == t ? null : t.getCause()) {
+			if (t instanceof RaftRetryFailureException || t instanceof TimeoutIOException) {
+				return member + " took no snapshot within " + waitMillis + " ms: its snapshot failed (a full data disk, for"
+						+ " example), or did not finish in time, or the member did not answer (" + ex.getMessage() + "); see"
+						+ " its log (\"snapshot failed\") and the status, and run it again in a while; see \"Exit codes\" in"
+						+ " docs/distributed/runbooks.md";
+			}
+		}
+		return member + " took no snapshot: it refused the request (" + ex.getClass().getSimpleName() + ": "
+				+ ex.getMessage() + "); check the member's id, address and --group-id, see the status, and see \"Exit"
+				+ " codes\" in docs/distributed/runbooks.md";
 	}
 
 	@FunctionalInterface
