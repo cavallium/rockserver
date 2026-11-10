@@ -706,13 +706,15 @@ public final class ReplicatedServerMain {
 			usage(CHANGE_ADDRESSES + " is an option of add-peer and remove-peer only");
 		}
 		long deadline = System.nanoTime() + timeout.toNanos();
+		// Until when the client sends a request again; admin snapshot moves it earlier (R55-3).
+		var retryDeadline = new java.util.concurrent.atomic.AtomicLong(deadline);
 		var group = RaftGroup.valueOf(groupId, peers.stream().map(ReplicatedServerMain::raftPeer).toList());
 		var anyConfig = NodeConfig.defaults(peers.getFirst().id(), peers, Path.of("."));
 		try (var client = RaftClient.newBuilder()
 				.setClientId(ClientId.randomId())
 				.setRaftGroup(group)
 				.setProperties(RaftSettings.client(anyConfig))
-				.setRetryPolicy(retryUntil(deadline))
+				.setRetryPolicy(retryUntil(retryDeadline::get))
 				.build()) {
 			RaftClientReply reply = switch (command.getFirst()) {
 				case "status" -> {
@@ -751,7 +753,15 @@ public final class ReplicatedServerMain {
 				case "snapshot" -> {
 					var member = peerId(command);
 					var api = client.getSnapshotManagementApi(RaftPeerId.valueOf(member));
-					var taken = attempt(timeout, () -> api.create(timeout.toMillis()));
+					long wait = snapshotWaitMillis(snapshotRequestWait, deadline - System.nanoTime());
+					retryDeadline.set(System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(wait));
+					RaftClientReply taken;
+					try {
+						taken = api.create(wait);
+					} catch (IOException ex) {
+						fail(snapshotNotTaken(member, wait, ex));
+						throw new AssertionError(ex);
+					}
 					if (taken.isSuccess()) {
 						var none = noSnapshotReason(taken.getLogIndex());
 						if (none != null) {
@@ -1666,9 +1676,31 @@ public final class ReplicatedServerMain {
 		return (clusterVersion | membersSupport) & ~supported;
 	}
 
-	/** Ratis' default retries at once and for ever: a change that cannot happen would flood the leader, with no end. */
-	private static RetryPolicy retryUntil(long deadlineNanos) {
-		return _ -> System.nanoTime() - deadlineNanos < 0 ? () -> ADMIN_RETRY_SLEEP : RetryPolicy.NO_RETRY_ACTION;
+	/**
+	 * Ratis' default retries at once and for ever: a change that cannot happen would flood the leader, with no end. The
+	 * client sends a request again until the time {@code deadlineNanos} gives at that moment.
+	 */
+	private static RetryPolicy retryUntil(java.util.function.LongSupplier deadlineNanos) {
+		return _ -> System.nanoTime() - deadlineNanos.getAsLong() < 0 ? () -> ADMIN_RETRY_SLEEP
+				: RetryPolicy.NO_RETRY_ACTION;
+	}
+
+	/**
+	 * How long, in ms, {@code admin snapshot} waits for the member's snapshot (R55-3): {@code wait}, at most the time
+	 * left of {@code --timeout-ms}, at least 1 ms. Ratis 3.3.1 does not answer a snapshot request whose take threw (it
+	 * logs it and never completes the request, and every retry of the client joins the same request), so the request
+	 * ends only at this wait; it was the whole {@code --timeout-ms}, 10 minutes by default.
+	 */
+	static long snapshotWaitMillis(Duration wait, long leftNanos) {
+		return Math.max(1, Math.min(wait.toMillis(), TimeUnit.NANOSECONDS.toMillis(leftNanos)));
+	}
+
+	/** The {@code FAILED} text of {@code admin snapshot} when {@code member} gave no answer within {@code waitMillis}. */
+	static String snapshotNotTaken(String member, long waitMillis, IOException ex) {
+		return member + " took no snapshot within " + waitMillis + " ms: its snapshot failed (a full data disk, for"
+				+ " example), or did not finish in time, or the member did not answer (" + ex.getMessage() + "); see its log"
+				+ " (\"snapshot failed\") and the status, and run it again in a while; see \"Exit codes\" in"
+				+ " docs/distributed/runbooks.md";
 	}
 
 	@FunctionalInterface

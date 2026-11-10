@@ -365,6 +365,14 @@ class CommandLineTest {
 				status.out());
 	}
 
+	/** R55-3: admin snapshot waits for the member's snapshot at most its own wait, and at most the time left. */
+	@Test
+	void theSnapshotWaitIsAtMostTheTimeLeft() {
+		assertEquals(120_000, ReplicatedServerMain.snapshotWaitMillis(Duration.ofSeconds(120), Duration.ofMinutes(10).toNanos()));
+		assertEquals(5_000, ReplicatedServerMain.snapshotWaitMillis(Duration.ofSeconds(120), Duration.ofSeconds(5).toNanos()));
+		assertEquals(1, ReplicatedServerMain.snapshotWaitMillis(Duration.ofSeconds(120), -5));
+	}
+
 	/**
 	 * R55-3: a snapshot that fails on the member while {@code admin snapshot} waits (a full disk) ends the command soon,
 	 * with a snapshot-specific {@code FAILED} line and exit code 1. Ratis 3.3.1 does not answer a request whose take
