@@ -1008,11 +1008,7 @@ public final class ReplicatedNode implements AutoCloseable {
 					+ " none. If every node of a new cluster was started with --join, nothing elects a leader: --join is only"
 					+ " for a node that joins a running cluster. Otherwise start or repair the pending and unreachable"
 					+ " members: this node decides by itself once they answer";
-			case NO_MAJORITY -> "Start or repair the pending and unreachable members (also"
-					+ " members of a version without the Configuration method count as unreachable): this node decides by"
-					+ " itself once a majority of the new half of the newest committed configuration answer. If they are gone"
-					+ " for good, check with status on a member: if this node is not in its configuration, stop it, wipe its"
-					+ " data directory, start it with --join and run add-peer";
+			case NO_MAJORITY -> NO_MAJORITY_ADVICE;
 			case NEEDS_TERM -> "Members answered with a version that predates Configuration2, which does not tell terms"
 					+ " (its committed flag does not confirm a removal by itself), and the members of this version that"
 					+ " answered cannot make a majority of the new half of the newest committed configuration without"
@@ -1110,8 +1106,16 @@ public final class ReplicatedNode implements AutoCloseable {
 		}
 	}
 
-	private static final String REMOVED_ADVICE = "Take it out of its supervisor. To add it again, wipe its data"
+	/** What a removed node logs and prints with exit code 4 about what to do (see "Removed node" in runbooks.md). */
+	static final String REMOVED_ADVICE = "Take it out of its supervisor. To add it again, wipe its data"
 			+ " directory, start it with --join and run add-peer";
+
+	/** What a node outside the cluster for {@link RemovalRule.Reason#NO_MAJORITY} logs about what to do. */
+	static final String NO_MAJORITY_ADVICE = "Start or repair the pending and unreachable members (also"
+			+ " members of a version without the Configuration method count as unreachable): this node decides by"
+			+ " itself once a majority of the new half of the newest committed configuration answer. If they are gone"
+			+ " for good, check with status on a member: if this node is not in its configuration, stop it, wipe its"
+			+ " data directory, start it with --join and run add-peer";
 
 
 	/** Id to Raft address of every peer this node knows of: its startup list, then the peers of {@code conf}. */

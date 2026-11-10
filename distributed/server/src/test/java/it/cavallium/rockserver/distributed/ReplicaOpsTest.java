@@ -308,6 +308,33 @@ class ReplicaOpsTest {
 	}
 
 	/**
+	 * R53-3: a line of {@code replica-ops.log} cut inside a multi-byte character (an append cut by a full disk or a
+	 * power loss, with a non-ASCII data directory in a {@code DONE} line) is skipped, and the lines around it still load.
+	 * Before, {@code Files.readAllLines} threw {@code MalformedInputException} and no line loaded, at every start.
+	 */
+	@Test
+	void aResultLineCutInsideACharacterIsSkippedAndTheOthersLoad() throws Exception {
+		var config = NodeConfig.defaults("n0", List.of(new PeerConfig("n0", "127.0.0.1", 1, "127.0.0.1", 2)), temp);
+		byte[] cut = "è".getBytes(StandardCharsets.UTF_8);
+		var log = new java.io.ByteArrayOutputStream();
+		log.writeBytes("2026-11-01T10:00:00Z checksum 7 DONE 3 abc\n".getBytes(StandardCharsets.UTF_8));
+		log.writeBytes("2026-11-01T10:01:00Z backup 8 DONE b1 /data/caff".getBytes(StandardCharsets.UTF_8));
+		log.write(cut[0]);
+		log.writeBytes("\n".getBytes(StandardCharsets.UTF_8));
+		log.writeBytes("2026-11-01T10:02:00Z checksum 9 DONE 4 def\n".getBytes(StandardCharsets.UTF_8));
+		log.writeBytes("2026-11-01T10:03:00Z backup 10 DONE b2 /data/caffè\n".getBytes(StandardCharsets.UTF_8));
+		Files.write(temp.resolve("replica-ops.log"), log.toByteArray());
+
+		try (var ops = new ReplicaOps(config, null, new NodeMetrics("n0"))) {
+			assertEquals(List.of(7L, 9L), ops.checksumResults().stream().map(ReplicaOps.Result::index).toList());
+			assertEquals(new ReplicaOps.Result(ReplicaOps.State.DONE, 7, 3, "abc"), ops.checksumResult(7));
+			assertEquals(new ReplicaOps.Result(ReplicaOps.State.DONE, 9, 4, "def"), ops.checksumResult(9));
+			assertEquals(ReplicaOps.State.DONE, ops.backupResult("b2", 10).state());
+			assertEquals("/data/caffè", ops.backupResult("b2", 10).detail());
+		}
+	}
+
+	/**
 	 * R6-5: a periodic checksum whose proposal failed is tried again after {@link ReplicaOps#PROPOSAL_RETRY}, not a full
 	 * interval later; and while no check is known, the interval counts from the first start of the node, kept in a file,
 	 * not from each start.

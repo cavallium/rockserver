@@ -833,6 +833,41 @@ class NodeStoreTest {
 	}
 
 	/**
+	 * R53-6: an export killed before its last rename also leaves the copy's config next to the target
+	 * ({@code rockserver-replica-for-<target>.conf}, the resolved config with its secrets). The refusal of the
+	 * {@code <target>.tmp} it left names that file too, so that it goes with it, and leaves both as they are; a rerun to
+	 * the same target after removing {@code <target>.tmp} leaves no config behind.
+	 */
+	@Test
+	void theRefusalOfAKilledExportsTemporaryDirectoryNamesItsLeftConfig() throws IOException {
+		Path source = tempDir.resolve("source");
+		writeDatabase(source, "v", TermIndex.valueOf(1, 5));
+		Path target = tempDir.resolve("seed");
+		Path building = Files.createDirectories(tempDir.resolve("seed.tmp"));
+		Path leftConfig = NodeStore.replicaConfigFile(target);
+		Files.writeString(leftConfig, "secret = 1");
+
+		var refused = assertThrows(IOException.class, () -> NodeStore.exportSeed(source, null, target));
+
+		assertTrue(refused.getMessage().contains("seed.tmp already exists"), refused.getMessage());
+		assertTrue(refused.getMessage().contains(leftConfig.toString()), refused.getMessage());
+		assertTrue(Files.isDirectory(building));
+		assertEquals("secret = 1", Files.readString(leftConfig));
+
+		NodeStore.deleteRecursively(building);
+		NodeStore.exportSeed(source, null, target);
+		assertFalse(Files.exists(leftConfig), "the rerun replaced and deleted it");
+		assertFalse(Files.exists(building));
+
+		// Killed after the last rename: a complete target and the config.
+		Files.writeString(leftConfig, "secret = 1");
+		var targetRefused = assertThrows(IOException.class, () -> NodeStore.exportSeed(source, null, target));
+		assertTrue(targetRefused.getMessage().contains("seed already exists"), targetRefused.getMessage());
+		assertTrue(targetRefused.getMessage().contains(leftConfig.toString()), targetRefused.getMessage());
+		assertEquals("secret = 1", Files.readString(leftConfig));
+	}
+
+	/**
 	 * R34 review 3: an existing {@code <target>.tmp}, which the checkpoint would build in, is refused before anything is
 	 * touched, as an existing target is, and stays as it was. Before, the checkpoint deleted it first, whoever had made
 	 * it (an operator's {@code /backups/seed.tmp} for {@code --target /backups/seed}).
