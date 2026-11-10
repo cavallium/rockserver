@@ -335,6 +335,27 @@ class ReplicaOpsTest {
 	}
 
 	/**
+	 * R53-3 review: a last line torn before its {@code \n} (an append cut by a full disk or a power loss) costs only its
+	 * own result. Before, the first result written after the restart was appended to the same physical line, and that
+	 * merged line was rejected at the next start too (here {@code State.valueOf("DO2026-...")}).
+	 */
+	@Test
+	void aResultWrittenAfterATornLastLineStartsOnALineOfItsOwn() throws Exception {
+		var config = NodeConfig.defaults("n0", List.of(new PeerConfig("n0", "127.0.0.1", 1, "127.0.0.1", 2)), temp);
+		Files.writeString(temp.resolve("replica-ops.log"), "2026-11-01T10:00:00Z checksum 7 DONE 3 abc\n"
+				+ "2026-11-01T10:01:00Z checksum 8 DO", StandardCharsets.UTF_8);
+		try (var ops = new ReplicaOps(config, null, new NodeMetrics("n0"))) {
+			assertEquals(List.of(7L), ops.checksumResults().stream().map(ReplicaOps.Result::index).toList());
+			ops.persist("checksum 11 DONE 5 ghi");
+			ops.persist("checksum 12 DONE 6 jkl");
+		}
+		try (var ops = new ReplicaOps(config, null, new NodeMetrics("n0"))) {
+			assertEquals(List.of(7L, 11L, 12L), ops.checksumResults().stream().map(ReplicaOps.Result::index).toList());
+			assertEquals(new ReplicaOps.Result(ReplicaOps.State.DONE, 11, 5, "ghi"), ops.checksumResult(11));
+		}
+	}
+
+	/**
 	 * R6-5: a periodic checksum whose proposal failed is tried again after {@link ReplicaOps#PROPOSAL_RETRY}, not a full
 	 * interval later; and while no check is known, the interval counts from the first start of the node, kept in a file,
 	 * not from each start.

@@ -844,7 +844,7 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 	}
 
 	/** Appends one line to the results file, so that a restarted node still answers about its past results. */
-	private synchronized void persist(String line) {
+	synchronized void persist(String line) {
 		try {
 			Files.createDirectories(resultsFile.getParent());
 			Files.writeString(resultsFile, Instant.now() + " " + line + "\n", StandardCharsets.UTF_8,

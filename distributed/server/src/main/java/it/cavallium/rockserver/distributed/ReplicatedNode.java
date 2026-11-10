@@ -1001,9 +1001,7 @@ public final class ReplicatedNode implements AutoCloseable {
 							+ " If no node of the cluster started without --join, nothing elects a leader: --join is only for a"
 							+ " node that joins a running cluster"
 					: "It is a member: it waits for the others to elect a leader";
-			case NOT_ADDED -> "It never was a voter (started with --join): run add-peer for it. If its add was abandoned,"
-					+ " or it was added and removed long ago, stop it and wipe its data directory: add-peer refuses a node"
-					+ " that has a log";
+			case NOT_ADDED -> NOT_ADDED_ADVICE;
 			case NO_COMMITTED_CONFIGURATION -> "No member answered with a committed configuration, and this node applied"
 					+ " none. If every node of a new cluster was started with --join, nothing elects a leader: --join is only"
 					+ " for a node that joins a running cluster. Otherwise start or repair the pending and unreachable"
@@ -1127,6 +1125,13 @@ public final class ReplicatedNode implements AutoCloseable {
 			+ " data directory, start it with --join and run add-peer, at its old address (at another one, add a node"
 			+ " under a new id instead)";
 
+	/**
+	 * What a node outside the cluster for {@link RemovalRule.Reason#NOT_ADDED} logs about what to do; the same rule on a
+	 * reused id as {@link #REMOVED_ADVICE} (R53-5 review).
+	 */
+	static final String NOT_ADDED_ADVICE = "It never was a voter (started with --join): run add-peer for it. If its add"
+			+ " was abandoned, or it was added and removed long ago, stop it and wipe its data directory: add-peer refuses"
+			+ " a node that has a log";
 
 	/** Id to Raft address of every peer this node knows of: its startup list, then the peers of {@code conf}. */
 	private Map<String, String> memberAddresses(RaftConfiguration conf) {
