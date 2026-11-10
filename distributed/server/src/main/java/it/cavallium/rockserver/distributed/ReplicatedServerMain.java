@@ -1694,7 +1694,10 @@ public final class ReplicatedServerMain {
 	 * request pending, and {@code TimeoutExecutor.onTimeout(request.getTimeoutMs())} clears it and completes it with
 	 * {@code TimeoutIOException("Failed to take a snapshot within timeout")}; every retry of the client in the meantime
 	 * joins the same request. The answer therefore comes at this wait, which was the whole {@code --timeout-ms}, 10
-	 * minutes by default.
+	 * minutes by default. A request that joined another one's (the byte trigger's, whose take failed) ends at that one's
+	 * timeout, at most 120 s, and the client then sends it again, which runs a take (R56-1). A timer left by an earlier
+	 * request also clears the pending one when it fires (Ratis never cancels it): the client sends it again, and the
+	 * take that runs completes it (R56-2).
 	 */
 	static long snapshotWaitMillis(Duration wait, long leftNanos) {
 		return Math.max(1, Math.min(wait.toMillis(), TimeUnit.NANOSECONDS.toMillis(leftNanos)));
@@ -1704,7 +1707,7 @@ public final class ReplicatedServerMain {
 	 * The {@code FAILED} text of {@code admin snapshot} when the request to {@code member} threw {@code ex}. Only a
 	 * request that ran out of time ({@link TimeoutIOException}, the member's answer at the request's timeout) or of
 	 * retries ({@link RaftRetryFailureException}, the client's deadline at the same moment) gets the text of a wait that
-	 * ran out (R56-1); an exception the blocking client rethrows at once, a {@code GroupMismatchException} from a member
+	 * ran out (review of R55, 1); an exception the blocking client rethrows at once, a {@code GroupMismatchException} from a member
 	 * started with another {@code --group-id} for example, says that the member refused.
 	 */
 	static String snapshotNotTaken(String member, long waitMillis, IOException ex) {

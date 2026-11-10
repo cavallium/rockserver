@@ -374,7 +374,7 @@ class CommandLineTest {
 	}
 
 	/**
-	 * R56-1: only a request that ran out of time or of retries (the member's own timeout, or the client's) gets the text
+	 * Review of R55, 1: only a request that ran out of time or of retries (the member's own timeout, or the client's) gets the text
 	 * of a wait that ran out; an exception the blocking client rethrows at once (a member of another group) says that
 	 * the member refused, without a wait and without a failed snapshot.
 	 */
