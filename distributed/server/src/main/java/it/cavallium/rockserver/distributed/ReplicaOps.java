@@ -848,12 +848,27 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 		}
 	}
 
+	/**
+	 * Tests only: given the record of the next append, how many of its bytes to write before that append fails with an
+	 * {@link IOException}, as a full disk cuts a write short; null for none. Cleared by the append it cuts.
+	 */
+	volatile java.util.function.@Nullable ToIntFunction<String> cutNextAppendForTesting;
+
 	/** Appends one line to the results file, so that a restarted node still answers about its past results. */
 	synchronized void persist(String line) {
 		try {
 			Files.createDirectories(resultsFile.getParent());
-			Files.writeString(resultsFile, (resultsFileTorn ? "\n" : "") + Instant.now() + " " + line + "\n",
-					StandardCharsets.UTF_8, StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+			var record = (resultsFileTorn ? "\n" : "") + Instant.now() + " " + line + "\n";
+			byte[] bytes = record.getBytes(StandardCharsets.UTF_8);
+			var cut = cutNextAppendForTesting;
+			cutNextAppendForTesting = null;
+			try (var out = Files.newOutputStream(resultsFile, StandardOpenOption.CREATE, StandardOpenOption.APPEND)) {
+				if (cut != null) {
+					out.write(bytes, 0, Math.min(bytes.length, cut.applyAsInt(record)));
+					throw new IOException("No space left on device (cut for a test)");
+				}
+				out.write(bytes);
+			}
 			resultsFileTorn = false;
 		} catch (IOException ex) {
 			LOG.warn("{}: failed to write {}: {}", config.nodeId(), resultsFile, ex.toString());
@@ -1293,6 +1308,11 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 	/** Tests only. */
 	List<Result> checksumResults() {
 		return checksums.values().stream().sorted((a, b) -> Long.compare(a.index(), b.index())).toList();
+	}
+
+	/** Tests only: the log indexes of the backup results this replica knows, in order. */
+	List<Long> backupIndexesForTesting() {
+		return backups.keySet().stream().sorted().toList();
 	}
 
 	/** The backups directory of a data directory. */

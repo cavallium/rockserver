@@ -20,6 +20,7 @@ import it.cavallium.rockserver.core.common.RocksDBException.RocksDBErrorType;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.security.MessageDigest;
 import java.time.Duration;
 import java.util.HexFormat;
@@ -352,6 +353,92 @@ class ReplicaOpsTest {
 		try (var ops = new ReplicaOps(config, null, new NodeMetrics("n0"))) {
 			assertEquals(List.of(7L, 11L, 12L), ops.checksumResults().stream().map(ReplicaOps.Result::index).toList());
 			assertEquals(new ReplicaOps.Result(ReplicaOps.State.DONE, 11, 5, "ghi"), ops.checksumResult(11));
+		}
+	}
+
+	private static final String DIGEST = "0123456789abcdef".repeat(4);
+
+	private static List<Long> checksumIndexes(ReplicaOps ops) {
+		return ops.checksumResults().stream().map(ReplicaOps.Result::index).toList();
+	}
+
+	/**
+	 * R54-1: an append cut short while the node runs (a full disk, then space freed), inside the state of its line or
+	 * inside its digest, costs only its own result. Before, the flag that makes the next append start on a line of its
+	 * own was set only at the start, so the next result was glued onto the fragment: at the next start the merged line
+	 * was rejected (a bad state), or loaded as the cut result with a digest that held the next line, and the next
+	 * result was lost either way.
+	 */
+	@Test
+	void anAppendCutWhileTheNodeRunsCostsOnlyItsOwnResult() throws Exception {
+		var config = NodeConfig.defaults("n0", List.of(new PeerConfig("n0", "127.0.0.1", 1, "127.0.0.1", 2)), temp);
+		try (var ops = new ReplicaOps(config, null, new NodeMetrics("n0"))) {
+			ops.persist("checksum 7 DONE 3 " + DIGEST);
+			ops.cutNextAppendForTesting = record -> record.indexOf(" DONE ") + 3;
+			ops.persist("checksum 8 DONE 3 " + DIGEST);
+			ops.persist("checksum 11 DONE 5 " + DIGEST);
+			ops.cutNextAppendForTesting = record -> record.indexOf(DIGEST) + 10;
+			ops.persist("checksum 12 DONE 3 " + DIGEST);
+			ops.persist("checksum 13 DONE 6 " + DIGEST);
+		}
+		try (var ops = new ReplicaOps(config, null, new NodeMetrics("n0"))) {
+			assertEquals(List.of(7L, 11L, 13L), checksumIndexes(ops));
+			assertEquals(new ReplicaOps.Result(ReplicaOps.State.DONE, 11, 5, DIGEST), ops.checksumResult(11));
+			assertEquals(new ReplicaOps.Result(ReplicaOps.State.DONE, 13, 6, DIGEST), ops.checksumResult(13));
+		}
+	}
+
+	/**
+	 * R54-2: a last line torn inside its last field (a checksum's digest, a backup's directory) by a power loss or a
+	 * full disk does not load: it was taken as a {@code DONE} result with the cut digest, which a peer's comparison
+	 * reports as REPLICAS DIVERGED, or a {@code DONE} backup at a directory that does not exist. It does not load at a
+	 * later start either, once more results were written after it.
+	 */
+	@Test
+	void aTornLastLineCutInsideItsLastFieldDoesNotLoad() throws Exception {
+		var config = NodeConfig.defaults("n0", List.of(new PeerConfig("n0", "127.0.0.1", 1, "127.0.0.1", 2)), temp);
+		Files.writeString(temp.resolve("replica-ops.log"), "2026-11-01T10:00:00Z checksum 7 DONE 3 " + DIGEST + "\n"
+				+ "2026-11-01T10:00:30Z backup 9 DONE b1 /data/backups/b1\n"
+				+ "2026-11-01T10:01:00Z checksum 8 DONE 3 " + DIGEST.substring(0, 20), StandardCharsets.UTF_8);
+		try (var ops = new ReplicaOps(config, null, new NodeMetrics("n0"))) {
+			assertEquals(List.of(7L), checksumIndexes(ops));
+			assertEquals("/data/backups/b1", ops.backupResult("b1", 9).detail());
+			ops.persist("checksum 11 DONE 5 " + DIGEST);
+		}
+		try (var ops = new ReplicaOps(config, null, new NodeMetrics("n0"))) {
+			assertEquals(List.of(7L, 11L), checksumIndexes(ops));
+		}
+
+		Files.writeString(temp.resolve("replica-ops.log"), "2026-11-01T10:00:00Z backup 9 DONE b1 /data/backups/b1\n"
+				+ "2026-11-01T10:01:00Z backup 10 DONE b2 /data/back", StandardCharsets.UTF_8);
+		try (var ops = new ReplicaOps(config, null, new NodeMetrics("n0"))) {
+			assertEquals(ReplicaOps.State.DONE, ops.backupResult("b1", 9).state());
+			assertEquals(List.of(9L), ops.backupIndexesForTesting());
+		}
+	}
+
+	/**
+	 * R54-2: a line this version wrote ends with a check of its content, so a line cut anywhere (a cut that a later
+	 * append made a middle line, a page of a power loss) or changed is rejected wherever it is in the file, while the
+	 * lines around it load. Lines of an older version, which have no check, still load before the first checked line.
+	 */
+	@Test
+	void aCutOrChangedLineIsRejectedWhereverItIs() throws Exception {
+		var config = NodeConfig.defaults("n0", List.of(new PeerConfig("n0", "127.0.0.1", 1, "127.0.0.1", 2)), temp);
+		var file = temp.resolve("replica-ops.log");
+		Files.writeString(file, "2026-11-01T10:00:00Z checksum 6 DONE 2 " + DIGEST + "\n", StandardCharsets.UTF_8);
+		try (var ops = new ReplicaOps(config, null, new NodeMetrics("n0"))) {
+			ops.persist("checksum 7 DONE 3 " + DIGEST);
+		}
+		Files.writeString(file, "2026-11-01T10:01:00Z checksum 10 DONE 4 " + DIGEST.substring(0, 9) + "\n"
+				+ "2026-11-01T10:01:30Z checksum 14 DONE 4 " + DIGEST + " #00000000\n", StandardCharsets.UTF_8,
+				StandardOpenOption.APPEND);
+		try (var ops = new ReplicaOps(config, null, new NodeMetrics("n0"))) {
+			ops.persist("checksum 12 DONE 5 " + DIGEST);
+		}
+		try (var ops = new ReplicaOps(config, null, new NodeMetrics("n0"))) {
+			assertEquals(List.of(6L, 7L, 12L), checksumIndexes(ops));
+			assertEquals(new ReplicaOps.Result(ReplicaOps.State.DONE, 7, 3, DIGEST), ops.checksumResult(7));
 		}
 	}
 
