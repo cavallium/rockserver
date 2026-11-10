@@ -459,7 +459,11 @@ class CheckpointStorageTest {
 
 		follower.reload();
 		assertEquals(TermIndex.valueOf(4, 40), follower.getLatestSnapshot().getTermIndex());
-		assertListsExactlyTheSnapshotFiles(follower, follower.getLatestSnapshot());
+		Path restored = tempDir.resolve("restored");
+		NodeStore.restore(follower.snapshotDbDir(), restored);
+		try (var restoredStore = NodeStore.open(restored, null, "restored")) {
+			assertEquals(TermIndex.valueOf(4, 40), restoredStore.applied());
+		}
 		// The next snapshot after the install deletes what the racing take left.
 		setApplied(store, TermIndex.valueOf(4, 50));
 		follower.take(store);

@@ -1106,16 +1106,26 @@ public final class ReplicatedNode implements AutoCloseable {
 		}
 	}
 
-	/** What a removed node logs and prints with exit code 4 about what to do (see "Removed node" in runbooks.md). */
+	/**
+	 * What a removed node logs and prints with exit code 4 about what to do (see "Removed node" in runbooks.md). An id
+	 * comes back only at its old address (R52-2, R53-5): Ratis 3.3.1 keeps one connection per member id on every node,
+	 * made from the first address it knew and never replaced while the node runs.
+	 */
 	static final String REMOVED_ADVICE = "Take it out of its supervisor. To add it again, wipe its data"
-			+ " directory, start it with --join and run add-peer";
+			+ " directory, start it with --join and run add-peer, at its old address: an id comes back only there (the"
+			+ " other nodes keep sending to the address they first knew for it); at another address, add a node under a"
+			+ " new id instead";
 
-	/** What a node outside the cluster for {@link RemovalRule.Reason#NO_MAJORITY} logs about what to do. */
+	/**
+	 * What a node outside the cluster for {@link RemovalRule.Reason#NO_MAJORITY} logs about what to do; the same rule on
+	 * a reused id as {@link #REMOVED_ADVICE} (R53-5).
+	 */
 	static final String NO_MAJORITY_ADVICE = "Start or repair the pending and unreachable members (also"
 			+ " members of a version without the Configuration method count as unreachable): this node decides by"
 			+ " itself once a majority of the new half of the newest committed configuration answer. If they are gone"
 			+ " for good, check with status on a member: if this node is not in its configuration, stop it, wipe its"
-			+ " data directory, start it with --join and run add-peer";
+			+ " data directory, start it with --join and run add-peer, at its old address (at another one, add a node"
+			+ " under a new id instead)";
 
 
 	/** Id to Raft address of every peer this node knows of: its startup list, then the peers of {@code conf}. */

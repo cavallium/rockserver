@@ -854,12 +854,49 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 		}
 	}
 
+	/**
+	 * The lines of {@code file} that are valid UTF-8, the others skipped and counted in {@code skipped} (R53-3): an append
+	 * cut by a full disk or a power loss can end inside a multi-byte character (a non-ASCII data directory in a
+	 * {@code DONE} line, an exception's text in a {@code FAILED} one), and {@code Files.readAllLines} then threw for the
+	 * whole file, so no line loaded at any start until the file was moved by hand. The file is a cache
+	 * ({@code backup.properties} is the record of a backup, {@code checksum-schedule} the schedule's fallback): a
+	 * damaged line costs only its own result.
+	 */
+	static List<String> readValidLines(Path file, java.util.concurrent.atomic.AtomicInteger skipped) throws IOException {
+		byte[] bytes = Files.readAllBytes(file);
+		var lines = new ArrayList<String>();
+		var decoder = StandardCharsets.UTF_8.newDecoder()
+				.onMalformedInput(java.nio.charset.CodingErrorAction.REPORT)
+				.onUnmappableCharacter(java.nio.charset.CodingErrorAction.REPORT);
+		int start = 0;
+		while (start < bytes.length) {
+			int end = start;
+			while (end < bytes.length && bytes[end] != '\n') {
+				end++;
+			}
+			int stop = end > start && bytes[end - 1] == '\r' ? end - 1 : end;
+			try {
+				lines.add(decoder.decode(java.nio.ByteBuffer.wrap(bytes, start, stop - start)).toString());
+			} catch (java.nio.charset.CharacterCodingException malformed) {
+				skipped.incrementAndGet();
+			}
+			start = end + 1;
+		}
+		return lines;
+	}
+
 	private void loadResults() {
 		if (!Files.isRegularFile(resultsFile)) {
 			return;
 		}
 		try {
-			for (String line : Files.readAllLines(resultsFile, StandardCharsets.UTF_8)) {
+			var skipped = new java.util.concurrent.atomic.AtomicInteger();
+			var lines = readValidLines(resultsFile, skipped);
+			if (skipped.get() > 0) {
+				LOG.warn("{}: skipped {} line(s) of {} that are not valid UTF-8 (an append cut by a full disk or a crash):"
+						+ " the results they held are forgotten", config.nodeId(), skipped.get(), resultsFile);
+			}
+			for (String line : lines) {
 				var parts = line.split(" ", 6);
 				if (parts.length < 6) {
 					continue;

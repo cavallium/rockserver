@@ -423,7 +423,8 @@ final class RockserverStateMachine extends BaseStateMachine {
 	 * Called by Ratis once a snapshot from the leader is fully received, before {@link #reinitialize}: Ratis reloads
 	 * the state machine only if it is {@code PAUSED}, and otherwise stops this replica's Raft server for good. The
 	 * state machine updater thread then runs {@link #reinitialize} instead of applying entries, which makes it
-	 * {@code RUNNING} again.
+	 * {@code RUNNING} again. Until then {@link #takeSnapshot} takes none (R53-1); a take already running is not waited
+	 * for (see there).
 	 */
 	@Override
 	public synchronized void pause() {
@@ -1259,11 +1260,23 @@ final class RockserverStateMachine extends BaseStateMachine {
 	 * <p>It answers the same, without a checkpoint and keeping the byte count, while Ratis has not handed over the log up
 	 * to the database's applied index ({@link #behindTheDatabase}): a snapshot is at that index, and Ratis takes one past
 	 * its own applied index for a bug of the state machine (an ERROR, no purge) (R48-1).</p>
+	 *
+	 * <p>And it answers the same unless the state machine is {@code RUNNING} (R53-1): from {@link #pause} until
+	 * {@link #reinitialize} made it running again, Ratis is swapping in an installed snapshot directory and the database
+	 * is about to be replaced. A take that passed this check before the pause can still run beside the swap, which
+	 * {@link CheckpointStorage} copes with (it keeps a snapshot past its latest one). {@link #pause} does not wait for
+	 * it: Ratis calls it holding the division's {@code RaftServerImpl} monitor, which its {@code appendEntries} and
+	 * {@code requestVote} take too, and a take waits for the apply queue and the disk (a hung disk would silence the
+	 * division for good).</p>
 	 */
 	@Override
 	public long takeSnapshot() throws IOException {
 		if (failed) {
 			throw new IOException("Replica failed, not taking a snapshot");
+		}
+		if (getLifeCycleState() != LifeCycle.State.RUNNING) {
+			LOG.info("{}: not taking a snapshot while {} (an install)", config.nodeId(), getLifeCycleState());
+			return RaftLog.INVALID_LOG_INDEX;
 		}
 		if (snapshotBackoff.waiting(System.nanoTime())) {
 			return RaftLog.INVALID_LOG_INDEX;
