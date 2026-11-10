@@ -186,10 +186,15 @@ majority and healthy (`status`).
    default: raise it for a large database, about 100 MB/s).
 3. Check: `status` shows `n4` with the others' commit index; `checksum` prints `OK`; the `rockserver-node-missing`
    alert threshold and the clients' address lists include `n4` and not the old node. Check that the old id is gone
-   from the voters before step 4: the `leader ...: voters [...]` line of the `remove-peer` (or of `add-peer` of `n4`
-   again, which prints `already a voter` and `OK`) must not list `n1`. If it does, the removal did not happen (a
-   mistyped id prints `is not a voter: nothing to remove`): run `remove-peer` again with the id as listed, with
-   `--peer` still holding the old node.
+   from the voters before step 4, from a call made after the removal: run the `remove-peer n1` again, with the same
+   `--peer`. It reads the configuration first and prints `n1 is not a voter: nothing to remove (voters [n2, n3, n4])`
+   and `OK`: the voters it lists must not include `n1`. (`add-peer n4` again, which prints `already a voter` and `OK`,
+   also reads it after the change: its `leader ...: voters [...]` line must not list `n1`.) Do not read the voters
+   from the call that removed: it prints the configuration read before its proposal, the old id in it,
+   `leader n2: voters [n1, n2, n3, n4]; this change adds [] and removes [n1]`, then `OK` when the removal committed.
+   If the check's run instead prints `removes [n1]` and `OK`, the earlier call had not removed it and this one did. If
+   the voters printed by the first `remove-peer` after `nothing to remove` still list the old id, its id was mistyped:
+   run it again with the id as listed, with `--peer` still holding the old node.
 4. Update `PEERS` (every node's `--peer`, and the `admin` commands) to the new members: `n4` added, the old node
    gone, only once step 3 shows it is no longer a voter. The running nodes need no restart for it (they learned `n4` from the configuration, and forward to it by
    asking it at that Raft address); use the new list at their next restart. Never reuse the old id at another
