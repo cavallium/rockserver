@@ -555,6 +555,131 @@ class CheckpointStorageTest {
 	}
 
 	/**
+	 * R58-3: Ratis swallows a failure of its {@code deleteFully} of the old snapshots moved aside, so an aside can
+	 * outlive a completed swap; Ratis then resets the Raft log to start after the received snapshot before the state
+	 * machine verifies it. A damaged install found at the start with an aside next to it and a log that starts after
+	 * the aside's newest snapshot was therefore not cut short by a crash during the swap: promoting the aside would
+	 * leave a gap between the snapshot and the log. It fails as with no aside, and the damaged snapshot is kept.
+	 */
+	@Test
+	void aDamagedInstallWithAStaleAsideAndALogStartingAfterItFailsLoudly() throws IOException {
+		Path stateMachineDir = damagedInstallWithTheOldSnapshotsAside();
+		writeLogSegment(tempDir.resolve("follower"), "log_inprogress_41");
+		closeRaftStorages();
+
+		var failure = assertThrows(CheckpointStorage.DamagedSnapshotException.class,
+				() -> initStorage(tempDir.resolve("follower"), RaftStorage.StartupOption.RECOVER));
+		assertTrue(failure.getMessage().contains("snapshot-4-40"), failure.getMessage());
+		assertTrue(failure.getMessage().contains("41"), failure.getMessage());
+		assertTrue(Files.isDirectory(stateMachineDir.resolve("snapshots").resolve("snapshot-4-40")),
+				"the damaged snapshot is kept for inspection");
+	}
+
+	/**
+	 * R58-3: a log that still holds the entries right after the aside's newest snapshot (a crash during the swap, before
+	 * Ratis reset the log) does not stop the aside from being promoted.
+	 */
+	@Test
+	void aDamagedInstallWithAnAsideAndALogNotPastItFallsBackToTheAside() throws IOException {
+		Path stateMachineDir = damagedInstallWithTheOldSnapshotsAside();
+		writeLogSegment(tempDir.resolve("follower"), "log_3-6");
+		writeLogSegment(tempDir.resolve("follower"), "log_inprogress_7");
+		closeRaftStorages();
+
+		var restarted = initStorage(tempDir.resolve("follower"), RaftStorage.StartupOption.RECOVER);
+		assertEquals(TermIndex.valueOf(1, 5), restarted.getLatestSnapshot().getTermIndex());
+		assertEquals(Set.of("snapshot-1-5"), fileNames(stateMachineDir.resolve("snapshots")));
+	}
+
+	/**
+	 * R58-3: with several asides (each left by a failed delete), the one with the newest usable snapshot is promoted,
+	 * not the first one listed.
+	 */
+	@Test
+	void theNewestUsableAsideIsPromoted() throws IOException {
+		var leader = initStorage(tempDir.resolve("leader"), RaftStorage.StartupOption.FORMAT);
+		put(store, column, 7, "installed");
+		setApplied(store, TermIndex.valueOf(4, 40));
+		leader.take(store);
+		var follower = initStorage(tempDir.resolve("follower"), RaftStorage.StartupOption.FORMAT);
+		setApplied(store, TermIndex.valueOf(1, 5));
+		follower.take(store);
+		setApplied(store, TermIndex.valueOf(2, 20));
+		follower.take(store);
+		Path snapshotsDir = follower.getSnapshotDir().toPath();
+		Path stateMachineDir = snapshotsDir.getParent();
+		install(leader, leader.getLatestSnapshot(), follower, file -> {
+		}, false);
+		Files.write(firstTable(snapshotsDir), new byte[0]);
+		Path aside = stateMachineDir.resolve("snapshots.tmp_installing");
+		// Older asides, each holding only snapshot 1-5, and the newest snapshot 2-20 alone in the aside made last (the
+		// last listed on a file system that lists in creation order, such as XFS here).
+		for (int i = 0; i < 3; i++) {
+			copyTree(aside.resolve("snapshot-1-5"), stateMachineDir.resolve("snapshots.tmp_older" + i).resolve("snapshot-1-5"));
+		}
+		Path newest = Files.createDirectories(stateMachineDir.resolve("snapshots.tmp_newest"));
+		Files.move(aside.resolve("snapshot-2-20"), newest.resolve("snapshot-2-20"));
+		closeRaftStorages();
+
+		var restarted = initStorage(tempDir.resolve("follower"), RaftStorage.StartupOption.RECOVER);
+		assertEquals(TermIndex.valueOf(2, 20), restarted.getLatestSnapshot().getTermIndex());
+		assertEquals(Set.of("snapshots", "tmp"), fileNames(stateMachineDir));
+	}
+
+	/**
+	 * Review of R58, 4: theNewestUsableAsideIsPromoted is red before the R58-3 fix only when the directory listing puts
+	 * an older aside first. The choice itself is checked here under every order of the asides, so a rule that takes
+	 * the first usable aside fails on any file system.
+	 */
+	@Test
+	void theNewestUsableAsideIsChosenWhateverTheOrderOfTheAsides() throws IOException {
+		var follower = initStorage(tempDir.resolve("follower"), RaftStorage.StartupOption.FORMAT);
+		setApplied(store, TermIndex.valueOf(1, 5));
+		follower.take(store);
+		setApplied(store, TermIndex.valueOf(2, 20));
+		follower.take(store);
+		Path snapshotsDir = follower.getSnapshotDir().toPath();
+		closeRaftStorages();
+		Path asidesDir = Files.createDirectories(tempDir.resolve("asides"));
+		Path older = asidesDir.resolve("older");
+		copyTree(snapshotsDir.resolve("snapshot-1-5"), older.resolve("snapshot-1-5"));
+		Path newest = asidesDir.resolve("newest");
+		copyTree(snapshotsDir.resolve("snapshot-2-20"), newest.resolve("snapshot-2-20"));
+		Path empty = Files.createDirectories(asidesDir.resolve("empty"));
+		var asides = List.of(older, newest, empty);
+		for (int first = 0; first < asides.size(); first++) {
+			for (int second = 0; second < asides.size(); second++) {
+				if (second == first) {
+					continue;
+				}
+				int third = 3 - first - second;
+				var order = List.of(asides.get(first), asides.get(second), asides.get(third));
+				assertEquals(newest, CheckpointStorage.newestUsableAside(order), "order " + order);
+			}
+		}
+		assertNull(CheckpointStorage.newestUsableAside(List.of(empty)));
+	}
+
+	/** Writes a Raft log segment file named {@code name} (content irrelevant here) under the raft directory. */
+	private static void writeLogSegment(Path raftDir, String name) throws IOException {
+		Path current = Files.createDirectories(raftDir.resolve("current"));
+		Files.write(current.resolve(name), new byte[] {1, 2, 3});
+	}
+
+	private static void copyTree(Path source, Path target) throws IOException {
+		try (Stream<Path> walk = Files.walk(source)) {
+			for (Path path : walk.toList()) {
+				Path to = target.resolve(source.relativize(path).toString());
+				if (Files.isDirectory(path)) {
+					Files.createDirectories(to);
+				} else {
+					Files.copy(path, to);
+				}
+			}
+		}
+	}
+
+	/**
 	 * A follower with snapshot 1-5 that received snapshot 4-40, crashed after the received directory took the place of
 	 * {@code snapshots/} and before the old one, moved aside, was deleted; the received one lost data. Returns the
 	 * follower's state machine directory (its raft directory is {@code follower}).

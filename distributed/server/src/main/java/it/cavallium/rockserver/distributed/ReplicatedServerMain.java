@@ -752,6 +752,13 @@ public final class ReplicatedServerMain {
 				}
 				case "snapshot" -> {
 					var member = peerId(command);
+					// R58-2: Ratis' client asks the member by its id in the group, and throws an uncaught
+					// NullPointerException ("Server <id> not found") for one outside it. Ids are compared as Ratis does,
+					// case-sensitively.
+					if (peers.stream().noneMatch(peer -> peer.id().equals(member))) {
+						usage("invalid snapshot argument " + member + ": " + member + " is not one of --peer ("
+								+ String.join(", ", peers.stream().map(PeerConfig::id).toList()) + ")");
+					}
 					long wait = snapshotWaitMillis(snapshotRequestWait, deadline - System.nanoTime());
 					RaftClientReply taken;
 					try {

@@ -87,6 +87,12 @@ class SessionWritesTest {
 			return (Boolean) call(target, "numbers", new Class<?>[] {RocksDBAPICommand.class}, command);
 		}
 
+		/** {@code numbers(BoundRequestContext, RocksDBAPICommand)}: the connection's own check, context included. */
+		boolean numbers(RequestContext context, RocksDBAPICommand<?, ?, ?> command) {
+			Object bound = callOn(BOUND, null, "bind", new Class<?>[] {RequestContext.class}, context);
+			return (Boolean) call(target, "numbers", new Class<?>[] {BOUND, RocksDBAPICommand.class}, bound, command);
+		}
+
 		boolean endsUpdateUnnumbered(RocksDBAPICommand<?, ?, ?> command) {
 			return (Boolean) call(target, "endsUpdateUnnumbered", new Class<?>[] {RocksDBAPICommand.class}, command);
 		}
@@ -170,6 +176,20 @@ class SessionWritesTest {
 		writes.observe(opening, new UpdateContext<>(null, update));
 		assertTrue(writes.numbers(put(update)), "the write that ends an update is numbered");
 		assertTrue(writes.numbers(put(0)));
+	}
+
+	/**
+	 * R58-1: a write whose context already carries a request id was numbered by the caller (a proxy's downstream
+	 * client): the connection does not number it again, so the caller's id reaches the server unchanged.
+	 */
+	@Test
+	void aWriteWhoseContextCarriesARequestIdIsNotNumberedAgain() throws Exception {
+		var writes = new Writes(_ -> new CompletableFuture<>(), (_, _) -> new CompletableFuture<>(), Runnable::run);
+		var context = RequestContext.latency(Duration.ofSeconds(5));
+		assertTrue(writes.numbers(context, put(0)));
+		var callerNumbered = context.withRequestId(new ClientRequestId(42, 7, 7));
+		assertFalse(writes.numbers(callerNumbered, put(0)), "the caller's numbered write was numbered again");
+		assertFalse(writes.numbers(callerNumbered, new RocksDBAPICommandSingle.DeleteRange(1, KEY, KEY)));
 	}
 
 	/**

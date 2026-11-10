@@ -15,9 +15,11 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.OptionalLong;
 import java.util.Properties;
 import java.util.Set;
 import java.util.function.LongSupplier;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 import org.apache.ratis.io.MD5Hash;
@@ -59,7 +61,10 @@ import org.slf4j.LoggerFactory;
  * {@link #INSTALL_ABANDONED_AFTER}. The node's install cleanup thread looks for them ({@link #discardFailedInstalls});
  * {@link #getLatestSnapshot()}, which Ratis calls under its locks, never does. After a crash during the swap, the old
  * snapshots moved aside are used only if the new ones are missing or damaged, and only those whose checkpoint is
- * complete: Ratis deletes the aside file by file, so a crash during that delete leaves it partial (R51-2).</p>
+ * complete: Ratis deletes the aside file by file, so a crash during that delete leaves it partial (R51-2). Of several
+ * asides the newest usable snapshot is used. Ratis also swallows a failure of that delete, so an aside can outlive a
+ * swap that completed: when the Raft log already starts past the entry after the newest snapshot named in the asides,
+ * Ratis had reset it, and a damaged install is reported as with no aside (R58-3, {@link #raftLogStart}).</p>
  *
  * <p>Ratis saves a {@code <file>.md5} next to every received file but syncs nothing, so an installed snapshot is
  * used only once each file matches its saved digest; it is then fsynced and marked as verified. A snapshot that
@@ -100,6 +105,8 @@ final class CheckpointStorage implements StateMachineStorage {
 	/** Written into an installed snapshot once its files matched their digests and were fsynced. */
 	private static final String VERIFIED_FILE = "installed.verified";
 	private static final long NEVER = Long.MIN_VALUE;
+	/** A Raft log segment file of Ratis 3.3.1: {@code log_inprogress_<start>} (group 1) or {@code log_<start>-<end>} (group 2). */
+	private static final Pattern LOG_SEGMENT = Pattern.compile("log_inprogress_(\\d+)|log_(\\d+)-\\d+");
 
 	private final long installReadLeaseNanos;
 	private final LongSupplier nanoClock;
@@ -154,31 +161,120 @@ final class CheckpointStorage implements StateMachineStorage {
 		tmpDir = tmp;
 		Files.createDirectories(snapshotsDir);
 		List<Path> asides = installAsides();
+		DamagedSnapshotException damagedInstall = null;
 		try {
 			reload();
 		} catch (DamagedSnapshotException damaged) {
 			if (asides.isEmpty()) {
 				throw damaged;
 			}
-			// Ratis was still swapping the directories, so it had not reset the log yet: the install did not happen. The
-			// old snapshots moved aside may be whole (a crash before the received directory took their place) or partly
-			// deleted (a crash during Ratis' deleteFully of them): usableSnapshot promotes only whole checkpoints (R51-2).
-			LOG.warn("Discarding a snapshot installation interrupted by a crash", damaged);
-			NodeStore.deleteRecursively(snapshotsDir);
-			Files.createDirectories(snapshotsDir);
-			reload();
+			damagedInstall = damaged;
 		}
-		for (Path aside : asides) {
-			if (latestDir == null && usableSnapshot(aside)) {
+		if (latestDir == null && !asides.isEmpty()) {
+			// The received snapshot is damaged, or snapshots/ was missing: the old snapshots moved aside are used if
+			// Ratis was still swapping the directories when it stopped. They may be whole (a crash before the received
+			// directory took their place) or partly deleted (a crash during Ratis' deleteFully of them): usableSnapshot
+			// keeps only whole checkpoints (R51-2). Of several asides, the newest usable snapshot wins (R58-3).
+			//
+			// R58-3: Ratis swallows a failure of its deleteFully of the aside, so an aside also outlives a swap that
+			// completed, after which Ratis resets the Raft log to start after the received snapshot before the state
+			// machine verifies it. Before that reset the log never starts past the entry after the newest snapshot the
+			// node had, which is in the aside (Ratis purges only up to a snapshot); a log that starts past it proves the
+			// swap completed, so the aside (whose db/ is older than the received snapshot too) would leave a gap before
+			// the log. That damaged install is reported as with no aside, and snapshots/ is kept for inspection. The
+			// bound is read from the snapshots' names before usableSnapshot deletes the incomplete ones: a partly deleted
+			// snapshot still says where the log may start.
+			long asideIndex = 0;
+			for (Path aside : asides) {
+				for (Path dir : snapshotDirs(aside)) {
+					TermIndex named = namedTermIndex(dir);
+					if (named != null) {
+						asideIndex = Math.max(asideIndex, named.getIndex());
+					}
+				}
+			}
+			// Known gap (review of R58, 3): right after a completed swap Ratis' purge leaves no segment until the next
+			// entry is appended, so logStart is empty and the aside is promoted. By reading Ratis that opens no gap: an
+			// empty log restarts after the promoted snapshot and the leader sends what follows.
+			OptionalLong logStart = raftLogStart(this.stateMachineDir);
+			if (logStart.isPresent() && logStart.getAsLong() > asideIndex + 1) {
+				String gap = "the Raft log starts at index " + logStart.getAsLong() + ", past index " + (asideIndex + 1)
+						+ " after the newest snapshot moved aside (index " + asideIndex + ", in " + asides + "): Ratis had"
+						+ " completed the swap and reset the log, and failed to delete the old snapshots";
+				if (damagedInstall != null) {
+					throw new DamagedSnapshotException(damagedInstall.dir(), damagedInstall.reason() + "; " + gap,
+							damagedInstall);
+				}
+				throw new IOException("No snapshot in " + snapshotsDir + ", and " + gap + ": this replica cannot catch up"
+						+ " by itself, rebuild it from the other members");
+			}
+			Path chosen = newestUsableAside(asides);
+			if (damagedInstall != null) {
+				LOG.warn("Discarding a snapshot installation interrupted by a crash", damagedInstall);
 				NodeStore.deleteRecursively(snapshotsDir);
-				Files.move(aside, snapshotsDir);
+				Files.createDirectories(snapshotsDir);
+				reload();
+			}
+			if (chosen != null) {
+				NodeStore.deleteRecursively(snapshotsDir);
+				Files.move(chosen, snapshotsDir);
 				NodeStore.syncDirectory(stateMachineDir);
 				reload();
-			} else {
+			}
+		}
+		for (Path aside : asides) {
+			if (Files.exists(aside)) {
 				NodeStore.deleteRecursively(aside);
 			}
 		}
 		deleteUnusedSnapshots(null);
+	}
+
+	/**
+	 * Of {@code asides}, the one whose latest usable snapshot is the newest, whatever the order of the list (the order
+	 * of a directory listing, R58-3); null if none holds a usable snapshot. Deletes the incomplete snapshots of each
+	 * ({@link #usableSnapshot}).
+	 */
+	static @Nullable Path newestUsableAside(List<Path> asides) throws IOException {
+		Path chosen = null;
+		TermIndex chosenTermIndex = null;
+		for (Path aside : asides) {
+			if (usableSnapshot(aside)) {
+				TermIndex termIndex = readTermIndex(findLatest(aside));
+				if (chosenTermIndex == null || termIndex.compareTo(chosenTermIndex) > 0) {
+					chosen = aside;
+					chosenTermIndex = termIndex;
+				}
+			}
+		}
+		return chosen;
+	}
+
+	/**
+	 * The first index of the Raft log next to {@code stateMachineDir} ({@code raft/<group>/current}, Ratis' segment
+	 * files {@code log_<start>-<end>} and {@code log_inprogress_<start>}), or empty if it holds no segment. An empty
+	 * open segment is skipped: Ratis deletes it at the start.
+	 */
+	static OptionalLong raftLogStart(Path stateMachineDir) throws IOException {
+		Path current = stateMachineDir.toAbsolutePath().getParent().resolve("current");
+		if (!Files.isDirectory(current)) {
+			return OptionalLong.empty();
+		}
+		long start = Long.MAX_VALUE;
+		try (Stream<Path> files = Files.list(current)) {
+			for (Path file : files.toList()) {
+				var matcher = LOG_SEGMENT.matcher(file.getFileName().toString());
+				if (!matcher.matches() || !Files.isRegularFile(file)) {
+					continue;
+				}
+				boolean open = matcher.group(1) != null;
+				if (open && Files.size(file) == 0) {
+					continue;
+				}
+				start = Math.min(start, Long.parseLong(open ? matcher.group(1) : matcher.group(2)));
+			}
+		}
+		return start == Long.MAX_VALUE ? OptionalLong.empty() : OptionalLong.of(start);
 	}
 
 	/**

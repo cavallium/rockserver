@@ -65,7 +65,9 @@ import reactor.core.publisher.Mono;
  * <p>Numbered: writes outside transactions, transaction commits, the write that ends an update opened through
  * this connection (whose id this class remembers from the {@code getForUpdate} answer), schema changes (column
  * creation and deletion, merge operator upload), range deletions, and batch writes, chunk by chunk
- * ({@link #sendBatch}) when the server numbers batches. A write staged in a transaction is not: sending it again could stage it twice. A write whose first copy is refused because its
+ * ({@link #sendBatch}) when the server numbers batches. A write whose context already carries a request id is not:
+ * the caller numbered it, and its id is passed through ({@link #numbers(BoundRequestContext, RocksDBAPICommand)}).
+ * A write staged in a transaction is not: sending it again could stage it twice. A write whose first copy is refused because its
  * session expired was not applied, and goes again under a new session; a copy sent again after an unknown outcome that
  * meets an expired session ends with {@code OUTCOME_UNKNOWN}.</p>
  *
@@ -416,7 +418,19 @@ final class SessionWrites {
 				DEFAULT_RETRY_WINDOW_MILLIS));
 	}
 
-	/** True if {@code command} is numbered (see the class description). */
+	/**
+	 * True if {@code command}, sent with {@code context}, is numbered by this connection: never when the context already
+	 * carries a request id (R58-1). Such a write was numbered by the caller, in a session of its own on the same
+	 * cluster: a {@code GrpcServer} in front of this connection (a proxy) puts the id of its downstream client into the
+	 * context. It is sent once, unnumbered by this connection, with the caller's id, so every copy the caller sends after
+	 * a lost answer reaches the cluster under one number and takes effect at most once; resending is the caller's job,
+	 * as in the Rust client ({@code Client::numbering}).
+	 */
+	boolean numbers(BoundRequestContext context, RocksDBAPICommand<?, ?, ?> command) {
+		return context.value().requestId() == null && numbers(command);
+	}
+
+	/** True if {@code command} is numbered (see the class description), when its context carries no request id. */
 	boolean numbers(RocksDBAPICommand<?, ?, ?> command) {
 		return switch (command) {
 			case RocksDBAPICommandSingle.Put<?> c -> isReplicatedOrUpdateEnd(c.transactionOrUpdateId());

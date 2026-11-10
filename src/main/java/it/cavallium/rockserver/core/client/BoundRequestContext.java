@@ -42,6 +42,11 @@ record BoundRequestContext(RequestContext value, long startedNanos) {
 	}
 
 	private static BoundRequestContext cachedNoTimeout(RequestContext context) {
+		if (context.requestId() != null) {
+			// The cached bindings carry no request id: a numbered write keeps its own context, or it is sent unnumbered
+			// (or numbered again by a proxy) and a resend applies twice (review of R58, 1).
+			return noTimeout(context);
+		}
 		return switch (context.profile()) {
 			case ANALYTICAL -> ANALYTICAL_NO_TIMEOUT;
 			case INGEST -> INGEST_NO_TIMEOUT;
