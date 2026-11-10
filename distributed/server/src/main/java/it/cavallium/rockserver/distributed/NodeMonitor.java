@@ -66,6 +66,8 @@ final class NodeMonitor {
 	private volatile double logBytes = Double.NaN;
 	private volatile double snapshotIndex = Double.NaN;
 	private volatile double snapshotAgeSeconds = Double.NaN;
+	/** When this monitor was made, at the node's start: the age of the snapshot of a node without one (R60-3). */
+	private final long startedMillis = System.currentTimeMillis();
 	private volatile double followerLagMax = Double.NaN;
 	/**
 	 * When the last refresh ended ({@link System#nanoTime}), or this monitor was made. A refresh that waits for good (a
@@ -268,19 +270,23 @@ final class NodeMonitor {
 		var snapshot = stateMachine.getLatestSnapshot();
 		if (snapshot == null) {
 			snapshotIndex = Double.NaN;
-			snapshotAgeSeconds = Double.NaN;
+			snapshotAgeSeconds = snapshotAgeSeconds(nowMillis, false, 0, startedMillis);
 			return;
 		}
 		snapshotIndex = snapshot.getIndex();
-		snapshotAgeSeconds = snapshotAgeSeconds(nowMillis, true, stateMachine.latestSnapshotTimeMillis(), 0);
+		snapshotAgeSeconds = snapshotAgeSeconds(nowMillis, true, stateMachine.latestSnapshotTimeMillis(), startedMillis);
 	}
 
-	/** The {@code snapshot.age_seconds} gauge: seconds since the snapshot was taken ({@code takenMillis}, 0 unknown). */
+	/**
+	 * The {@code snapshot.age_seconds} gauge: the seconds since the snapshot was taken ({@code takenMillis}). Without a
+	 * snapshot, or without the time it was taken ({@code takenMillis} 0: its directory's time cannot be read), the
+	 * seconds since the node started ({@code startedMillis}), in which no snapshot was taken (R60-3). It was NaN then,
+	 * which the InfluxDB registry does not write: {@code rockserver-snapshot-old} ({@code noDataState: OK}) never fired
+	 * on a node whose snapshots all fail. A restart starts the count again. Never negative.
+	 */
 	static double snapshotAgeSeconds(long nowMillis, boolean hasSnapshot, long takenMillis, long startedMillis) {
-		if (!hasSnapshot) {
-			return Double.NaN;
-		}
-		return takenMillis > 0 ? Math.max(0, (nowMillis - takenMillis) / 1000.0) : Double.NaN;
+		long since = hasSnapshot && takenMillis > 0 ? takenMillis : startedMillis;
+		return Math.max(0, (nowMillis - since) / 1000.0);
 	}
 
 	/** The bytes of the segment files of the Raft log in {@code dir}, NaN if it cannot be read. */

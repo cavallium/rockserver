@@ -1070,7 +1070,7 @@ class CommandLineTest {
 				"backup-status", "b1", "latest"));
 		assertEquals(2, badIndex.code(), badIndex.toString());
 		// R60-6: a repeated --peer id and a --timeout-ms beyond the nanoseconds of a long are usage errors too, as with
-		// run; they ended with exit 1 and a stack trace (NodeConfig's "Duplicate peer ids", Duration.toNanos).
+		// run; they ended with exit 1 and a stack trace (RaftGroup.valueOf's "Found duplicated element", toNanos).
 		var repeatedPeer = run("admin", "--peer", "d1=127.0.0.1:1/127.0.0.1:1", "--peer", "d1=127.0.0.1:2/127.0.0.1:2",
 				"status");
 		assertEquals(2, repeatedPeer.code(), repeatedPeer.toString());

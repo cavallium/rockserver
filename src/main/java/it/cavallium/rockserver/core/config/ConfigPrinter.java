@@ -7,6 +7,12 @@ import org.github.gestalt.config.exceptions.GestaltException;
 import java.util.*;
 import org.rocksdb.CompressionType;
 
+/**
+ * Prints a configuration as the JSON-like text that every database open logs ({@code "Database configuration: {}"} in
+ * {@code EmbeddedDB}, unless {@code -Drockserver.core.print-config=false}). Credentials are not printed: the InfluxDB
+ * {@code token} and {@code user}, and the user info of its {@code url}, print as {@code "<redacted>"} when set (R60-1),
+ * so that the log (the journal, under systemd) holds no secret of the owner-only configuration files.
+ */
 public class ConfigPrinter {
 
 	public static String stringifyBloomFilter(BloomFilterConfig o) throws GestaltException {
@@ -277,13 +283,39 @@ public class ConfigPrinter {
 				      "allow-insecure-certificates": %s
 				    }\
 				""".formatted(o.enabled(),
-				quote(o.url()),
+				quote(redactUserInfo(o.url())),
 				quote(o.bucket()),
-				quote(o.user()),
-				quote(o.token()),
+				quote(redacted(o.user())),
+				quote(redacted(o.token())),
 				quote(o.org()),
 				o.allowInsecureCertificates()
 		);
+	}
+
+	/** What a credential prints as, so that the logged configuration ({@code "Database configuration"}) holds none. */
+	static final String REDACTED = "<redacted>";
+
+	/** {@link #REDACTED} for a set credential; an empty or unset one prints as it is. */
+	private static String redacted(String value) {
+		return value == null || value.isEmpty() ? value : REDACTED;
+	}
+
+	/** The URL with its user info ({@code user:password@}) masked, the rest (scheme, host, port, path) as it is. */
+	private static String redactUserInfo(String url) {
+		if (url == null) {
+			return null;
+		}
+		int scheme = url.indexOf("://");
+		int authority = scheme < 0 ? 0 : scheme + 3;
+		int end = authority;
+		while (end < url.length() && "/?#".indexOf(url.charAt(end)) < 0) {
+			end++;
+		}
+		int at = url.lastIndexOf('@', end - 1);
+		if (at < authority) {
+			return url;
+		}
+		return url.substring(0, authority) + REDACTED + url.substring(at);
 	}
 
 	public static String stringifyJmx(JmxMetricsConfig o) throws GestaltException {

@@ -1752,6 +1752,19 @@ impl RockserverClient {
         }
     }
 
+    /// A write this view sends once, unnumbered (`numbering` is `None`): an update it ends is forgotten once it has
+    /// its answer, whatever the answer, as after a numbered write (R60-4). Without it a write through a view that
+    /// carries a request id left the id numbered for up to `UPDATE_MEMORY`; the Java client forgets it too
+    /// (`SessionWrites.endsUpdateUnnumbered`). A transaction id, or an update this client does not remember, is
+    /// left alone. A `without_client_sessions` view has no session writes, so an update it ends stays remembered.
+    async fn unnumbered<R>(&self, update_id: i64, call: impl Future<Output = Result<R>>) -> Result<R> {
+        let result = call.await;
+        if let Some(writes) = &self.sessions {
+            writes.update_ended(update_id);
+        }
+        result
+    }
+
     /// The session writes that number a write with this transaction or update id, if this view numbers it.
     fn numbering(&self, transaction_or_update_id: i64) -> Option<Arc<SessionWrites>> {
         if self.context.request_id.is_some() {
@@ -2021,7 +2034,7 @@ impl RockserverClient {
         let tx = transaction_or_update_id;
         match self.numbering(tx) {
             Some(writes) => self.numbered(&writes, tx, copy!(view => view.put_once(tx, column_id, keys, value); keys, value)).await,
-            None => self.put_once(tx, column_id, keys, value).await,
+            None => self.unnumbered(tx, self.put_once(tx, column_id, keys, value)).await,
         }
     }
 
@@ -2030,7 +2043,7 @@ impl RockserverClient {
         let tx = transaction_or_update_id;
         match self.numbering(tx) {
             Some(writes) => self.numbered(&writes, tx, copy!(view => view.put_ensure_once(tx, column_id, keys, value); keys, value)).await,
-            None => self.put_ensure_once(tx, column_id, keys, value).await,
+            None => self.unnumbered(tx, self.put_ensure_once(tx, column_id, keys, value)).await,
         }
     }
 
@@ -2039,7 +2052,7 @@ impl RockserverClient {
         let tx = transaction_or_update_id;
         match self.numbering(tx) {
             Some(writes) => self.numbered(&writes, tx, copy!(view => view.put_get_previous_once(tx, column_id, keys, value); keys, value)).await,
-            None => self.put_get_previous_once(tx, column_id, keys, value).await,
+            None => self.unnumbered(tx, self.put_get_previous_once(tx, column_id, keys, value)).await,
         }
     }
 
@@ -2048,7 +2061,7 @@ impl RockserverClient {
         let tx = transaction_or_update_id;
         match self.numbering(tx) {
             Some(writes) => self.numbered(&writes, tx, copy!(view => view.put_get_delta_once(tx, column_id, keys, value); keys, value)).await,
-            None => self.put_get_delta_once(tx, column_id, keys, value).await,
+            None => self.unnumbered(tx, self.put_get_delta_once(tx, column_id, keys, value)).await,
         }
     }
 
@@ -2057,7 +2070,7 @@ impl RockserverClient {
         let tx = transaction_or_update_id;
         match self.numbering(tx) {
             Some(writes) => self.numbered(&writes, tx, copy!(view => view.put_get_changed_once(tx, column_id, keys, value); keys, value)).await,
-            None => self.put_get_changed_once(tx, column_id, keys, value).await,
+            None => self.unnumbered(tx, self.put_get_changed_once(tx, column_id, keys, value)).await,
         }
     }
 
@@ -2066,7 +2079,7 @@ impl RockserverClient {
         let tx = transaction_or_update_id;
         match self.numbering(tx) {
             Some(writes) => self.numbered(&writes, tx, copy!(view => view.put_get_previous_presence_once(tx, column_id, keys, value); keys, value)).await,
-            None => self.put_get_previous_presence_once(tx, column_id, keys, value).await,
+            None => self.unnumbered(tx, self.put_get_previous_presence_once(tx, column_id, keys, value)).await,
         }
     }
 
@@ -2075,7 +2088,7 @@ impl RockserverClient {
         let tx = transaction_or_update_id;
         match self.numbering(tx) {
             Some(writes) => self.numbered(&writes, tx, copy!(view => view.delete_once(tx, column_id, keys); keys)).await,
-            None => self.delete_once(tx, column_id, keys).await,
+            None => self.unnumbered(tx, self.delete_once(tx, column_id, keys)).await,
         }
     }
 
@@ -2084,7 +2097,7 @@ impl RockserverClient {
         let tx = transaction_or_update_id;
         match self.numbering(tx) {
             Some(writes) => self.numbered(&writes, tx, copy!(view => view.delete_get_previous_once(tx, column_id, keys); keys)).await,
-            None => self.delete_get_previous_once(tx, column_id, keys).await,
+            None => self.unnumbered(tx, self.delete_get_previous_once(tx, column_id, keys)).await,
         }
     }
 
@@ -2093,7 +2106,7 @@ impl RockserverClient {
         let tx = transaction_or_update_id;
         match self.numbering(tx) {
             Some(writes) => self.numbered(&writes, tx, copy!(view => view.delete_get_previous_presence_once(tx, column_id, keys); keys)).await,
-            None => self.delete_get_previous_presence_once(tx, column_id, keys).await,
+            None => self.unnumbered(tx, self.delete_get_previous_presence_once(tx, column_id, keys)).await,
         }
     }
 
@@ -2111,7 +2124,7 @@ impl RockserverClient {
         let tx = transaction_or_update_id;
         match self.numbering(tx) {
             Some(writes) => self.numbered(&writes, tx, copy!(view => view.merge_once(tx, column_id, keys, value); keys, value)).await,
-            None => self.merge_once(tx, column_id, keys, value).await,
+            None => self.unnumbered(tx, self.merge_once(tx, column_id, keys, value)).await,
         }
     }
 
@@ -2120,7 +2133,7 @@ impl RockserverClient {
         let tx = transaction_or_update_id;
         match self.numbering(tx) {
             Some(writes) => self.numbered(&writes, tx, copy!(view => view.merge_get_merged_once(tx, column_id, keys, value); keys, value)).await,
-            None => self.merge_get_merged_once(tx, column_id, keys, value).await,
+            None => self.unnumbered(tx, self.merge_get_merged_once(tx, column_id, keys, value)).await,
         }
     }
 
@@ -2131,7 +2144,7 @@ impl RockserverClient {
         let tx = transaction_or_update_id;
         match self.numbering(tx) {
             Some(writes) => self.numbered(&writes, tx, copy!(view => view.put_multi_list_once(tx, column_id, data); data)).await,
-            None => self.put_multi_list_once(tx, column_id, data).await,
+            None => self.unnumbered(tx, self.put_multi_list_once(tx, column_id, data)).await,
         }
     }
 
@@ -2148,7 +2161,7 @@ impl RockserverClient {
                     result
                 }
             },
-            None => self.put_multi_once(tx, column_id, items).await,
+            None => self.unnumbered(tx, self.put_multi_once(tx, column_id, items)).await,
         }
     }
 
@@ -2165,7 +2178,7 @@ impl RockserverClient {
                     result
                 }
             },
-            None => self.put_multi_ensure_once(tx, column_id, items).await,
+            None => self.unnumbered(tx, self.put_multi_ensure_once(tx, column_id, items)).await,
         }
     }
 
@@ -2182,7 +2195,7 @@ impl RockserverClient {
                     results?.boxed()
                 }
             },
-            None => self.put_multi_get_previous_once(tx, column_id, items).await?.boxed(),
+            None => self.unnumbered(tx, self.put_multi_get_previous_once(tx, column_id, items)).await?.boxed(),
         })
     }
 
@@ -2199,7 +2212,7 @@ impl RockserverClient {
                     results?.boxed()
                 }
             },
-            None => self.put_multi_get_delta_once(tx, column_id, items).await?.boxed(),
+            None => self.unnumbered(tx, self.put_multi_get_delta_once(tx, column_id, items)).await?.boxed(),
         })
     }
 
@@ -2216,7 +2229,7 @@ impl RockserverClient {
                     results?.boxed()
                 }
             },
-            None => self.put_multi_get_changed_once(tx, column_id, items).await?.boxed(),
+            None => self.unnumbered(tx, self.put_multi_get_changed_once(tx, column_id, items)).await?.boxed(),
         })
     }
 
@@ -2233,7 +2246,7 @@ impl RockserverClient {
                     results?.boxed()
                 }
             },
-            None => self.put_multi_get_previous_presence_once(tx, column_id, items).await?.boxed(),
+            None => self.unnumbered(tx, self.put_multi_get_previous_presence_once(tx, column_id, items)).await?.boxed(),
         })
     }
 
@@ -2250,7 +2263,7 @@ impl RockserverClient {
                     result
                 }
             },
-            None => self.delete_multi_once(tx, column_id, keys).await,
+            None => self.unnumbered(tx, self.delete_multi_once(tx, column_id, keys)).await,
         }
     }
 
@@ -2267,7 +2280,7 @@ impl RockserverClient {
                     results?.boxed()
                 }
             },
-            None => self.delete_multi_get_previous_once(tx, column_id, keys).await?.boxed(),
+            None => self.unnumbered(tx, self.delete_multi_get_previous_once(tx, column_id, keys)).await?.boxed(),
         })
     }
 
@@ -2284,7 +2297,7 @@ impl RockserverClient {
                     results?.boxed()
                 }
             },
-            None => self.delete_multi_get_previous_presence_once(tx, column_id, keys).await?.boxed(),
+            None => self.unnumbered(tx, self.delete_multi_get_previous_presence_once(tx, column_id, keys)).await?.boxed(),
         })
     }
 
@@ -2301,7 +2314,7 @@ impl RockserverClient {
                     result
                 }
             },
-            None => self.merge_multi_once(tx, column_id, items).await,
+            None => self.unnumbered(tx, self.merge_multi_once(tx, column_id, items)).await,
         }
     }
 
@@ -2318,7 +2331,7 @@ impl RockserverClient {
                     results?.boxed()
                 }
             },
-            None => self.merge_multi_get_merged_once(tx, column_id, items).await?.boxed(),
+            None => self.unnumbered(tx, self.merge_multi_get_merged_once(tx, column_id, items)).await?.boxed(),
         })
     }
 
