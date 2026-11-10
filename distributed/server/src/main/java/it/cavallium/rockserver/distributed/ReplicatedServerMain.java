@@ -189,6 +189,11 @@ public final class ReplicatedServerMain {
 	private static final Duration DEFAULT_ADMIN_TIMEOUT = Duration.ofMinutes(10);
 	private static final TimeDuration ADMIN_RETRY_SLEEP = TimeDuration.valueOf(500, TimeUnit.MILLISECONDS);
 	/**
+	 * How long {@code admin snapshot} asks the member to wait for its snapshot, at most the time left of
+	 * {@code --timeout-ms} (R55-3); tests shorten it.
+	 */
+	static volatile Duration snapshotRequestWait = Duration.ofSeconds(120);
+	/**
 	 * How long {@code add-peer} waits for an answer of the new node and of each member, per round, and {@code status}
 	 * for each member.
 	 */

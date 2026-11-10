@@ -366,6 +366,43 @@ class CommandLineTest {
 	}
 
 	/**
+	 * R55-3: a snapshot that fails on the member while {@code admin snapshot} waits (a full disk) ends the command soon,
+	 * with a snapshot-specific {@code FAILED} line and exit code 1. Ratis 3.3.1 does not answer a request whose take
+	 * threw: the command waited for the whole {@code --timeout-ms} (10 minutes by default) and then printed the
+	 * membership-change advice of {@code attempt()}.
+	 */
+	@Test
+	void adminSnapshotWhoseTakeFailsEndsSoonAndSaysSo() throws Exception {
+		cluster = new InProcessCluster(Files.createDirectories(temp.resolve("snapshot-fails")), 1,
+				c -> c.withSnapshotEveryEntries(1_000_000)).startAll();
+		var leader = cluster.awaitLeader(TIMEOUT);
+		var api = leader.connection().getSyncApi(RequestContext.batch(TIMEOUT));
+		long column = api.createColumn("c", SCHEMA);
+		api.put(0, column, key(1), value("v1"), RequestType.none());
+		var stateMachine = leader.stateMachine();
+		InProcessCluster.await(TIMEOUT, () -> stateMachine.handedOverForTesting() >= stateMachine.appliedIndex().get());
+		var id = leader.config().nodeId();
+
+		var wait = ReplicatedServerMain.snapshotRequestWait;
+		ReplicatedServerMain.snapshotRequestWait = Duration.ofSeconds(3);
+		stateMachine.snapshotFailureForTests = new java.io.IOException("No space left on device (injected)");
+		try {
+			long start = System.nanoTime();
+			var failed = run(admin(List.of(id), "snapshot", id));
+			var elapsed = Duration.ofNanos(System.nanoTime() - start);
+			assertEquals(1, failed.code(), failed.toString());
+			assertTrue(failed.out().contains("FAILED: " + id + " took no snapshot"), failed.out());
+			assertTrue(failed.out().contains("see its log"), failed.out());
+			assertTrue(!failed.out().contains("A leader that started a change"), failed.out());
+			assertTrue(!failed.out().contains("OK"), failed.out());
+			assertTrue(elapsed.compareTo(Duration.ofSeconds(20)) < 0, () -> "took " + elapsed + " with --timeout-ms 30000: "
+					+ failed.out());
+		} finally {
+			stateMachine.snapshotFailureForTests = null;
+			ReplicatedServerMain.snapshotRequestWait = wait;
+		}
+	}
+	/**
 	 * R52-3: Ratis 3.3.1 takes a configuration with the same voter ids and priorities for no change
 	 * ({@code RaftConfigurationImpl.hasNoChange} never compares addresses) and answers success without writing it. A
 	 * call with {@code --change-addresses} that adds and removes nothing (here a re-run of a remove-peer) therefore

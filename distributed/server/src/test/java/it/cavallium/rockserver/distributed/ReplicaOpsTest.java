@@ -472,6 +472,94 @@ class ReplicaOpsTest {
 	}
 
 	/**
+	 * The results that a binary of round 53 loads from {@code lines}, by a copy of its {@code loadResults}
+	 * ({@code git show 61027b1~1}): each line split with {@code split(" ", 6)}, at least 6 parts, {@code parts[5]} taken
+	 * whole as the detail; a line it cannot parse is skipped. Keyed {@code "checksum <index>"} or
+	 * {@code "backup <name> <index>"}.
+	 */
+	private static Map<String, String> loadedByRound53(List<String> lines) {
+		var loaded = new java.util.LinkedHashMap<String, String>();
+		for (String line : lines) {
+			var parts = line.split(" ", 6);
+			if (parts.length < 6) {
+				continue;
+			}
+			try {
+				long index = Long.parseLong(parts[2]);
+				ReplicaOps.State.valueOf(parts[3]);
+				switch (parts[1]) {
+					case "checksum" -> {
+						Long.parseLong(parts[4]);
+						loaded.put("checksum " + index, parts[5]);
+					}
+					case "backup" -> loaded.put("backup " + parts[4] + " " + index, parts[5]);
+					default -> {}
+				}
+			} catch (IllegalArgumentException malformed) {
+				// R53 skips it.
+			}
+		}
+		return loaded;
+	}
+
+	/**
+	 * R55-1: the lines this version writes are read right by a binary of round 53, to which a node may be rolled back
+	 * while the cluster version allows it. R54-2 wrote {@code <time> <content> #<crc>}, and round 53 took
+	 * {@code "<digest> #<crc>"} as the digest of a {@code DONE} checksum (a peer's comparison then reported REPLICAS
+	 * DIVERGED) and {@code "<dir> #<crc>"} as the directory of a backup ({@code backup-status}).
+	 */
+	@Test
+	void anOlderBinaryReadsTheResultsThisVersionWrites() throws Exception {
+		var config = NodeConfig.defaults("n0", List.of(new PeerConfig("n0", "127.0.0.1", 1, "127.0.0.1", 2)), temp);
+		try (var ops = new ReplicaOps(config, null, new NodeMetrics("n0"))) {
+			ops.persist("checksum 7 DONE 3 " + DIGEST);
+			ops.persist("backup 9 DONE b1 /data/backups/b1");
+			ops.persist("checksum 11 FAILED 0 disk full");
+		}
+		var lines = Files.readAllLines(temp.resolve("replica-ops.log"), StandardCharsets.UTF_8);
+		assertEquals(Map.of("checksum 7", DIGEST, "backup b1 9", "/data/backups/b1", "checksum 11", "disk full"),
+				loadedByRound53(lines), String.join("\n", lines));
+		try (var ops = new ReplicaOps(config, null, new NodeMetrics("n0"))) {
+			assertEquals(new ReplicaOps.Result(ReplicaOps.State.DONE, 7, 3, DIGEST), ops.checksumResult(7));
+			assertEquals("/data/backups/b1", ops.backupResult("b1", 9).detail());
+			assertEquals(new ReplicaOps.Result(ReplicaOps.State.FAILED, 11, 0, "disk full"), ops.checksumResult(11));
+		}
+	}
+
+	/** An R54-2 checked line: {@code <time> <content> #<crc32 of content, 8 hex digits>}. */
+	private static String round54Line(String time, String content) {
+		var crc = new java.util.zip.CRC32();
+		crc.update(content.getBytes(StandardCharsets.UTF_8));
+		return time + " " + content + " #" + String.format("%08x", crc.getValue());
+	}
+
+	/**
+	 * R55-1: the checked lines that round 54 wrote still load after the upgrade, a changed one is still rejected, and the
+	 * lines this version appends after them load too.
+	 */
+	@Test
+	void theCheckedLinesOfRound54StillLoad() throws Exception {
+		var config = NodeConfig.defaults("n0", List.of(new PeerConfig("n0", "127.0.0.1", 1, "127.0.0.1", 2)), temp);
+		var file = temp.resolve("replica-ops.log");
+		Files.writeString(file, "2026-11-01T10:00:00Z checksum 5 DONE 2 " + DIGEST + "\n"
+				+ round54Line("2026-11-01T10:00:10Z", "format checked") + "\n"
+				+ round54Line("2026-11-01T10:00:20Z", "checksum 6 DONE 2 " + DIGEST) + "\n"
+				+ round54Line("2026-11-01T10:00:30Z", "checksum 7 DONE 3 " + DIGEST).replace(" 3 ", " 4 ") + "\n"
+				+ round54Line("2026-11-01T10:00:40Z", "backup 8 DONE b1 /data/backups/b1") + "\n",
+				StandardCharsets.UTF_8);
+		try (var ops = new ReplicaOps(config, null, new NodeMetrics("n0"))) {
+			assertEquals(List.of(5L, 6L), checksumIndexes(ops));
+			assertEquals(new ReplicaOps.Result(ReplicaOps.State.DONE, 6, 2, DIGEST), ops.checksumResult(6));
+			assertEquals("/data/backups/b1", ops.backupResult("b1", 8).detail());
+			ops.persist("checksum 12 DONE 5 " + DIGEST);
+		}
+		try (var ops = new ReplicaOps(config, null, new NodeMetrics("n0"))) {
+			assertEquals(List.of(5L, 6L, 12L), checksumIndexes(ops));
+			assertEquals(new ReplicaOps.Result(ReplicaOps.State.DONE, 12, 5, DIGEST), ops.checksumResult(12));
+		}
+	}
+
+	/**
 	 * R6-5: a periodic checksum whose proposal failed is tried again after {@link ReplicaOps#PROPOSAL_RETRY}, not a full
 	 * interval later; and while no check is known, the interval counts from the first start of the node, kept in a file,
 	 * not from each start.
