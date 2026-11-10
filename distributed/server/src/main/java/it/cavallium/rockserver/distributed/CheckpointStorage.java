@@ -61,7 +61,10 @@ import org.slf4j.LoggerFactory;
  * {@link #INSTALL_ABANDONED_AFTER}. The node's install cleanup thread looks for them ({@link #discardFailedInstalls});
  * {@link #getLatestSnapshot()}, which Ratis calls under its locks, never does. After a crash during the swap, the old
  * snapshots moved aside are used only if the new ones are missing or damaged, and only those whose checkpoint is
- * complete: Ratis deletes the aside file by file, so a crash during that delete leaves it partial (R51-2).</p>
+ * complete: Ratis deletes the aside file by file, so a crash during that delete leaves it partial (R51-2). Of several
+ * asides the newest usable snapshot is used. Ratis also swallows a failure of that delete, so an aside can outlive a
+ * swap that completed: when the Raft log already starts past the entry after the newest snapshot named in the asides,
+ * Ratis had reset it, and a damaged install is reported as with no aside (R58-3, {@link #raftLogStart}).</p>
  *
  * <p>Ratis saves a {@code <file>.md5} next to every received file but syncs nothing, so an installed snapshot is
  * used only once each file matches its saved digest; it is then fsynced and marked as verified. A snapshot that

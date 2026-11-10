@@ -541,6 +541,16 @@ volatile write cache) void it. If too few nodes can start to elect a leader, whi
 quorum" in [design.md](design.md): there is no override. [performance.md](performance.md) ("Power loss") has the
 same procedure, with the disks it assumes.
 
+A start that fails with `Installed snapshot .../snapshot-<term>-<index> is damaged (...), probably by a crash before it
+was synced` is a different case: the snapshot the node received from the leader lost data in the power loss, and its
+Raft log may already start after it, so the node cannot catch up by itself. Do not delete the snapshot (it is kept for
+inspection) nor run `repair-log`: replace the node ("Replacing a node"). When the message goes on with `the Raft log
+starts at index N, past index M after the newest snapshot moved aside (...)` (R58-3), Ratis had also failed to delete
+the node's old snapshots after the install (a `Failed to delete existing directory` warning earlier in its log,
+usually a disk error): check the disk (the kernel log, SMART) before you reuse it. The same start without that addition
+and with a `snapshots.*` directory next to `snapshots/` does not fail: the node goes back to its old snapshots (the
+install was cut short) and catches up from the leader.
+
 ## Snapshot installs refused
 
 Two alerts count the ways a follower fails a leader's snapshot install stream (design.md, R16-2 and the install
@@ -566,7 +576,7 @@ commit index of any member, so a member that is gone holds it back.
 2. If it is gone for good, replace it (above), or remove it: `rs admin --peer <the others> remove-peer <id>`.
 3. If every member is there, check the snapshots: the alert `rockserver-snapshot-old` and the log (`snapshot taken`,
    or `snapshot failed`). A failing snapshot is usually a full disk. `rs admin $PEERS snapshot <id>` asks a member for
-   one: it waits up to 2 minutes (or the time left of `--timeout-ms`) in one call, as long as the snapshot ends
+   one (`<id>` must be one of the `--peer` ids, spelled as there: another is refused as wrong usage, exit code 2, R58-2): it waits up to 2 minutes (or the time left of `--timeout-ms`) in one call, as long as the snapshot ends
    within the wait (R57-1: before, a snapshot slower than 2 s could run twice for one command, or end it with
    `FAILED` although the member took it; the request is still sent again after a broken connection or when Ratis
    ended it early, R56-2, and a snapshot that ends in the 500 ms before it is sent again is not reported: run it again), and,
