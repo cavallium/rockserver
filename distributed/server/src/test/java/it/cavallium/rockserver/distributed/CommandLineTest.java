@@ -374,7 +374,7 @@ class CommandLineTest {
 	}
 
 	/**
-	 * R56-1: only a request that ran out of time or of retries (the member's own timeout, or the client's) gets the text
+	 * Review of R55, 1: only a request that ran out of time or of retries (the member's own timeout, or the client's) gets the text
 	 * of a wait that ran out; an exception the blocking client rethrows at once (a member of another group) says that
 	 * the member refused, without a wait and without a failed snapshot.
 	 */
@@ -429,6 +429,117 @@ class CommandLineTest {
 					+ failed.out());
 		} finally {
 			stateMachine.snapshotFailureForTests = null;
+			ReplicatedServerMain.snapshotRequestWait = wait;
+		}
+	}
+
+	/**
+	 * R56-1: a snapshot asked by the byte trigger ({@code --snapshot-every-bytes}) whose take fails (a full disk) leaves
+	 * its request pending in Ratis 3.3.1 until the request's own timeout, and an {@code admin snapshot} in the meantime
+	 * joins it and runs no take. With the byte trigger's 10-minute timeout, the operator who freed the disk and ran
+	 * {@code admin snapshot}, as "Raft log grows" says, got {@code FAILED ... took no snapshot within} each time for
+	 * up to 10 minutes. The byte trigger's request now ends soon (its shortest timeout is set to 2 s here), and the
+	 * command's next try asks again and gets a take.
+	 */
+	@Test
+	void adminSnapshotRunsATakeAfterAFailedTakeOfTheByteTrigger() throws Exception {
+		var minTimeout = RockserverStateMachine.snapshotByBytesMinRequestTimeout;
+		var wait = ReplicatedServerMain.snapshotRequestWait;
+		RockserverStateMachine.snapshotByBytesMinRequestTimeout = Duration.ofSeconds(2);
+		ReplicatedServerMain.snapshotRequestWait = Duration.ofSeconds(20);
+		try {
+			cluster = new InProcessCluster(Files.createDirectories(temp.resolve("bytes-snapshot-fails")), 1,
+					c -> c.withSnapshotEveryEntries(1_000_000).withSnapshotEveryBytes(1 << 20)).startAll();
+			var leader = cluster.awaitLeader(TIMEOUT);
+			var api = leader.connection().getSyncApi(RequestContext.batch(TIMEOUT));
+			long column = api.createColumn("c", SCHEMA);
+			var stateMachine = leader.stateMachine();
+			var id = leader.config().nodeId();
+			stateMachine.snapshotFailureForTests = new IOException("No space left on device (injected)");
+			var large = Buf.wrap(new byte[256 * 1024]);
+			for (long i = 0; i < 8; i++) {
+				api.put(0, column, key(i), large, RequestType.none());
+			}
+			// 2 MiB past a 1 MiB threshold: the byte trigger asked, and its take failed.
+			InProcessCluster.await(TIMEOUT, () -> stateMachine.snapshotAttempts.get() >= 1);
+			assertTrue(stateMachine.getLatestSnapshot() == null, "the take failed");
+			// The disk is freed; past the first backoff (1 s).
+			stateMachine.snapshotFailureForTests = null;
+			Thread.sleep(1500);
+
+			long start = System.nanoTime();
+			var taken = run(admin(List.of(id), "snapshot", id));
+			var elapsed = Duration.ofNanos(System.nanoTime() - start);
+			assertEquals(0, taken.code(), taken.toString());
+			var latest = stateMachine.getLatestSnapshot();
+			assertTrue(latest != null, "a snapshot was taken");
+			assertTrue(taken.out().contains(id + " took a snapshot at log index " + latest.getIndex()), taken.out());
+			assertTrue(elapsed.compareTo(Duration.ofSeconds(15)) < 0, () -> "took " + elapsed + ": " + taken.out());
+		} finally {
+			RockserverStateMachine.snapshotByBytesMinRequestTimeout = minTimeout;
+			ReplicatedServerMain.snapshotRequestWait = wait;
+		}
+	}
+
+	/**
+	 * R56-2: Ratis 3.3.1 never cancels the timer that {@code takingSnapshotAsync} schedules for a snapshot request, and
+	 * the handler's {@code timeout()} fails whatever request is pending when it fires. A timer left by an earlier request
+	 * that finished in time (here one with a 3 s timeout, answered at once) therefore fails an {@code admin snapshot}
+	 * whose take is still running at that moment (here a take of 2.5 s started 1.5 s after the earlier request). The
+	 * command must not print {@code FAILED} for it: it asks again and reports the take. Review of R56, 5: the test checks
+	 * that the earlier request's timer fired while the command's take ran and that the client sent its request again,
+	 * so a drift of the timing (a take that starts late or ends before the timer) fails instead of passing untested.
+	 */
+	@Test
+	void aTimerLeftByAnEarlierSnapshotRequestDoesNotFailALaterAdminSnapshot() throws Exception {
+		var wait = ReplicatedServerMain.snapshotRequestWait;
+		ReplicatedServerMain.snapshotRequestWait = Duration.ofSeconds(20);
+		try {
+			cluster = new InProcessCluster(Files.createDirectories(temp.resolve("stale-timer")), 1,
+					c -> c.withSnapshotEveryEntries(1_000_000)).startAll();
+			var leader = cluster.awaitLeader(TIMEOUT);
+			var api = leader.connection().getSyncApi(RequestContext.batch(TIMEOUT));
+			long column = api.createColumn("c", SCHEMA);
+			api.put(0, column, key(1), value("v1"), RequestType.none());
+			var stateMachine = leader.stateMachine();
+			InProcessCluster.await(TIMEOUT, () -> stateMachine.handedOverForTesting() >= stateMachine.appliedIndex().get());
+			var id = leader.config().nodeId();
+			var division = java.util.Objects.requireNonNull(stateMachine.division());
+
+			long earlier = System.nanoTime();
+			var first = division.getRaftServer().snapshotManagementAsync(
+					org.apache.ratis.protocol.SnapshotManagementRequest.newCreate(org.apache.ratis.protocol.ClientId.randomId(),
+							division.getId(), division.getGroup().getGroupId(), 1, 3000)).get(TIMEOUT.toSeconds(), TimeUnit.SECONDS);
+			// The earlier request's timer was armed between these two moments, so it fires between them plus 3 s.
+			long answered = System.nanoTime();
+			assertTrue(first.isSuccess() && first.getLogIndex() >= 0, first.toString());
+			api.put(0, column, key(2), value("v2"), RequestType.none());
+			InProcessCluster.await(TIMEOUT, () -> stateMachine.handedOverForTesting() >= stateMachine.appliedIndex().get());
+			stateMachine.snapshotDelayForTests = 2500;
+			long sleep = TimeUnit.NANOSECONDS.toMillis(earlier + TimeUnit.MILLISECONDS.toNanos(1500) - System.nanoTime());
+			assertTrue(sleep > 0, "the earlier request took " + (1500 - sleep) + " ms");
+			Thread.sleep(sleep);
+
+			long attempts = stateMachine.snapshotAttempts.get();
+			long retries = ReplicatedServerMain.adminRetriesForTests.get();
+			var taken = run(admin(List.of(id), "snapshot", id));
+			assertEquals(0, taken.code(), taken.toString());
+			assertTrue(!taken.out().contains("FAILED"), taken.out());
+			var latest = stateMachine.getLatestSnapshot();
+			assertTrue(latest != null && latest.getIndex() > first.getLogIndex(), "a later snapshot was taken: " + latest);
+			assertTrue(taken.out().contains(id + " took a snapshot at log index "), taken.out());
+			assertEquals(attempts + 1, stateMachine.snapshotAttempts.get(), "one take, for the command");
+			long fireFrom = earlier + TimeUnit.SECONDS.toNanos(3);
+			long fireTo = answered + TimeUnit.SECONDS.toNanos(3);
+			long takeStarted = stateMachine.takeStartedForTests;
+			long takeEnded = stateMachine.takeEndedForTests;
+			assertTrue(takeStarted - fireFrom < 0 && takeEnded - fireTo > 0, () -> "the earlier timer fired between "
+					+ TimeUnit.NANOSECONDS.toMillis(fireFrom - earlier) + " and " + TimeUnit.NANOSECONDS.toMillis(fireTo - earlier)
+					+ " ms, the take ran from " + TimeUnit.NANOSECONDS.toMillis(takeStarted - earlier) + " to "
+					+ TimeUnit.NANOSECONDS.toMillis(takeEnded - earlier) + " ms");
+			assertTrue(ReplicatedServerMain.adminRetriesForTests.get() > retries,
+					"the timer cleared the command's request and the client sent it again");
+		} finally {
 			ReplicatedServerMain.snapshotRequestWait = wait;
 		}
 	}

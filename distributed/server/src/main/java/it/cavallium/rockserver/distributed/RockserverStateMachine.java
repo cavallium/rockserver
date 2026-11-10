@@ -35,6 +35,7 @@ import org.apache.ratis.protocol.RaftGroupMemberId;
 import org.apache.ratis.protocol.RaftPeerId;
 import org.apache.ratis.protocol.SnapshotManagementRequest;
 import org.apache.ratis.protocol.exceptions.StateMachineException;
+import org.apache.ratis.protocol.exceptions.TimeoutIOException;
 import org.apache.ratis.server.RaftServer;
 import org.apache.ratis.server.protocol.TermIndex;
 import org.apache.ratis.server.raftlog.RaftLog;
@@ -1096,7 +1097,59 @@ final class RockserverStateMachine extends BaseStateMachine {
 	private final AtomicBoolean snapshotByBytesPending =
 			new AtomicBoolean();
 	private final AtomicLong snapshotCalls = new AtomicLong();
-	private static final long SNAPSHOT_REQUEST_TIMEOUT_MS = 10L * 60 * 1000;
+	/** The longest timeout of the request {@link #snapshotByBytes} sends: the wait of {@code admin snapshot}. */
+	private static final long SNAPSHOT_BY_BYTES_MAX_REQUEST_TIMEOUT_MS = 120_000;
+	/** The shortest timeout of the request {@link #snapshotByBytes} sends; a seam for tests (R56-1). */
+	static volatile Duration snapshotByBytesMinRequestTimeout = Duration.ofSeconds(30);
+	/** The longest successful take since the start, in ns: see {@link #snapshotByBytesRequestTimeoutMillis}. */
+	private final AtomicLong slowestTakeNanos = new AtomicLong();
+
+	/**
+	 * The timeout, in ms, of the request {@link #snapshotByBytes} sends (R56-1): twice the slowest take seen
+	 * ({@code slowestTakeNanos}), at least {@code min} (30 s), at most 2 minutes, the wait of {@code admin snapshot}.
+	 *
+	 * <p>Ratis 3.3.1 answers a request whose take threw only at the request's timeout: {@code StateMachineUpdater}
+	 * catches the IOException without {@code completeTakingSnapshot}, so the request stays pending, and every later
+	 * request on the member ({@code admin snapshot}, and the client's retries of it) joins it and runs no take
+	 * ({@code SnapshotManagementRequestHandler.takingSnapshotAsync} hands back the pending request's future, without
+	 * waking the updater or arming a timer). With the 10 minutes it had, one failed take of the byte trigger (a full
+	 * disk) made every {@code admin snapshot} for up to 10 minutes end with {@code took no snapshot within}, and kept
+	 * {@link #snapshotByBytesPending} set, although the backoff allows the next try after a minute at most. A timeout
+	 * that a take outlasts is harmless: Ratis runs {@link #takeSnapshot} on its {@code StateMachineUpdater} thread (after
+	 * waiting for the batch's applies) and hands over no entry meanwhile, so the take runs to its end and the log is
+	 * purged; the request's end only costs a false WARN. Only groups already queued on {@link #completer} can ask again
+	 * meanwhile, and after the take {@link #bytesSinceSnapshot} is below the threshold, so usually nothing asks again
+	 * (review of R56, 1).</p>
+	 *
+	 * <p>The slowest take is measured from the entry of {@link #takeSnapshot} (its drain of the apply queue included),
+	 * not from the request's submission: Ratis' timer also runs while the request waits for the updater and while the
+	 * updater waits for the batch's applies, so twice the take is not a bound on the request's life. The 30 s floor
+	 * covers that wait in practice, and a timeout that ends first only costs the WARN above (review of R56, 2).</p>
+	 */
+	static long snapshotByBytesRequestTimeoutMillis(Duration min, long slowestTakeNanos) {
+		long twice = TimeUnit.NANOSECONDS.toMillis(Math.min(slowestTakeNanos, Long.MAX_VALUE / 2) * 2);
+		return Math.min(SNAPSHOT_BY_BYTES_MAX_REQUEST_TIMEOUT_MS, Math.max(min.toMillis(), twice));
+	}
+
+	/**
+	 * The WARN of {@link #snapshotByBytes} when its request ended without a snapshot ({@code cause}). Only a request
+	 * that ran out of time ({@link TimeoutIOException}, Ratis' answer at the request's timeout, also wrapped) gets the
+	 * timeout text; any other exception (a server that is closed or not running) was a refusal at once (review of R56,
+	 * 3, as {@code ReplicatedServerMain.snapshotNotTaken} does for {@code admin snapshot}). Either way the next applied
+	 * group asks again while the log is still past {@code snapshotEveryBytes}.
+	 */
+	static String snapshotByBytesNotEnded(String nodeId, long everyBytes, long timeoutMs, @Nullable Throwable cause) {
+		for (Throwable t = cause; t != null; t = t.getCause() == t ? null : t.getCause()) {
+			if (t instanceof TimeoutIOException) {
+				return nodeId + ": the snapshot asked after " + everyBytes + " bytes of log did not end within " + timeoutMs
+						+ " ms: its take failed (see \"snapshot failed\" above), or outlasted the timeout, or a timer that an"
+						+ " earlier snapshot request left in Ratis ended it; the next entries ask again while no snapshot is taken";
+			}
+		}
+		return nodeId + ": the snapshot asked after " + everyBytes + " bytes of log was refused at once ("
+				+ (cause == null ? "no exception" : cause.getClass().getSimpleName() + ": " + cause.getMessage())
+				+ "); the next entries ask again while no snapshot is taken";
+	}
 
 	/**
 	 * Asks Ratis for a snapshot once {@code snapshotEveryBytes} of log entries were applied since the latest one.
@@ -1123,14 +1176,15 @@ final class RockserverStateMachine extends BaseStateMachine {
 		LOG.info("{}: {} bytes of log entries applied since the latest snapshot, taking one", config.nodeId(),
 				bytesSinceSnapshot.get());
 		try {
+			long timeoutMs = snapshotByBytesRequestTimeoutMillis(snapshotByBytesMinRequestTimeout, slowestTakeNanos.get());
 			var request = SnapshotManagementRequest.newCreate(
-					ClientId.randomId(), server.getId(), groupId, snapshotCalls.incrementAndGet(),
-					SNAPSHOT_REQUEST_TIMEOUT_MS);
+					ClientId.randomId(), server.getId(), groupId, snapshotCalls.incrementAndGet(), timeoutMs);
 			server.snapshotManagementAsync(request).whenComplete((reply, error) -> {
 				snapshotByBytesPending.set(false);
 				if (error != null || !reply.isSuccess()) {
-					LOG.warn("{}: the snapshot asked after {} bytes of log failed; asking again after the next entries",
-							config.nodeId(), config.snapshotEveryBytes(), error != null ? error : reply.getException());
+					// A failed take, one that outlasted the timeout, or a timer that an earlier request left in Ratis (R56-2).
+					var cause = error != null ? error : reply.getException();
+					LOG.warn(snapshotByBytesNotEnded(config.nodeId(), config.snapshotEveryBytes(), timeoutMs, cause), cause);
 				}
 			});
 		} catch (RuntimeException ex) {
@@ -1248,8 +1302,12 @@ final class RockserverStateMachine extends BaseStateMachine {
 	private final SnapshotBackoff snapshotBackoff = new SnapshotBackoff();
 	/** Tests only: a failure that the next snapshots throw before their checkpoint. */
 	volatile @Nullable IOException snapshotFailureForTests;
+	/** Tests only: how long, in ms, each snapshot sleeps before its checkpoint (a slow take). */
+	volatile long snapshotDelayForTests;
 	/** Snapshots that this replica tried (the checkpoint started), for tests. */
 	final AtomicLong snapshotAttempts = new AtomicLong();
+	/** Tests only: {@link System#nanoTime} at the entry and at the end of the latest tried snapshot. */
+	volatile long takeStartedForTests, takeEndedForTests;
 
 	/**
 	 * Takes a snapshot, unless one failed recently. Ratis asks again after every applied entry while a snapshot is due,
@@ -1291,6 +1349,8 @@ final class RockserverStateMachine extends BaseStateMachine {
 			return RaftLog.INVALID_LOG_INDEX;
 		}
 		snapshotAttempts.incrementAndGet();
+		long entered = System.nanoTime();
+		takeStartedForTests = entered;
 		try {
 			// Ratis waited for the entries it handed over; positions without data may still be queued.
 			drainApplyQueue();
@@ -1299,12 +1359,23 @@ final class RockserverStateMachine extends BaseStateMachine {
 			if (injected != null) {
 				throw injected;
 			}
+			long delay = snapshotDelayForTests;
+			if (delay > 0) {
+				try {
+					Thread.sleep(delay);
+				} catch (InterruptedException ex) {
+					Thread.currentThread().interrupt();
+					throw new java.io.InterruptedIOException("interrupted in the delay of a test");
+				}
+			}
 			// Before the checkpoint: entries applied while it runs count towards the next one.
 			long bytesBefore = bytesSinceSnapshot.get();
 			var position = storage.take(store);
 			CrashPoints.reach(CrashPoints.Point.SNAPSHOT_TAKEN);
 			bytesSinceSnapshot.addAndGet(-bytesBefore);
 			snapshotTime.since(start);
+			// From the entry, the drain included (review of R56, 2).
+			slowestTakeNanos.accumulateAndGet(System.nanoTime() - entered, Math::max);
 			snapshotBackoff.succeeded();
 			LOG.info("{}: snapshot taken at {} in {} ms", config.nodeId(), position,
 					(System.nanoTime() - start) / 1_000_000);
@@ -1314,6 +1385,8 @@ final class RockserverStateMachine extends BaseStateMachine {
 			LOG.warn("{}: snapshot failed ({} in a row), not trying again for {} ms", config.nodeId(),
 					snapshotBackoff.failures(), delay / 1_000_000, ex);
 			throw ex;
+		} finally {
+			takeEndedForTests = System.nanoTime();
 		}
 	}
 

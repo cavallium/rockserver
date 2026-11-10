@@ -40,6 +40,46 @@ class SnapshotByBytesTest {
 		}
 	}
 
+	/**
+	 * R56-1: the byte trigger's snapshot request times out soon after a take could have ended (twice the slowest take
+	 * seen, at least {@code min}, at most 2 minutes, the wait of {@code admin snapshot}): a take that fails leaves the
+	 * request pending in Ratis 3.3.1 until that timeout, and every {@code admin snapshot} meanwhile joins it and runs no
+	 * take. It was 10 minutes.
+	 */
+	@Test
+	void theByteTriggersRequestTimesOutSoonAfterATake() {
+		var min = Duration.ofSeconds(30);
+		assertEquals(30_000, RockserverStateMachine.snapshotByBytesRequestTimeoutMillis(min, 0));
+		assertEquals(30_000, RockserverStateMachine.snapshotByBytesRequestTimeoutMillis(min, TimeUnit.SECONDS.toNanos(3)));
+		assertEquals(80_000, RockserverStateMachine.snapshotByBytesRequestTimeoutMillis(min, TimeUnit.SECONDS.toNanos(40)));
+		assertEquals(120_000, RockserverStateMachine.snapshotByBytesRequestTimeoutMillis(min, TimeUnit.MINUTES.toNanos(5)));
+		assertEquals(2_000, RockserverStateMachine.snapshotByBytesRequestTimeoutMillis(Duration.ofSeconds(2), 0));
+	}
+
+	/**
+	 * Review of R56, 3: the byte trigger's WARN names a timeout only for a request that ran out of time (Ratis' answer
+	 * at the request's timeout, {@code TimeoutIOException}, also wrapped); a request refused at once (a server that is
+	 * closed or not running) says so and gives the exception, as {@code admin snapshot}'s {@code snapshotNotTaken} does.
+	 */
+	@Test
+	void theByteTriggersWarnNamesATimeoutOnlyForOne() {
+		var timedOut = RockserverStateMachine.snapshotByBytesNotEnded("n1", 1024, 30_000,
+				new org.apache.ratis.protocol.exceptions.TimeoutIOException("Failed to take a snapshot within timeout"));
+		assertTrue(timedOut.startsWith("n1: the snapshot asked after 1024 bytes of log did not end within 30000 ms"),
+				timedOut);
+		assertTrue(timedOut.contains("snapshot failed"), timedOut);
+		var wrapped = RockserverStateMachine.snapshotByBytesNotEnded("n1", 1024, 30_000,
+				new java.util.concurrent.CompletionException(
+						new org.apache.ratis.protocol.exceptions.TimeoutIOException("Failed to take a snapshot within timeout")));
+		assertTrue(wrapped.contains("did not end within 30000 ms"), wrapped);
+		var refused = RockserverStateMachine.snapshotByBytesNotEnded("n1", 1024, 30_000,
+				new org.apache.ratis.protocol.exceptions.ServerNotReadyException("n1 is not in [RUNNING]: current state is CLOSED"));
+		assertTrue(refused.startsWith("n1: the snapshot asked after 1024 bytes of log was refused at once"), refused);
+		assertTrue(refused.contains("ServerNotReadyException: n1 is not in [RUNNING]"), refused);
+		assertTrue(!refused.contains("within"), refused);
+		assertTrue(!refused.contains("still running"), refused);
+	}
+
 	@Test
 	void aFewLargeEntriesTriggerASnapshot() throws Exception {
 		cluster = new InProcessCluster(temp, 3, c -> c.withSnapshotEveryEntries(1_000_000)
