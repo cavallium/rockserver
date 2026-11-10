@@ -272,8 +272,15 @@ final class NodeMonitor {
 			return;
 		}
 		snapshotIndex = snapshot.getIndex();
-		long taken = stateMachine.latestSnapshotTimeMillis();
-		snapshotAgeSeconds = taken > 0 ? Math.max(0, (nowMillis - taken) / 1000.0) : Double.NaN;
+		snapshotAgeSeconds = snapshotAgeSeconds(nowMillis, true, stateMachine.latestSnapshotTimeMillis(), 0);
+	}
+
+	/** The {@code snapshot.age_seconds} gauge: seconds since the snapshot was taken ({@code takenMillis}, 0 unknown). */
+	static double snapshotAgeSeconds(long nowMillis, boolean hasSnapshot, long takenMillis, long startedMillis) {
+		if (!hasSnapshot) {
+			return Double.NaN;
+		}
+		return takenMillis > 0 ? Math.max(0, (nowMillis - takenMillis) / 1000.0) : Double.NaN;
 	}
 
 	/** The bytes of the segment files of the Raft log in {@code dir}, NaN if it cannot be read. */
