@@ -182,6 +182,18 @@ final class RaftSettings {
 		return properties;
 	}
 
+	/**
+	 * The properties of a client of {@code admin} that waits {@code requestTimeout} for each answer: Ratis 3.3.1's gRPC
+	 * client gives each admin request but a leadership transfer a deadline of {@code Rpc.requestTimeout}, not the
+	 * request's own timeout (R57-1). Only {@code admin snapshot}, whose member answers when its take ends, uses it; the
+	 * nodes and the other admin commands keep {@link #client}.
+	 */
+	static RaftProperties adminClient(NodeConfig config, Duration requestTimeout) {
+		var properties = client(config);
+		RaftClientConfigKeys.Rpc.setRequestTimeout(properties, duration(requestTimeout));
+		return properties;
+	}
+
 	static TimeDuration duration(Duration value) {
 		return TimeDuration.valueOf(value.toMillis(), TimeUnit.MILLISECONDS);
 	}

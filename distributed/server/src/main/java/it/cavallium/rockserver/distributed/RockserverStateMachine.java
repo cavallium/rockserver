@@ -1304,6 +1304,8 @@ final class RockserverStateMachine extends BaseStateMachine {
 	volatile @Nullable IOException snapshotFailureForTests;
 	/** Tests only: how long, in ms, each snapshot sleeps before its checkpoint (a slow take). */
 	volatile long snapshotDelayForTests;
+	/** Tests only: a latch that each snapshot waits for (at most a minute) before its checkpoint, after the delay. */
+	volatile java.util.concurrent.@Nullable CountDownLatch snapshotHoldForTests;
 	/** Snapshots that this replica tried (the checkpoint started), for tests. */
 	final AtomicLong snapshotAttempts = new AtomicLong();
 	/** Tests only: {@link System#nanoTime} at the entry and at the end of the latest tried snapshot. */
@@ -1366,6 +1368,17 @@ final class RockserverStateMachine extends BaseStateMachine {
 				} catch (InterruptedException ex) {
 					Thread.currentThread().interrupt();
 					throw new java.io.InterruptedIOException("interrupted in the delay of a test");
+				}
+			}
+			var hold = snapshotHoldForTests;
+			if (hold != null) {
+				try {
+					if (!hold.await(1, TimeUnit.MINUTES)) {
+						throw new IOException("the hold of a test was not released within a minute");
+					}
+				} catch (InterruptedException ex) {
+					Thread.currentThread().interrupt();
+					throw new java.io.InterruptedIOException("interrupted in the hold of a test");
 				}
 			}
 			// Before the checkpoint: entries applied while it runs count towards the next one.

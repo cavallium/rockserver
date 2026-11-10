@@ -708,15 +708,13 @@ public final class ReplicatedServerMain {
 			usage(CHANGE_ADDRESSES + " is an option of add-peer and remove-peer only");
 		}
 		long deadline = System.nanoTime() + timeout.toNanos();
-		// Until when the client sends a request again; admin snapshot moves it earlier (R55-3).
-		var retryDeadline = new java.util.concurrent.atomic.AtomicLong(deadline);
 		var group = RaftGroup.valueOf(groupId, peers.stream().map(ReplicatedServerMain::raftPeer).toList());
 		var anyConfig = NodeConfig.defaults(peers.getFirst().id(), peers, Path.of("."));
 		try (var client = RaftClient.newBuilder()
 				.setClientId(ClientId.randomId())
 				.setRaftGroup(group)
 				.setProperties(RaftSettings.client(anyConfig))
-				.setRetryPolicy(retryUntil(retryDeadline::get))
+				.setRetryPolicy(retryUntil(() -> deadline))
 				.build()) {
 			RaftClientReply reply = switch (command.getFirst()) {
 				case "status" -> {
@@ -754,12 +752,10 @@ public final class ReplicatedServerMain {
 				}
 				case "snapshot" -> {
 					var member = peerId(command);
-					var api = client.getSnapshotManagementApi(RaftPeerId.valueOf(member));
 					long wait = snapshotWaitMillis(snapshotRequestWait, deadline - System.nanoTime());
-					retryDeadline.set(System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(wait));
 					RaftClientReply taken;
 					try {
-						taken = api.create(wait);
+						taken = requestSnapshot(group, anyConfig, RaftPeerId.valueOf(member), wait);
 					} catch (IOException ex) {
 						fail(snapshotNotTaken(member, wait, ex));
 						throw new AssertionError(ex);
@@ -1692,7 +1688,75 @@ public final class ReplicatedServerMain {
 		};
 	}
 
-	/** Tests only: the retries that {@code admin}'s Ratis client was allowed ({@link #retryUntil}). */
+	/**
+	 * How much longer than the member's own wait {@code admin snapshot}'s client waits for the answer: the member answers
+	 * at that wait at the latest (R57-1), and as the client's last attempt did before.
+	 */
+	static final Duration SNAPSHOT_ANSWER_MARGIN = Duration.ofSeconds(2);
+
+	/**
+	 * Asks {@code member} for a snapshot and waits {@code waitMillis} for it (R55-3), in one call that lasts the wait
+	 * (R57-1). Ratis 3.3.1's gRPC client gives a snapshot request a deadline of the client's {@code Rpc.requestTimeout}
+	 * ({@code GrpcClientProtocolClient.snapshotManagement}, not the request's own timeout), which {@link RaftSettings#client}
+	 * sets to the election timeout, 2 s: a take longer than that ran past the call, and one that ended while the client
+	 * slept before its next attempt ({@link #ADMIN_RETRY_SLEEP}) answered no one. Ratis had cleared its pending request,
+	 * so the next attempt ran a second take past the entries applied meanwhile (the creation gap is 1), and near the end
+	 * of the wait the command printed {@code took no snapshot within} although the member took one.
+	 *
+	 * <p>Each attempt therefore has a client of its own whose deadline is the time left of the wait plus
+	 * {@link #SNAPSHOT_ANSWER_MARGIN}, and the member waits the time left. An attempt that Ratis would send again (a
+	 * transport error, a member not up yet, the member's own timeout, or a timer left by an earlier request clearing
+	 * this one, R56-2) is sent again {@link #ADMIN_RETRY_SLEEP} later, as {@link #retryUntil} does, until the wait ends;
+	 * then it throws a {@link TimeoutIOException}. The clock is read again after the sleep, so no attempt is sent once
+	 * the wait has ended (review of R57, 1: before, a failure in the last 500 ms of the wait still sent one, with 1 ms
+	 * left, which could start a take on the member after the command had given up). Any other exception (one that the blocking client rethrows at once,
+	 * a {@code GroupMismatchException} for example) is thrown as is.</p>
+	 */
+	static RaftClientReply requestSnapshot(RaftGroup group, NodeConfig anyConfig, RaftPeerId member, long waitMillis)
+			throws IOException, InterruptedException {
+		long end = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(waitMillis);
+		IOException last = null;
+		while (true) {
+			if (last != null) {
+				// After the sleep: an attempt sent now would outlast the wait (review of R57, 1).
+				if (System.nanoTime() - end >= 0) {
+					throw new TimeoutIOException("no snapshot within " + waitMillis + " ms: " + last.getMessage(), last);
+				}
+				adminRetriesForTests.incrementAndGet();
+			}
+			long left = Math.max(1, TimeUnit.NANOSECONDS.toMillis(end - System.nanoTime()));
+			var retryable = new java.util.concurrent.atomic.AtomicBoolean();
+			var client = RaftClient.newBuilder()
+					.setClientId(ClientId.randomId())
+					.setRaftGroup(group)
+					.setProperties(RaftSettings.adminClient(anyConfig, Duration.ofMillis(left).plus(SNAPSHOT_ANSWER_MARGIN)))
+					.setRetryPolicy(_ -> {
+						retryable.set(true);
+						return RetryPolicy.NO_RETRY_ACTION;
+					})
+					.build();
+			try {
+				return client.getSnapshotManagementApi(member).create(left);
+			} catch (IOException ex) {
+				if (!retryable.get()) {
+					throw ex;
+				}
+				if (System.nanoTime() - end >= 0) {
+					throw new TimeoutIOException("no snapshot within " + waitMillis + " ms: " + ex.getMessage(), ex);
+				}
+				last = ex;
+			} finally {
+				try {
+					client.close();
+				} catch (IOException ignored) {
+					// The answer, or the exception, is what counts.
+				}
+			}
+			ADMIN_RETRY_SLEEP.sleep();
+		}
+	}
+
+	/** Tests only: the retries that {@code admin}'s Ratis client was allowed ({@link #retryUntil}), or {@link #requestSnapshot}. */
 	static final java.util.concurrent.atomic.AtomicLong adminRetriesForTests = new java.util.concurrent.atomic.AtomicLong();
 
 	/**
@@ -1701,7 +1765,8 @@ public final class ReplicatedServerMain {
 	 * request's own timeout: {@code SnapshotManagementRequestHandler.takingSnapshotAsync} logs the failure and leaves the
 	 * request pending, and {@code TimeoutExecutor.onTimeout(request.getTimeoutMs())} clears it and completes it with
 	 * {@code TimeoutIOException("Failed to take a snapshot within timeout")}; every retry of the client in the meantime
-	 * joins the same request. The answer therefore comes at this wait, which was the whole {@code --timeout-ms}, 10
+	 * joins the same request; it is one call that lasts the wait ({@link #requestSnapshot}, R57-1). The answer
+	 * therefore comes at this wait, which was the whole {@code --timeout-ms}, 10
 	 * minutes by default. A request that joined another one's (the byte trigger's, whose take failed) ends at that one's
 	 * timeout, 30 s to 120 s after the byte trigger asked, and the client then sends it again, which runs a take
 	 * (R56-1), if this wait has not ended first: with a short {@code --timeout-ms} (30 s, say) the command still ends
@@ -1716,9 +1781,9 @@ public final class ReplicatedServerMain {
 
 	/**
 	 * The {@code FAILED} text of {@code admin snapshot} when the request to {@code member} threw {@code ex}. Only a
-	 * request that ran out of time ({@link TimeoutIOException}, the member's answer at the request's timeout) or of
-	 * retries ({@link RaftRetryFailureException}, the client's deadline at the same moment) gets the text of a wait that
-	 * ran out (review of R55, 1); an exception the blocking client rethrows at once, a {@code GroupMismatchException} from a member
+	 * request that ran out of time ({@link TimeoutIOException}: the member's answer at the request's timeout, or
+	 * {@link #requestSnapshot}'s at the end of the wait, R57-1) or of retries ({@link RaftRetryFailureException}, which
+	 * the client threw at the same moment before R57-1) gets the text of a wait that ran out (review of R55, 1); an exception the blocking client rethrows at once, a {@code GroupMismatchException} from a member
 	 * started with another {@code --group-id} for example, says that the member refused.
 	 */
 	static String snapshotNotTaken(String member, long waitMillis, IOException ex) {

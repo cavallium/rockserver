@@ -21,6 +21,23 @@ class RaftSettingsTest {
 		return RaftSettings.server(NodeConfig.defaults("a", List.of(peer), Path.of("unused")));
 	}
 
+	/**
+	 * R57-1: admin snapshot's client waits for the member's answer as long as it is told, with everything else as
+	 * {@link RaftSettings#client}; the client of the nodes (and of the other admin commands) keeps the election timeout.
+	 */
+	@Test
+	void onlyTheAdminSnapshotClientWaitsLongerThanTheElectionTimeout() {
+		var peer = new PeerConfig("a", "127.0.0.1", 1, "127.0.0.1", 2);
+		var config = NodeConfig.defaults("a", List.of(peer), Path.of("unused"));
+		var nodes = RaftSettings.client(config);
+		assertEquals(config.electionTimeoutMax().toMillis(),
+				org.apache.ratis.client.RaftClientConfigKeys.Rpc.requestTimeout(nodes).toLong(TimeUnit.MILLISECONDS));
+		var admin = RaftSettings.adminClient(config, java.time.Duration.ofSeconds(122));
+		assertEquals(122_000,
+				org.apache.ratis.client.RaftClientConfigKeys.Rpc.requestTimeout(admin).toLong(TimeUnit.MILLISECONDS));
+		assertEquals(GrpcConfigKeys.messageSizeMax(nodes, _ -> {}), GrpcConfigKeys.messageSizeMax(admin, _ -> {}));
+	}
+
 	/** R6-1: the leader appends with CommitHeartbeats' appender, which can send the commit index to a follower at once. */
 	@Test
 	void theServerAppendsWithCommitHeartbeats() {
