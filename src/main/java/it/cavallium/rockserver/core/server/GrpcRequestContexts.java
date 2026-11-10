@@ -190,7 +190,9 @@ final class GrpcRequestContexts {
 	}
 
 	RocksDBSyncAPI syncApi(it.cavallium.rockserver.core.common.RequestContext context) {
-		if (!context.hasTimeout()) {
+		// The cached API is bound to a context with no request id: a numbered write must reach the connection with its
+		// own context, or it is sent (or proposed) unnumbered and a resend applies twice (review of R58, 1).
+		if (!context.hasTimeout() && context.requestId() == null) {
 			var cached = noDeadlineSyncApis[context.profile().ordinal()];
 			if (cached != null) {
 				return cached;
@@ -200,7 +202,9 @@ final class GrpcRequestContexts {
 	}
 
 	RocksDBAsyncAPI asyncApi(it.cavallium.rockserver.core.common.RequestContext context) {
-		if (!context.hasTimeout()) {
+		// The cached API is bound to a context with no request id: a numbered write must reach the connection with its
+		// own context, or it is sent (or proposed) unnumbered and a resend applies twice (review of R58, 1).
+		if (!context.hasTimeout() && context.requestId() == null) {
 			var cached = noDeadlineAsyncApis[context.profile().ordinal()];
 			if (cached != null) {
 				return cached;
