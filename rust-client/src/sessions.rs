@@ -239,16 +239,25 @@ fn remaining(deadline: Instant, finite: bool) -> Option<Option<Duration>> {
     }
 }
 
-/// Awaits a copy or an opening. A caller with a deadline sends it with what is left as its gRPC timeout, so the
-/// transport ends it. A caller without one sends it with no timeout, so that the server still sees a caller without
-/// a deadline. Nothing else ends it then: `connect` sets no keepalive, so a silent node (power loss, SIGSTOP, a
-/// partition with the host up) would hold it forever. The window ends it here instead, with `None`.
+/// How long past its deadline [`within_window`] waits for a copy of a caller with a deadline: the transport's or
+/// the server's own answer at the deadline (which may say the write was not applied) comes first, unless the node is
+/// silent.
+pub(crate) const COPY_ANSWER_MARGIN: Duration = Duration::from_secs(1);
+
+/// Awaits a copy or an opening, `None` once the window ended without an answer. A caller with a deadline sends it
+/// with what is left as its gRPC timeout, so the transport ends it, but that timeout bounds only the wait for the
+/// response headers, not the results a multi write with results then drains (R60-5): a node that goes silent after
+/// the headers would hold the copy past the deadline, so the copy is bounded here too, at the deadline plus
+/// [`COPY_ANSWER_MARGIN`]. A caller without a deadline sends it with no timeout, so that the server still sees a
+/// caller without a deadline. Nothing else ends it then: `connect` sets no keepalive, so a silent node (power loss,
+/// SIGSTOP, a partition with the host up) would hold it forever. The window ends it here instead.
 async fn within_window<F: Future>(deadline: Instant, finite: bool, call: F) -> Option<F::Output> {
-    if finite {
-        Some(call.await)
+    let end = if finite {
+        deadline.checked_add(COPY_ANSWER_MARGIN).unwrap_or(deadline)
     } else {
-        tokio::time::timeout_at(deadline, call).await.ok()
-    }
+        deadline
+    };
+    tokio::time::timeout_at(end, call).await.ok()
 }
 
 impl SessionWrites {
@@ -461,9 +470,11 @@ impl SessionWrites {
                     Some(Err(status)) => status,
                     // The copy may have been applied; the window has no room for another.
                     None => {
-                        return Err(unknown_outcome(&Status::deadline_exceeded(
-                            "no answer to the copy before the retry window ended",
-                        )))
+                        return Err(unknown_outcome(&Status::deadline_exceeded(if finite {
+                            "no answer to the copy by its deadline"
+                        } else {
+                            "no answer to the copy before the retry window ended"
+                        })))
                     }
                 };
                 if rocksdb_error_type(&status) == Some("SESSION_EXPIRED") {

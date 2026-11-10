@@ -225,10 +225,14 @@ class ReplicaOpsTest {
 			assertEquals(4, locked.value());
 			assertEquals(9, registry.find("rockserver.replication.raft.term").tag("node", "n7").gauge().value());
 
-			// A new database, a new registry: everything moves along.
+			// A new database, a new registry: everything moves along. The series count from what the registry before
+			// read (R60-2, see NodeMetricsTest), which stops there.
 			var reopened = new SimpleMeterRegistry();
 			metrics.bind(reopened);
-			assertEquals(2, reopened.find("rockserver.replication.duration").tag("name", "apply").functionTimer().count());
+			assertEquals(0, reopened.find("rockserver.replication.duration").tag("name", "apply").functionTimer().count());
+			apply.record(TimeUnit.MILLISECONDS.toNanos(1));
+			assertEquals(1, reopened.find("rockserver.replication.duration").tag("name", "apply").functionTimer().count());
+			assertEquals(2, timer.count());
 			assertEquals(9, reopened.find("rockserver.replication.raft.term").gauge().value());
 
 			// A database whose meters are tagged with a configured node name: the replication meters follow it.

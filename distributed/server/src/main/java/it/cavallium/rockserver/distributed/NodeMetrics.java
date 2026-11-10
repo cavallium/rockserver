@@ -36,7 +36,13 @@ import org.slf4j.LoggerFactory;
  *   {@code rockserver.replication.amount} (their sum), tagged the same way;</li>
  *   <li>a gauge as {@code rockserver.replication.<name>}.</li>
  * </ul>
- * <p>The exported values are cumulative: the log line's interval sums and maxima are kept apart.</p>
+ * <p>The exported values are cumulative: the log line's interval sums and maxima are kept apart. They count from
+ * the {@link #bind} of the registry, not from the node's start (R60-2): the registry of a new database (start, and each
+ * snapshot install) exports only what the registries bound before did not read ({@link Exported}). The InfluxDB
+ * registry is a step registry, which publishes a function counter as the difference of its function between steps,
+ * from 0 when it is made: on the lifetime totals, its first step after an install carried every count since the node
+ * started, and an old checksum mismatch, leader stall or failed install record fired its alert again. A cumulative
+ * registry (JMX) restarts its counts at each install.</p>
  */
 final class NodeMetrics {
 
@@ -74,6 +80,63 @@ final class NodeMetrics {
 		long sum() {
 			return sum.sum();
 		}
+
+		/** What the registry bound last reads of this series, or null before the first registry. Guarded by exportLock. */
+		private @Nullable Exported exported;
+	}
+
+	/**
+	 * One series as one registry reads it (R60-2): its count and sum minus those that the registries bound before read
+	 * (the base), each read never below the last one. A {@link #bind} retires the reading of the registry bound before:
+	 * that registry then reads the values it read last, whether its database closed it (its last publish) or not, and
+	 * the new registry starts from them. So every value is published once, by one registry, and none is lost: what
+	 * comes between the last read of the old registry and the bind goes to the new one.
+	 */
+	static final class Exported {
+		private final Series series;
+		private final long countBase;
+		private final long sumBase;
+		/** The count and sum read last, from the series itself (not less the bases). Guarded by this. */
+		private long countRead;
+		private long sumRead;
+		private boolean retired;
+
+		Exported(Series series, @Nullable Exported before) {
+			this.series = series;
+			if (before == null) {
+				countBase = 0;
+				sumBase = 0;
+			} else {
+				synchronized (before) {
+					before.retired = true;
+					countBase = before.countRead;
+					sumBase = before.sumRead;
+				}
+			}
+			countRead = countBase;
+			sumRead = sumBase;
+		}
+
+		synchronized long count() {
+			if (!retired) {
+				countRead = Math.max(countRead, series.count());
+			}
+			return countRead - countBase;
+		}
+
+		synchronized long sum() {
+			if (!retired) {
+				sumRead = Math.max(sumRead, series.sum());
+			}
+			return sumRead - sumBase;
+		}
+	}
+
+	/** A new {@link Exported} of {@code series} for the registry being bound, retiring the one bound before. */
+	private static Exported exportedFor(Series series) {
+		var exported = new Exported(series, series.exported);
+		series.exported = exported;
+		return exported;
 	}
 
 	/** Sampling period of {@link #sampleEveryMillisecond}, see {@link #LAG_SAMPLE_PROPERTY}. */
@@ -200,7 +263,8 @@ final class NodeMetrics {
 	/**
 	 * Exports every series and gauge, those to come included, to {@code registry}, the registry of the database the node
 	 * just opened: a snapshot install closes the database, and its registry with it, and opens a new one. Meters stay
-	 * in the registries bound before, which their database closed.
+	 * in the registries bound before, which their database closed; their series stop at the values they read last, and
+	 * the new registry exports only what came after (see {@link Exported}).
 	 */
 	void bind(MeterRegistry registry) {
 		bind(registry, nodeId);
@@ -233,7 +297,8 @@ final class NodeMetrics {
 	}
 
 	private void registerDuration(MeterRegistry registry, String name, Series series) {
-		FunctionTimer.builder("rockserver.replication.duration", series, Series::count, Series::sum,
+		// The meters hold their object weakly: the series holds the one of the registry bound last.
+		FunctionTimer.builder("rockserver.replication.duration", exportedFor(series), Exported::count, Exported::sum,
 						TimeUnit.NANOSECONDS)
 				.tag("node", nodeTag)
 				.tag("name", name)
@@ -243,12 +308,13 @@ final class NodeMetrics {
 	}
 
 	private void registerAmount(MeterRegistry registry, String name, Series series) {
-		FunctionCounter.builder("rockserver.replication.count", series, s -> s.count())
+		var exported = exportedFor(series);
+		FunctionCounter.builder("rockserver.replication.count", exported, Exported::count)
 				.tag("node", nodeTag)
 				.tag("name", name)
 				.tag("kind", kindOf(name))
 				.register(registry);
-		FunctionCounter.builder("rockserver.replication.amount", series, s -> s.sum())
+		FunctionCounter.builder("rockserver.replication.amount", exported, Exported::sum)
 				.tag("node", nodeTag)
 				.tag("name", name)
 				.tag("kind", kindOf(name))

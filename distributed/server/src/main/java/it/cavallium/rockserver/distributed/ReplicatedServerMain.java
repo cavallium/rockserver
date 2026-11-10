@@ -189,6 +189,8 @@ import org.rocksdb.NativeLibraryLoader;
 public final class ReplicatedServerMain {
 
 	private static final Duration DEFAULT_ADMIN_TIMEOUT = Duration.ofMinutes(10);
+	/** The longest {@code admin --timeout-ms}: a deadline in nanoseconds still comparable with {@link System#nanoTime}. */
+	private static final Duration MAX_ADMIN_TIMEOUT = Duration.ofNanos(Long.MAX_VALUE / 2);
 	private static final TimeDuration ADMIN_RETRY_SLEEP = TimeDuration.valueOf(500, TimeUnit.MILLISECONDS);
 	/**
 	 * How long {@code admin snapshot} asks the member to wait for its snapshot, at most the time left of
@@ -706,6 +708,11 @@ public final class ReplicatedServerMain {
 		}
 		if (changeAddresses && !List.of("add-peer", "remove-peer").contains(command.getFirst())) {
 			usage(CHANGE_ADDRESSES + " is an option of add-peer and remove-peer only");
+		}
+		// R60-6: a --timeout-ms past the nanoseconds of a long (about 292 years; half of it, so that the deadline below
+		// stays comparable with System.nanoTime) was an ArithmeticException, exit 1 with a stack trace.
+		if (timeout.compareTo(MAX_ADMIN_TIMEOUT) > 0) {
+			usage("invalid --timeout-ms " + timeout.toMillis() + ": at most " + MAX_ADMIN_TIMEOUT.toMillis());
 		}
 		long deadline = System.nanoTime() + timeout.toNanos();
 		var group = RaftGroup.valueOf(groupId, peers.stream().map(ReplicatedServerMain::raftPeer).toList());
@@ -2176,6 +2183,14 @@ public final class ReplicatedServerMain {
 			}).toList();
 			if (peers.isEmpty()) {
 				usage("at least one --peer is required");
+			}
+			// R60-6: refused here for every command; admin built its Raft group (IllegalStateException) and its
+			// NodeConfig (IllegalArgumentException) with them, and ended with exit 1 and a stack trace.
+			var ids = new LinkedHashSet<String>();
+			for (var peer : peers) {
+				if (!ids.add(peer.id())) {
+					usage("--peer id " + peer.id() + " is given more than once");
+				}
 			}
 			return peers;
 		}

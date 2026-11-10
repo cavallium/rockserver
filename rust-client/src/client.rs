@@ -1752,6 +1752,19 @@ impl RockserverClient {
         }
     }
 
+    /// A write this view sends once, unnumbered (`numbering` is `None`): an update it ends is forgotten once it has
+    /// its answer, whatever the answer, as after a numbered write (R60-4). Without it a write through a view that
+    /// carries a request id left the id numbered for up to `UPDATE_MEMORY`; the Java client forgets it too
+    /// (`SessionWrites.endsUpdateUnnumbered`). A transaction id, or an update this client does not remember, is
+    /// left alone. A `without_client_sessions` view has no session writes, so an update it ends stays remembered.
+    async fn unnumbered<R>(&self, update_id: i64, call: impl Future<Output = Result<R>>) -> Result<R> {
+        let result = call.await;
+        if let Some(writes) = &self.sessions {
+            writes.update_ended(update_id);
+        }
+        result
+    }
+
     /// The session writes that number a write with this transaction or update id, if this view numbers it.
     fn numbering(&self, transaction_or_update_id: i64) -> Option<Arc<SessionWrites>> {
         if self.context.request_id.is_some() {
@@ -2021,7 +2034,7 @@ impl RockserverClient {
         let tx = transaction_or_update_id;
         match self.numbering(tx) {
             Some(writes) => self.numbered(&writes, tx, copy!(view => view.put_once(tx, column_id, keys, value); keys, value)).await,
-            None => self.put_once(tx, column_id, keys, value).await,
+            None => self.unnumbered(tx, self.put_once(tx, column_id, keys, value)).await,
         }
     }
 
@@ -2030,7 +2043,7 @@ impl RockserverClient {
         let tx = transaction_or_update_id;
         match self.numbering(tx) {
             Some(writes) => self.numbered(&writes, tx, copy!(view => view.put_ensure_once(tx, column_id, keys, value); keys, value)).await,
-            None => self.put_ensure_once(tx, column_id, keys, value).await,
+            None => self.unnumbered(tx, self.put_ensure_once(tx, column_id, keys, value)).await,
         }
     }
 
@@ -2039,7 +2052,7 @@ impl RockserverClient {
         let tx = transaction_or_update_id;
         match self.numbering(tx) {
             Some(writes) => self.numbered(&writes, tx, copy!(view => view.put_get_previous_once(tx, column_id, keys, value); keys, value)).await,
-            None => self.put_get_previous_once(tx, column_id, keys, value).await,
+            None => self.unnumbered(tx, self.put_get_previous_once(tx, column_id, keys, value)).await,
         }
     }
 
@@ -2048,7 +2061,7 @@ impl RockserverClient {
         let tx = transaction_or_update_id;
         match self.numbering(tx) {
             Some(writes) => self.numbered(&writes, tx, copy!(view => view.put_get_delta_once(tx, column_id, keys, value); keys, value)).await,
-            None => self.put_get_delta_once(tx, column_id, keys, value).await,
+            None => self.unnumbered(tx, self.put_get_delta_once(tx, column_id, keys, value)).await,
         }
     }
 
@@ -2057,7 +2070,7 @@ impl RockserverClient {
         let tx = transaction_or_update_id;
         match self.numbering(tx) {
             Some(writes) => self.numbered(&writes, tx, copy!(view => view.put_get_changed_once(tx, column_id, keys, value); keys, value)).await,
-            None => self.put_get_changed_once(tx, column_id, keys, value).await,
+            None => self.unnumbered(tx, self.put_get_changed_once(tx, column_id, keys, value)).await,
         }
     }
 
@@ -2066,7 +2079,7 @@ impl RockserverClient {
         let tx = transaction_or_update_id;
         match self.numbering(tx) {
             Some(writes) => self.numbered(&writes, tx, copy!(view => view.put_get_previous_presence_once(tx, column_id, keys, value); keys, value)).await,
-            None => self.put_get_previous_presence_once(tx, column_id, keys, value).await,
+            None => self.unnumbered(tx, self.put_get_previous_presence_once(tx, column_id, keys, value)).await,
         }
     }
 
@@ -2075,7 +2088,7 @@ impl RockserverClient {
         let tx = transaction_or_update_id;
         match self.numbering(tx) {
             Some(writes) => self.numbered(&writes, tx, copy!(view => view.delete_once(tx, column_id, keys); keys)).await,
-            None => self.delete_once(tx, column_id, keys).await,
+            None => self.unnumbered(tx, self.delete_once(tx, column_id, keys)).await,
         }
     }
 
@@ -2084,7 +2097,7 @@ impl RockserverClient {
         let tx = transaction_or_update_id;
         match self.numbering(tx) {
             Some(writes) => self.numbered(&writes, tx, copy!(view => view.delete_get_previous_once(tx, column_id, keys); keys)).await,
-            None => self.delete_get_previous_once(tx, column_id, keys).await,
+            None => self.unnumbered(tx, self.delete_get_previous_once(tx, column_id, keys)).await,
         }
     }
 
@@ -2093,7 +2106,7 @@ impl RockserverClient {
         let tx = transaction_or_update_id;
         match self.numbering(tx) {
             Some(writes) => self.numbered(&writes, tx, copy!(view => view.delete_get_previous_presence_once(tx, column_id, keys); keys)).await,
-            None => self.delete_get_previous_presence_once(tx, column_id, keys).await,
+            None => self.unnumbered(tx, self.delete_get_previous_presence_once(tx, column_id, keys)).await,
         }
     }
 
@@ -2111,7 +2124,7 @@ impl RockserverClient {
         let tx = transaction_or_update_id;
         match self.numbering(tx) {
             Some(writes) => self.numbered(&writes, tx, copy!(view => view.merge_once(tx, column_id, keys, value); keys, value)).await,
-            None => self.merge_once(tx, column_id, keys, value).await,
+            None => self.unnumbered(tx, self.merge_once(tx, column_id, keys, value)).await,
         }
     }
 
@@ -2120,7 +2133,7 @@ impl RockserverClient {
         let tx = transaction_or_update_id;
         match self.numbering(tx) {
             Some(writes) => self.numbered(&writes, tx, copy!(view => view.merge_get_merged_once(tx, column_id, keys, value); keys, value)).await,
-            None => self.merge_get_merged_once(tx, column_id, keys, value).await,
+            None => self.unnumbered(tx, self.merge_get_merged_once(tx, column_id, keys, value)).await,
         }
     }
 
@@ -2131,7 +2144,7 @@ impl RockserverClient {
         let tx = transaction_or_update_id;
         match self.numbering(tx) {
             Some(writes) => self.numbered(&writes, tx, copy!(view => view.put_multi_list_once(tx, column_id, data); data)).await,
-            None => self.put_multi_list_once(tx, column_id, data).await,
+            None => self.unnumbered(tx, self.put_multi_list_once(tx, column_id, data)).await,
         }
     }
 
@@ -2148,7 +2161,7 @@ impl RockserverClient {
                     result
                 }
             },
-            None => self.put_multi_once(tx, column_id, items).await,
+            None => self.unnumbered(tx, self.put_multi_once(tx, column_id, items)).await,
         }
     }
 
@@ -2165,7 +2178,7 @@ impl RockserverClient {
                     result
                 }
             },
-            None => self.put_multi_ensure_once(tx, column_id, items).await,
+            None => self.unnumbered(tx, self.put_multi_ensure_once(tx, column_id, items)).await,
         }
     }
 
@@ -2182,7 +2195,7 @@ impl RockserverClient {
                     results?.boxed()
                 }
             },
-            None => self.put_multi_get_previous_once(tx, column_id, items).await?.boxed(),
+            None => self.unnumbered(tx, self.put_multi_get_previous_once(tx, column_id, items)).await?.boxed(),
         })
     }
 
@@ -2199,7 +2212,7 @@ impl RockserverClient {
                     results?.boxed()
                 }
             },
-            None => self.put_multi_get_delta_once(tx, column_id, items).await?.boxed(),
+            None => self.unnumbered(tx, self.put_multi_get_delta_once(tx, column_id, items)).await?.boxed(),
         })
     }
 
@@ -2216,7 +2229,7 @@ impl RockserverClient {
                     results?.boxed()
                 }
             },
-            None => self.put_multi_get_changed_once(tx, column_id, items).await?.boxed(),
+            None => self.unnumbered(tx, self.put_multi_get_changed_once(tx, column_id, items)).await?.boxed(),
         })
     }
 
@@ -2233,7 +2246,7 @@ impl RockserverClient {
                     results?.boxed()
                 }
             },
-            None => self.put_multi_get_previous_presence_once(tx, column_id, items).await?.boxed(),
+            None => self.unnumbered(tx, self.put_multi_get_previous_presence_once(tx, column_id, items)).await?.boxed(),
         })
     }
 
@@ -2250,7 +2263,7 @@ impl RockserverClient {
                     result
                 }
             },
-            None => self.delete_multi_once(tx, column_id, keys).await,
+            None => self.unnumbered(tx, self.delete_multi_once(tx, column_id, keys)).await,
         }
     }
 
@@ -2267,7 +2280,7 @@ impl RockserverClient {
                     results?.boxed()
                 }
             },
-            None => self.delete_multi_get_previous_once(tx, column_id, keys).await?.boxed(),
+            None => self.unnumbered(tx, self.delete_multi_get_previous_once(tx, column_id, keys)).await?.boxed(),
         })
     }
 
@@ -2284,7 +2297,7 @@ impl RockserverClient {
                     results?.boxed()
                 }
             },
-            None => self.delete_multi_get_previous_presence_once(tx, column_id, keys).await?.boxed(),
+            None => self.unnumbered(tx, self.delete_multi_get_previous_presence_once(tx, column_id, keys)).await?.boxed(),
         })
     }
 
@@ -2301,7 +2314,7 @@ impl RockserverClient {
                     result
                 }
             },
-            None => self.merge_multi_once(tx, column_id, items).await,
+            None => self.unnumbered(tx, self.merge_multi_once(tx, column_id, items)).await,
         }
     }
 
@@ -2318,7 +2331,7 @@ impl RockserverClient {
                     results?.boxed()
                 }
             },
-            None => self.merge_multi_get_merged_once(tx, column_id, items).await?.boxed(),
+            None => self.unnumbered(tx, self.merge_multi_get_merged_once(tx, column_id, items)).await?.boxed(),
         })
     }
 
@@ -2754,6 +2767,127 @@ mod numbered_multi_tests {
             "ended after {elapsed:?}: the deadline started after the input"
         );
         assert!(is_outcome_unknown(&error) || is_not_applied(&error), "{error:?}");
+    }
+
+    /// R60-4: a write that ends an update, sent through a view whose context carries a request id (numbered by its
+    /// caller, sent once), forgets the update as a numbered write does, and as the Java client does
+    /// (`SessionWrites.endsUpdateUnnumbered`): its id is not numbered for a later write that gets the same id. The
+    /// copies fail here (a closed port): the update is forgotten whatever the answer, as after a numbered write.
+    #[tokio::test]
+    async fn a_write_of_a_request_id_view_forgets_the_update_it_ends() {
+        let client = numbering_client(Duration::from_millis(300));
+        let writes = client.sessions.clone().unwrap();
+        let view = client.with_context(
+            RequestContext::batch_with_timeout(Duration::from_millis(300)).with_request_id(7, 0, 0),
+        );
+        writes.update_opened(42);
+        writes.update_opened(43);
+        assert!(writes.numbers(42) && writes.numbers(43));
+        assert!(view.put(42, 1, vec![vec![1]], vec![1]).await.is_err());
+        assert!(!writes.numbers(42), "the update ended by put stays numbered");
+        let results = view
+            .put_multi_get_previous(
+                43,
+                1,
+                futures::stream::iter([Kv {
+                    keys: vec![vec![1]],
+                    value: vec![1],
+                }]),
+            )
+            .await;
+        assert!(results.is_err());
+        assert!(!writes.numbers(43), "the update ended by put_multi_get_previous stays numbered");
+    }
+
+    /// A server that answers every call of the service with its response headers, then sends nothing more: a node
+    /// that goes silent (SIGSTOP, power loss, a partition) after it began to answer.
+    #[derive(Clone)]
+    struct StalledAfterHeaders;
+
+    impl tonic::server::NamedService for StalledAfterHeaders {
+        const NAME: &'static str = "it.cavallium.rockserver.core.common.api.proto.RocksDBService";
+    }
+
+    struct PendingResults;
+
+    impl tonic::server::StreamingService<PutMultiRequest> for PendingResults {
+        type Response = Previous;
+        type ResponseStream = futures::stream::BoxStream<'static, Result<Previous>>;
+        type Future = std::future::Ready<Result<tonic::Response<Self::ResponseStream>>>;
+
+        fn call(&mut self, request: Request<tonic::Streaming<PutMultiRequest>>) -> Self::Future {
+            let results = async_stream::stream! {
+                // The request stays open, so that the call is not reset.
+                let _request = request;
+                futures::future::pending::<()>().await;
+                yield Ok(Previous::default());
+            };
+            std::future::ready(Ok(tonic::Response::new(results.boxed())))
+        }
+    }
+
+    impl tonic::codegen::Service<tonic::codegen::http::Request<tonic::body::BoxBody>> for StalledAfterHeaders {
+        type Response = tonic::codegen::http::Response<tonic::body::BoxBody>;
+        type Error = std::convert::Infallible;
+        type Future = futures::future::BoxFuture<'static, std::result::Result<Self::Response, Self::Error>>;
+
+        fn poll_ready(
+            &mut self,
+            _context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::result::Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, request: tonic::codegen::http::Request<tonic::body::BoxBody>) -> Self::Future {
+            Box::pin(async move {
+                let mut grpc = tonic::server::Grpc::new(tonic::codec::ProstCodec::default());
+                Ok(grpc.streaming(PendingResults, request).await)
+            })
+        }
+    }
+
+    /// R60-5: a numbered multi write with results of a caller with a deadline ends by its deadline (plus the margin
+    /// left to the transport's own answer), with an unknown outcome, when the node stops after the response headers.
+    /// The gRPC timeout covers only the wait for the headers, and draining the results had no bound: the write hung.
+    #[tokio::test]
+    async fn a_numbered_multi_write_with_results_ends_by_its_deadline_when_the_node_stalls_after_the_headers() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let incoming = tonic::transport::server::TcpIncoming::from_listener(listener, true, None).unwrap();
+        let server = tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(StalledAfterHeaders)
+                .serve_with_incoming(incoming),
+        );
+        let channel = Endpoint::from_shared(format!("http://127.0.0.1:{port}"))
+            .unwrap()
+            .connect_lazy();
+        let mut client = RockserverClient::new_unchecked(
+            channel,
+            RequestContext::batch_with_timeout(Duration::from_millis(500)),
+        );
+        client.sessions = Some(Arc::new(SessionWrites::with_open_session(true, 7)));
+        let start = std::time::Instant::now();
+        let call = client.put_multi_get_previous(
+            0,
+            1,
+            futures::stream::iter([Kv {
+                keys: vec![vec![1]],
+                value: vec![1],
+            }]),
+        );
+        let ended = tokio::time::timeout(Duration::from_secs(10), call).await;
+        let elapsed = start.elapsed();
+        server.abort();
+        let error = ended
+            .expect("the write was still waiting for the results 10 s after its 500 ms deadline")
+            .err()
+            .expect("no results came");
+        assert!(is_outcome_unknown(&error), "{error:?}");
+        assert!(
+            elapsed < Duration::from_secs(4),
+            "ended after {elapsed:?}"
+        );
     }
 
     /// R6-4 review: a caller without a deadline gets its retry window from the moment the write is sent, not from
