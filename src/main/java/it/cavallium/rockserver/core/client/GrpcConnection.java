@@ -284,7 +284,7 @@ public final class GrpcConnection extends BaseConnection {
 	@Override
 	<R, RS, RA> RS requestSync(BoundRequestContext context, RocksDBAPICommand<R, RS, RA> request) {
 		var writes = sessionWrites;
-		if (writes != null && (writes.numbers(request) || SessionWrites.observes(request))) {
+		if (writes != null && (writes.numbers(context, request) || SessionWrites.observes(request))) {
 			// Bounded by the deadline plus a margin: a lost callback must not block the caller forever. Past it the write
 			// is cancelled, and ends unknown if a copy was sent.
 			return (RS) SessionWrites.await((CompletableFuture<Object>) requestAsync(context, request),
@@ -304,7 +304,7 @@ public final class GrpcConnection extends BaseConnection {
 	@Override
 	<R, RS, RA> RA requestAsync(BoundRequestContext context, RocksDBAPICommand<R, RS, RA> request) {
 		var writes = sessionWrites;
-		if (writes != null && writes.numbers(request)) {
+		if (writes != null && writes.numbers(context, request)) {
 			return (RA) writes.send(context, (RocksDBAPICommand.RocksDBAPICommandSingle<?>) request);
 		}
 		// The futures derived below pass a cancel on to the call (R46-4): a cancelled getForUpdate reaches the server,
