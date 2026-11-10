@@ -193,6 +193,9 @@ final class CheckpointStorage implements StateMachineStorage {
 					}
 				}
 			}
+			// Known gap (review of R58, 3): right after a completed swap Ratis' purge leaves no segment until the next
+			// entry is appended, so logStart is empty and the aside is promoted. By reading Ratis that opens no gap: an
+			// empty log restarts after the promoted snapshot and the leader sends what follows.
 			OptionalLong logStart = raftLogStart(this.stateMachineDir);
 			if (logStart.isPresent() && logStart.getAsLong() > asideIndex + 1) {
 				String gap = "the Raft log starts at index " + logStart.getAsLong() + ", past index " + (asideIndex + 1)
