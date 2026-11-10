@@ -1755,7 +1755,8 @@ public final class ReplicatedServerMain {
 	 * request's own timeout: {@code SnapshotManagementRequestHandler.takingSnapshotAsync} logs the failure and leaves the
 	 * request pending, and {@code TimeoutExecutor.onTimeout(request.getTimeoutMs())} clears it and completes it with
 	 * {@code TimeoutIOException("Failed to take a snapshot within timeout")}; every retry of the client in the meantime
-	 * joins the same request. The answer therefore comes at this wait, which was the whole {@code --timeout-ms}, 10
+	 * joins the same request; it is one call that lasts the wait ({@link #requestSnapshot}, R57-1). The answer
+	 * therefore comes at this wait, which was the whole {@code --timeout-ms}, 10
 	 * minutes by default. A request that joined another one's (the byte trigger's, whose take failed) ends at that one's
 	 * timeout, 30 s to 120 s after the byte trigger asked, and the client then sends it again, which runs a take
 	 * (R56-1), if this wait has not ended first: with a short {@code --timeout-ms} (30 s, say) the command still ends
@@ -1770,9 +1771,9 @@ public final class ReplicatedServerMain {
 
 	/**
 	 * The {@code FAILED} text of {@code admin snapshot} when the request to {@code member} threw {@code ex}. Only a
-	 * request that ran out of time ({@link TimeoutIOException}, the member's answer at the request's timeout) or of
-	 * retries ({@link RaftRetryFailureException}, the client's deadline at the same moment) gets the text of a wait that
-	 * ran out (review of R55, 1); an exception the blocking client rethrows at once, a {@code GroupMismatchException} from a member
+	 * request that ran out of time ({@link TimeoutIOException}: the member's answer at the request's timeout, or
+	 * {@link #requestSnapshot}'s at the end of the wait, R57-1) or of retries ({@link RaftRetryFailureException}, which
+	 * the client threw at the same moment before R57-1) gets the text of a wait that ran out (review of R55, 1); an exception the blocking client rethrows at once, a {@code GroupMismatchException} from a member
 	 * started with another {@code --group-id} for example, says that the member refused.
 	 */
 	static String snapshotNotTaken(String member, long waitMillis, IOException ex) {
