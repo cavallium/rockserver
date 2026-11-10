@@ -352,6 +352,47 @@ class NumberedWritesTest {
 	}
 
 	/**
+	 * Review of R58, 1: a numbered write of a direct client whose context has no timeout (RequestContext.ingest(), the
+	 * profile a SessionWrites caller may use) and whose call has no gRPC deadline. The server's GrpcRequestContexts
+	 * used to serve such a context from its cached no-deadline API, whose context has no request id, so the write was
+	 * proposed unnumbered: no result recorded, and a copy sent after a lost answer applied again.
+	 */
+	@Test
+	void aNumberedWriteWithNoTimeoutAndNoDeadlineKeepsItsRequestId() throws Exception {
+		cluster = new InProcessCluster(temp, 3, c -> c).startAll();
+		var leader = cluster.awaitLeader(TIMEOUT);
+		var connection = (ReplicatedConnection) leader.connection();
+		var context = RequestContext.batch(TIMEOUT);
+		long column = connection.getAsyncApi(context).createColumnAsync("n", SCHEMA).join();
+		long session = connection.openClientSessionAsync(context).join();
+		var address = apiAddress(leader);
+		var channel = io.grpc.netty.NettyChannelBuilder.forAddress(address.host(), address.port()).usePlaintext()
+				.build();
+		try {
+			var stub = it.cavallium.rockserver.core.common.api.proto.RocksDBServiceGrpc.newBlockingStub(channel);
+			var wireContext = it.cavallium.rockserver.core.common.api.proto.RequestContext.newBuilder()
+					.setProfile(it.cavallium.rockserver.core.common.api.proto.WorkloadProfile.INGEST)
+					.setWorkloadContractVersion(RockserverCapabilities.REQUIRED_WORKLOAD_CONTRACT_VERSION)
+					.setTimeoutNanos(RequestContext.NO_TIMEOUT)
+					.setRequestId(it.cavallium.rockserver.core.common.api.proto.ClientRequestId.newBuilder()
+							.setSessionId(session).setSequence(0).setCompletedBelow(0));
+			var put = it.cavallium.rockserver.core.common.api.proto.PutRequest.newBuilder()
+					.setTransactionOrUpdateId(0).setColumnId(column)
+					.setData(it.cavallium.rockserver.core.common.api.proto.KV.newBuilder()
+							.addKeys(com.google.protobuf.ByteString.copyFrom(ByteBuffer.allocate(Long.BYTES).putLong(1)
+									.array()))
+							.setValue(com.google.protobuf.ByteString.copyFromUtf8("v")))
+					.setContext(wireContext).build();
+			stub.put(put);
+			assertEquals("v", localValue(leader, column, 1));
+			assertNotNull(leader.stateMachine().recordedResult(new ClientRequestId(session, 0, 0)),
+					"the write was proposed without its request id");
+		} finally {
+			channel.shutdownNow();
+		}
+	}
+
+	/**
 	 * R2-SC-4: a client of a server that offers sessions but does not number batches sends a batch of several chunks
 	 * unnumbered, as one stream, once: it uses no number of the session (the put after it is number 0), and the server
 	 * applies every chunk.

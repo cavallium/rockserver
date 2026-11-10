@@ -54,6 +54,20 @@ class GrpcProxyCallerRequestIdTest {
 
 	@Test
 	void aProxyPassesTheCallersRequestIdThroughSoTheClusterAppliesAResentMergeOnce() throws Exception {
+		run(WorkloadProfile.LATENCY, TimeUnit.SECONDS.toNanos(20), true);
+	}
+
+	/**
+	 * Review of R58, 1: the context of a SessionWrites caller with {@code RequestContext.ingest()} (no timeout) and no
+	 * gRPC deadline. GrpcRequestContexts used to serve such a context from its cached no-deadline API, built from a
+	 * context with no request id, so the caller's id was dropped before the proxy's connection saw it.
+	 */
+	@Test
+	void aProxyPassesTheRequestIdOfACallerWithNoTimeoutThrough() throws Exception {
+		run(WorkloadProfile.INGEST, Long.MAX_VALUE, false);
+	}
+
+	private void run(WorkloadProfile profile, long timeoutNanos, boolean deadline) throws Exception {
 		var seen = new CopyOnWriteArrayList<Id>();
 		Set<Id> applied = ConcurrentHashMap.newKeySet();
 		var counter = new AtomicInteger();
@@ -92,9 +106,12 @@ class GrpcProxyCallerRequestIdTest {
 			proxy = new GrpcServer(proxyClient, new InetSocketAddress("127.0.0.1", 0));
 			proxy.start();
 			channel = NettyChannelBuilder.forAddress("127.0.0.1", proxy.getPort()).usePlaintext().build();
-			var stub = RocksDBServiceGrpc.newBlockingStub(channel).withDeadlineAfter(30, TimeUnit.SECONDS);
+			var stub = RocksDBServiceGrpc.newBlockingStub(channel);
+			if (deadline) {
+				stub = stub.withDeadlineAfter(30, TimeUnit.SECONDS);
+			}
 
-			var numbered = merge(ClientRequestId.newBuilder().setSessionId(DOWNSTREAM_SESSION).setSequence(7)
+			var numbered = merge(profile, timeoutNanos, ClientRequestId.newBuilder().setSessionId(DOWNSTREAM_SESSION).setSequence(7)
 					.setCompletedBelow(7).build());
 			// The first copy, then the copy a downstream client sends after losing the answer to the first.
 			stub.merge(numbered);
@@ -104,7 +121,7 @@ class GrpcProxyCallerRequestIdTest {
 					"the proxy must forward the caller's request id unchanged");
 			assertEquals(1, counter.get(), "the resent merge was applied twice");
 
-			stub.merge(merge(null));
+			stub.merge(merge(profile, timeoutNanos, null));
 			assertEquals(3, seen.size());
 			assertEquals(PROXY_SESSION, seen.get(2).session(), "a write the caller did not number is numbered by the proxy");
 			assertEquals(2, counter.get());
@@ -123,10 +140,10 @@ class GrpcProxyCallerRequestIdTest {
 		}
 	}
 
-	private static MergeRequest merge(ClientRequestId id) {
-		var context = RequestContext.newBuilder().setProfile(WorkloadProfile.LATENCY)
+	private static MergeRequest merge(WorkloadProfile profile, long timeoutNanos, ClientRequestId id) {
+		var context = RequestContext.newBuilder().setProfile(profile)
 				.setWorkloadContractVersion(RockserverCapabilities.REQUIRED_WORKLOAD_CONTRACT_VERSION)
-				.setTimeoutNanos(TimeUnit.SECONDS.toNanos(20));
+				.setTimeoutNanos(timeoutNanos);
 		if (id != null) {
 			context.setRequestId(id);
 		}
