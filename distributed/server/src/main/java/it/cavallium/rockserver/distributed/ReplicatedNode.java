@@ -1001,18 +1001,12 @@ public final class ReplicatedNode implements AutoCloseable {
 							+ " If no node of the cluster started without --join, nothing elects a leader: --join is only for a"
 							+ " node that joins a running cluster"
 					: "It is a member: it waits for the others to elect a leader";
-			case NOT_ADDED -> "It never was a voter (started with --join): run add-peer for it. If its add was abandoned,"
-					+ " or it was added and removed long ago, stop it and wipe its data directory: add-peer refuses a node"
-					+ " that has a log";
+			case NOT_ADDED -> NOT_ADDED_ADVICE;
 			case NO_COMMITTED_CONFIGURATION -> "No member answered with a committed configuration, and this node applied"
 					+ " none. If every node of a new cluster was started with --join, nothing elects a leader: --join is only"
 					+ " for a node that joins a running cluster. Otherwise start or repair the pending and unreachable"
 					+ " members: this node decides by itself once they answer";
-			case NO_MAJORITY -> "Start or repair the pending and unreachable members (also"
-					+ " members of a version without the Configuration method count as unreachable): this node decides by"
-					+ " itself once a majority of the new half of the newest committed configuration answer. If they are gone"
-					+ " for good, check with status on a member: if this node is not in its configuration, stop it, wipe its"
-					+ " data directory, start it with --join and run add-peer";
+			case NO_MAJORITY -> NO_MAJORITY_ADVICE;
 			case NEEDS_TERM -> "Members answered with a version that predates Configuration2, which does not tell terms"
 					+ " (its committed flag does not confirm a removal by itself), and the members of this version that"
 					+ " answered cannot make a majority of the new half of the newest committed configuration without"
@@ -1110,9 +1104,35 @@ public final class ReplicatedNode implements AutoCloseable {
 		}
 	}
 
-	private static final String REMOVED_ADVICE = "Take it out of its supervisor. To add it again, wipe its data"
-			+ " directory, start it with --join and run add-peer";
+	/**
+	 * What a removed node logs and prints with exit code 4 about what to do (see "Removed node" in runbooks.md). An id
+	 * comes back only at its old address (R52-2, R53-5): Ratis 3.3.1 keeps one connection per member id on every node,
+	 * made from the first address it knew and never replaced while the node runs.
+	 */
+	static final String REMOVED_ADVICE = "Take it out of its supervisor. To add it again, wipe its data"
+			+ " directory, start it with --join and run add-peer, at its old address: an id comes back only there (the"
+			+ " other nodes keep sending to the address they first knew for it); at another address, add a node under a"
+			+ " new id instead";
 
+	/**
+	 * What a node outside the cluster for {@link RemovalRule.Reason#NO_MAJORITY} logs about what to do; the same rule on
+	 * a reused id as {@link #REMOVED_ADVICE} (R53-5).
+	 */
+	static final String NO_MAJORITY_ADVICE = "Start or repair the pending and unreachable members (also"
+			+ " members of a version without the Configuration method count as unreachable): this node decides by"
+			+ " itself once a majority of the new half of the newest committed configuration answer. If they are gone"
+			+ " for good, check with status on a member: if this node is not in its configuration, stop it, wipe its"
+			+ " data directory, start it with --join and run add-peer, at its old address (at another one, add a node"
+			+ " under a new id instead)";
+
+	/**
+	 * What a node outside the cluster for {@link RemovalRule.Reason#NOT_ADDED} logs about what to do; the same rule on a
+	 * reused id as {@link #REMOVED_ADVICE} (R53-5 review).
+	 */
+	static final String NOT_ADDED_ADVICE = "It never was a voter (started with --join): run add-peer for it. If its add"
+			+ " was abandoned, or it was added and removed long ago, stop it and wipe its data directory: add-peer refuses"
+			+ " a node that has a log. An id that was removed comes back only at its old address (at another one, add a"
+			+ " node under a new id instead)";
 
 	/** Id to Raft address of every peer this node knows of: its startup list, then the peers of {@code conf}. */
 	private Map<String, String> memberAddresses(RaftConfiguration conf) {

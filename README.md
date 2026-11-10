@@ -248,7 +248,8 @@ leader changes meanwhile): replace a lost node with `remove-peer <old>` and then
 `add-peer <new>` and then `remove-peer <old>`. The `--peer` addresses of the members that stay are written into the
 new configuration, so `admin` refuses one that differs from the leader's configuration (a mistyped port) unless
 `--change-addresses` asks for it (on a call that adds or removes a voter: Ratis writes nothing for addresses alone,
-and `admin` refuses that); to move a member to another address, replace it under a new id. An id keeps its address:
+and `admin` refuses that; the running nodes started with `--join` keep the old address until a restart, see the
+runbooks); to move a member to another address, replace it under a new id. An id keeps its address:
 the running nodes keep reaching a member id at the address they first knew, so an id removed and added again at
 another address never catches up (a removed id comes back only wiped, with `--join`, at its old address). See "Replacing a node" in the
 [runbooks](docs/distributed/runbooks.md) and the [design document](docs/distributed/design.md). Run every replicated node with `-XX:+ExitOnOutOfMemoryError` (it refuses to start
@@ -269,7 +270,8 @@ with `admin status` and stop and wipe the node yourself): see "Removal and waiti
 "Removed node" in [runbooks.md](docs/distributed/runbooks.md). One that meets a database or log of a newer cluster
 version exits with 5: set `RestartPreventExitStatus=2 4 5` (2: wrong
 usage, or no `-XX:+ExitOnOutOfMemoryError`), `SuccessExitStatus=143` (the JVM's status after SIGTERM) and
-`TimeoutStopSec=150` (a stop can outlast systemd's default of 90 s) in its systemd unit (see "Exit codes" in
+`TimeoutStopSec=600` (a stop can outlast systemd's default of 90 s: the API server's close alone can take up to
+about 6 minutes with a client call that does not end) in its systemd unit (see "Exit codes" in
 [runbooks.md](docs/distributed/runbooks.md)). A replicated node flushes its memtables when all columns together
 reach `database.global.write-buffer-manager` (128 MiB by default): it replaces every column's `write-buffer-size`
 with that budget, because with atomic flush any flush writes every column (see "Memtables" in

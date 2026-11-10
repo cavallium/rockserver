@@ -329,11 +329,28 @@ final class CheckpointStorage implements StateMachineStorage {
 	 * without {@code snapshot.properties} or {@code installed.verified} but with Ratis' {@code .md5} files, which looks
 	 * like an installation that lost its position ({@link #findLatest} also copes with such a leftover from a version
 	 * before R52).
+	 *
+	 * <p>A snapshot whose name puts it past the latest one stays too (R53-1): it is an installed snapshot that Ratis
+	 * swapped in while a {@link #take} ran. Ratis 3.3.1 ends an install with {@code StateMachine.pause()}, then
+	 * {@code SnapshotManager.finalizeSnapshot} (the snapshot directory moved aside and the received one renamed into
+	 * its place, without this storage's monitor), then the reload, and {@code pause()} does not wait for a take on the
+	 * updater thread: the take moves its checkpoint into the installed directory, and deleting the installed snapshot
+	 * there left the reload with the replica's own older one while Ratis had purged its log up to the installed index,
+	 * a replica that stopped applying without an error. {@link #reload} then finds the installed snapshot, and the
+	 * next take after it deletes the checkpoint the racing take left. At the start no usable snapshot is past the
+	 * latest ({@link #findLatest} picks the furthest, and fails on a damaged one past it).</p>
 	 */
 	private void deleteUnusedSnapshots(@Nullable Path previous) throws IOException {
 		long now = nanoClock.getAsLong();
+		long latestIndex = latest == null ? Long.MAX_VALUE : latest.getIndex();
 		for (Path dir : snapshotDirs(snapshotsDir)) {
 			if (dir.equals(latestDir) || dir.equals(previous)) {
+				continue;
+			}
+			TermIndex named = namedTermIndex(dir);
+			if (named != null && named.getIndex() > latestIndex) {
+				LOG.warn("Keeping snapshot {}, past the latest one {}: an install swapped it in while a snapshot was"
+						+ " taken, the reload after the install loads it", dir, latestDir);
 				continue;
 			}
 			Snapshot snapshot = listed.get(dir);

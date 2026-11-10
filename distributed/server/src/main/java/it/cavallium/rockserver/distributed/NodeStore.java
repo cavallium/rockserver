@@ -1393,13 +1393,13 @@ final class NodeStore implements Closeable {
 		refuseTargetAmongNodeDirectories(dbDir, stateMachineDir, target);
 		// NOFOLLOW_LINKS: a symbolic link to nothing is refused too, as the copy would be written where it points (R34-2).
 		if (Files.exists(target, LinkOption.NOFOLLOW_LINKS)) {
-			throw new IOException("The target " + target + " already exists");
+			throw new IOException("The target " + target + " already exists" + leftConfigNote(target));
 		}
 		// The checkpoint builds in <target>.tmp: one that exists is not this run's, and stays (R34 review 3).
 		Path building = target.resolveSibling(target.getFileName() + ".tmp");
 		if (Files.exists(building, LinkOption.NOFOLLOW_LINKS)) {
 			throw new IOException("The target's temporary directory " + building + " already exists: remove it or choose"
-					+ " another target");
+					+ " another target" + leftConfigNote(target));
 		}
 		// R33-1: a restore that a crash interrupted during its swap may have left no db/ (between its two renames, or
 		// before the parent's fsync), with the complete newer database in <db>.restore-ready: the open below finishes
@@ -1520,6 +1520,23 @@ final class NodeStore implements Closeable {
 		} catch (java.nio.channels.OverlappingFileLockException e) {
 			return null;
 		}
+	}
+
+	/**
+	 * For the refusals of an existing target or {@code <target>.tmp}: names the copy's config file when one is next to
+	 * the target (R53-6). An export killed (SIGKILL, an OOM exit, a power loss) leaves it with them, as it is deleted
+	 * only in {@code finally}; it holds the resolved Rockserver config with its secrets (owner-only). A rerun to the same
+	 * target replaces and deletes it, another target leaves it for good, and nothing else can find it later (the
+	 * export's target is not known at a start), so the refusal tells the operator. It is left as it is, like the
+	 * directories the refusal names.
+	 */
+	private static String leftConfigNote(Path target) {
+		Path config = replicaConfigFile(target);
+		if (!Files.exists(config, LinkOption.NOFOLLOW_LINKS)) {
+			return "";
+		}
+		return "; " + config + " is the copy's config that a killed export left (the resolved Rockserver config, with"
+				+ " its secrets): delete it with them, or export to this target again, which replaces and deletes it";
 	}
 
 	/** {@link #exportSeed(Path, Path, Path, Path, boolean)} once the node is known to be stopped, as far as it can be. */

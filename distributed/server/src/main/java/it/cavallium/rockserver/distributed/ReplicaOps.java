@@ -141,6 +141,11 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 	private final NodeMetrics.Series matches;
 	private final ScheduledExecutorService worker;
 	private final Path resultsFile;
+	/**
+	 * The results file ended without a {@code \n} at the start (a torn append): the next {@link #persist} begins with
+	 * one, so that its line does not merge into the torn one and get rejected with it at the next start (R53-3 review).
+	 */
+	private boolean resultsFileTorn;
 	private final Map<Long, Result> checksums = new ConcurrentHashMap<>();
 	/** By log index of the backup entry. */
 	private final Map<Long, BackupResult> backups = new ConcurrentHashMap<>();
@@ -844,14 +849,49 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 	}
 
 	/** Appends one line to the results file, so that a restarted node still answers about its past results. */
-	private synchronized void persist(String line) {
+	synchronized void persist(String line) {
 		try {
 			Files.createDirectories(resultsFile.getParent());
-			Files.writeString(resultsFile, Instant.now() + " " + line + "\n", StandardCharsets.UTF_8,
-					StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+			Files.writeString(resultsFile, (resultsFileTorn ? "\n" : "") + Instant.now() + " " + line + "\n",
+					StandardCharsets.UTF_8, StandardOpenOption.CREATE, StandardOpenOption.APPEND);
+			resultsFileTorn = false;
 		} catch (IOException ex) {
 			LOG.warn("{}: failed to write {}: {}", config.nodeId(), resultsFile, ex.toString());
 		}
+	}
+
+	/**
+	 * The lines of {@code file} that are valid UTF-8, the others skipped and counted in {@code skipped} (R53-3): an append
+	 * cut by a full disk or a power loss can end inside a multi-byte character (a non-ASCII data directory in a
+	 * {@code DONE} line, an exception's text in a {@code FAILED} one), and {@code Files.readAllLines} then threw for the
+	 * whole file, so no line loaded at any start until the file was moved by hand. The file is a cache
+	 * ({@code backup.properties} is the record of a backup, {@code checksum-schedule} the schedule's fallback): a
+	 * damaged line costs only its own result, also a torn last line, since {@link #persist} starts the next line after
+	 * it on a line of its own ({@code torn} is set when the file does not end in {@code \n}).
+	 */
+	static List<String> readValidLines(Path file, java.util.concurrent.atomic.AtomicInteger skipped,
+			java.util.concurrent.atomic.AtomicBoolean torn) throws IOException {
+		byte[] bytes = Files.readAllBytes(file);
+		torn.set(bytes.length > 0 && bytes[bytes.length - 1] != '\n');
+		var lines = new ArrayList<String>();
+		var decoder = StandardCharsets.UTF_8.newDecoder()
+				.onMalformedInput(java.nio.charset.CodingErrorAction.REPORT)
+				.onUnmappableCharacter(java.nio.charset.CodingErrorAction.REPORT);
+		int start = 0;
+		while (start < bytes.length) {
+			int end = start;
+			while (end < bytes.length && bytes[end] != '\n') {
+				end++;
+			}
+			int stop = end > start && bytes[end - 1] == '\r' ? end - 1 : end;
+			try {
+				lines.add(decoder.decode(java.nio.ByteBuffer.wrap(bytes, start, stop - start)).toString());
+			} catch (java.nio.charset.CharacterCodingException malformed) {
+				skipped.incrementAndGet();
+			}
+			start = end + 1;
+		}
+		return lines;
 	}
 
 	private void loadResults() {
@@ -859,7 +899,15 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 			return;
 		}
 		try {
-			for (String line : Files.readAllLines(resultsFile, StandardCharsets.UTF_8)) {
+			var skipped = new java.util.concurrent.atomic.AtomicInteger();
+			var torn = new java.util.concurrent.atomic.AtomicBoolean();
+			var lines = readValidLines(resultsFile, skipped, torn);
+			resultsFileTorn = torn.get();
+			if (skipped.get() > 0) {
+				LOG.warn("{}: skipped {} line(s) of {} that are not valid UTF-8 (an append cut by a full disk or a crash):"
+						+ " the results they held are forgotten", config.nodeId(), skipped.get(), resultsFile);
+			}
+			for (String line : lines) {
 				var parts = line.split(" ", 6);
 				if (parts.length < 6) {
 					continue;

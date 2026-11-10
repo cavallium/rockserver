@@ -417,6 +417,61 @@ class CheckpointStorageTest {
 		assertEquals(Set.of(), fileNames(restarted.getTmpDir().toPath()));
 	}
 
+	/**
+	 * R53-1: a follower's snapshot whose checkpoint was built before Ratis swapped in an installed snapshot directory
+	 * ({@code SnapshotManager.finalizeSnapshot} after {@code pause()}, which does not wait for a running take) moves into
+	 * the installed directory and must not delete the installed snapshot, which is newer than it: the reload after the
+	 * install then finds the installed one. Before, {@code deleteUnusedSnapshots} deleted it (neither the latest nor the
+	 * previous one), the reload found the follower's own older snapshot, and the replica kept its database while Ratis
+	 * had purged the log up to the installed index: a silent stall.
+	 */
+	@Test
+	void aSnapshotTakenWhileAnInstallSwapsTheDirectoryKeepsTheInstalledOne() throws IOException {
+		var leader = initStorage(tempDir.resolve("leader"), RaftStorage.StartupOption.FORMAT);
+		var follower = initStorage(tempDir.resolve("follower"), RaftStorage.StartupOption.FORMAT);
+		put(store, column, 1, "local");
+		setApplied(store, TermIndex.valueOf(1, 10));
+		follower.take(store);
+		put(store, column, 7, "installed");
+		setApplied(store, TermIndex.valueOf(4, 40));
+		leader.take(store);
+		var installed = leader.getLatestSnapshot();
+		setApplied(store, TermIndex.valueOf(2, 20));
+		var realHalt = CrashPoints.halt;
+		// The hook: once the follower's checkpoint is built, the install's last chunk swaps the snapshot directory.
+		CrashPoints.halt = code -> {
+			try {
+				install(leader, installed, follower);
+			} catch (IOException e) {
+				throw new java.io.UncheckedIOException(e);
+			}
+		};
+		try {
+			CrashPoints.arm(CrashPoints.Point.SNAPSHOT_BUILT, 0);
+			follower.take(store);
+		} finally {
+			CrashPoints.disarm();
+			CrashPoints.halt = realHalt;
+		}
+		Path snapshotsDir = follower.getSnapshotDir().toPath();
+		assertTrue(fileNames(snapshotsDir).contains("snapshot-4-40"), "the installed snapshot stays: "
+				+ fileNames(snapshotsDir));
+
+		follower.reload();
+		assertEquals(TermIndex.valueOf(4, 40), follower.getLatestSnapshot().getTermIndex());
+		Path restored = tempDir.resolve("restored");
+		NodeStore.restore(follower.snapshotDbDir(), restored);
+		try (var restoredStore = NodeStore.open(restored, null, "restored")) {
+			assertEquals(TermIndex.valueOf(4, 40), restoredStore.applied());
+		}
+		// The next snapshot after the install deletes what the racing take left.
+		setApplied(store, TermIndex.valueOf(4, 50));
+		follower.take(store);
+		setApplied(store, TermIndex.valueOf(4, 60));
+		follower.take(store);
+		assertEquals(Set.of("snapshot-4-50", "snapshot-4-60"), fileNames(snapshotsDir));
+	}
+
 	/** What the replaced {@link CrashPoints#halt} throws, in place of halting the JVM. */
 	private static final class HaltedForTest extends RuntimeException {
 	}

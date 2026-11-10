@@ -174,6 +174,37 @@ class SnapshotByBytesTest {
 		assertEquals(taken, stateMachine.getLatestSnapshot().getIndex());
 	}
 
+	/**
+	 * R53-1: once Ratis paused the state machine for the end of a snapshot install ({@code pause()}, then the swap of
+	 * the snapshot directory and the reload), a snapshot Ratis' updater asks for answers "none taken" and makes no
+	 * checkpoint: it would run beside the swap. It is taken again once the install made the state machine running.
+	 */
+	@Test
+	void noSnapshotWhileThePauseOfAnInstallLasts() throws Exception {
+		cluster = new InProcessCluster(temp, 1, c -> c.withSnapshotEveryEntries(1_000_000)).startAll();
+		var leader = cluster.awaitLeader(TIMEOUT);
+		var api = leader.connection().getSyncApi(RequestContext.batch(Duration.ofSeconds(20)));
+		long column = api.createColumn("c", ColumnSchema.of(IntList.of(Long.BYTES), ObjectList.of(), true));
+		api.put(0, column, new Keys(Buf.wrap(ByteBuffer.allocate(Long.BYTES).putLong(1).array())),
+				Buf.wrap(new byte[16]), RequestType.none());
+		var stateMachine = leader.stateMachine();
+		InProcessCluster.await(TIMEOUT, () -> stateMachine.handedOverForTesting() >= stateMachine.appliedIndex().get());
+		long attempts = stateMachine.snapshotAttempts.get();
+
+		stateMachine.pause();
+		try {
+			assertEquals(RaftLog.INVALID_LOG_INDEX, stateMachine.takeSnapshot(), "no snapshot while paused");
+			assertEquals(attempts, stateMachine.snapshotAttempts.get(), "no checkpoint started");
+			assertNull(stateMachine.getLatestSnapshot());
+		} finally {
+			// As reinitialize does after an install.
+			stateMachine.getLifeCycle().startAndTransition(() -> {
+			});
+		}
+		assertTrue(stateMachine.takeSnapshot() >= 0, "taken again once running");
+		assertEquals(attempts + 1, stateMachine.snapshotAttempts.get());
+	}
+
 	@Test
 	void logBytesBetweenCountsTheSegmentsInTheRange() throws Exception {
 		var dir = Files.createDirectory(temp.resolve("log"));
