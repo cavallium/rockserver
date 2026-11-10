@@ -299,10 +299,9 @@ class CommandLineTest {
 				"--change-addresses"));
 		assertEquals(0, changed.code(), changed.toString());
 		assertTrue(changed.out().strip().endsWith("OK"), changed.out());
-		assertTrue(changed.out().contains("--change-addresses: this change also moves " + staying
-				+ " in the configuration (the record only:"), changed.out());
-		assertTrue(changed.out().contains("restart every running node started with --join, one at a time"),
-				changed.out());
+		assertTrue(changed.out().contains("--change-addresses: this change also moves " + staying + " ("), changed.out());
+		assertTrue(changed.out().contains("this fixes the record only: once it prints OK, restart every running node"
+				+ " started with --join, one at a time"), changed.out());
 		assertVoters(survivors);
 		assertEquals(respelled.raftAddress(), voterAddress(staying));
 

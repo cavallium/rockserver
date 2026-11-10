@@ -742,8 +742,19 @@ public final class ReplicatedServerMain {
 							.toList(), unsafe, changeAddresses, timeout, deadline);
 				}
 				case "snapshot" -> {
-					var api = client.getSnapshotManagementApi(RaftPeerId.valueOf(peerId(command)));
-					yield attempt(timeout, () -> api.create(timeout.toMillis()));
+					var member = peerId(command);
+					var api = client.getSnapshotManagementApi(RaftPeerId.valueOf(member));
+					var taken = attempt(timeout, () -> api.create(timeout.toMillis()));
+					if (taken.isSuccess()) {
+						// R54-3: Ratis answers success with the index the state machine returned, -1 when it took none.
+						if (taken.getLogIndex() < 0) {
+							fail(member + " took no snapshot (" + NO_SNAPSHOT_REASONS + "): run it again in a while; see"
+									+ " \"Exit codes\" in docs/distributed/runbooks.md");
+						}
+						System.out.println(member + " took a snapshot at log index " + taken.getLogIndex()
+								+ " (or holds one there already)");
+					}
+					yield taken;
 				}
 				case "checksum" -> {
 					if (command.size() != 1) {
@@ -978,6 +989,14 @@ public final class ReplicatedServerMain {
 		return ReplicaOps.provesNotProposed(status);
 	}
 
+	/**
+	 * Why a member answers a snapshot request with log index -1 (R54-3): {@code RockserverStateMachine.takeSnapshot}
+	 * takes none in its retry backoff after a failed snapshot, while its database is past what Ratis handed over after
+	 * a start (R48-1), and while its state machine is not running (the end of a snapshot install, R53-1).
+	 */
+	static final String NO_SNAPSHOT_REASONS = "it is in its retry backoff after a failed snapshot, still replaying its"
+			+ " log after a start, or installing a snapshot";
+
 	/** Exit code of {@code checksum} and {@code backup} when a member gave no final result, or no usable one. */
 	static final int EXIT_INCOMPLETE = 4;
 
@@ -1176,7 +1195,10 @@ public final class ReplicatedServerMain {
 				var moved = VoterChange.addressChanges(current.servers(), target);
 				if (!moved.isEmpty()) {
 					refuseAddressChanges(moved, changeAddresses, change.size() == 0);
-					System.out.println(CHANGE_ADDRESSES + ": this change also moves " + String.join(", ", moved));
+					System.out.println(CHANGE_ADDRESSES + ": this change also moves " + String.join(", ", moved)
+							+ "; this fixes the record only: once it prints OK, restart every running node started with --join,"
+							+ " one at a time (\"One voter per change\" in docs/distributed/runbooks.md); until then they keep"
+							+ " the old address");
 				}
 				if (!change.safe()) {
 					if (!unsafe) {
@@ -1325,12 +1347,15 @@ public final class ReplicatedServerMain {
 	private static void refuseAddressChanges(List<String> moved, boolean changeAddresses, boolean noVoterChange) {
 		if (!changeAddresses) {
 			fail("refused: --peer gives members that stay another address than the leader's configuration: "
-					+ String.join(", ", moved) + ". The change writes the --peer address of every member that"
-					+ " stays into the configuration, which the nodes use once they restart. Fix --peer to the"
-					+ " addresses of the configuration; to move a member, add-peer a node under a new id at the new"
-					+ " address and remove-peer the old id (the running nodes keep the address they know for an id),"
-					+ " or pass " + CHANGE_ADDRESSES + " to write the --peer addresses. Nothing was proposed. See"
-					+ " \"Replacing a node\" in docs/distributed/runbooks.md");
+					+ String.join(", ", moved) + ". The change would write the --peer address of every member that"
+					+ " stays into the configuration, which admin and the nodes started with --join read. Nothing was"
+					+ " proposed. Fix --peer to the addresses of the configuration. A member does not move under its id"
+					+ " (the running nodes keep the address they know for an id): to move one, add-peer a node under a"
+					+ " new id at the new address and remove-peer the old id (\"Replacing a node\" in"
+					+ " docs/distributed/runbooks.md). Pass " + CHANGE_ADDRESSES + " only when the configuration itself"
+					+ " records a wrong address of a member that stays, on a call that adds or removes a voter: it never"
+					+ " moves a member, and every running node started with --join keeps the old address until it is"
+					+ " restarted, one at a time (\"One voter per change\" in docs/distributed/runbooks.md)");
 		}
 		if (noVoterChange) {
 			fail("refused: " + CHANGE_ADDRESSES + " on a call that adds and removes no voter: Ratis takes a"
@@ -1388,6 +1413,20 @@ public final class ReplicatedServerMain {
 	 * that, instead of holding the others for the admin time limit, as the shared client's retries until the deadline
 	 * did (R27-1). Status is what the runbooks tell to look at exactly when members are down.
 	 */
+	/**
+	 * The member's applied and commit index, from its own log info (R54-4): the restart of a node started with
+	 * {@code --join} after a {@code --change-addresses} call waits until its applied index reaches the configuration
+	 * entry, since the restart reads the last configuration it applied. Empty when the answer carries none.
+	 */
+	static String logInfo(GroupInfoReply info) {
+		var log = info.getLogInfoProto();
+		if (log == null || !log.hasApplied()) {
+			return "";
+		}
+		return ", applied index " + log.getApplied().getIndex()
+				+ (log.hasCommitted() ? ", commit index " + log.getCommitted().getIndex() : "");
+	}
+
 	private static void printStatus(List<PeerConfig> peers, RaftGroupId groupId) throws InterruptedException {
 		var executor = Executors.newVirtualThreadPerTaskExecutor();
 		var infoClient = infoClient(peers, groupId);
@@ -1395,7 +1434,8 @@ public final class ReplicatedServerMain {
 			var asked = peers.stream().map(peer -> CompletableFuture.supplyAsync(() -> {
 				try {
 					var info = infoClient.getGroupManagementApi(RaftPeerId.valueOf(peer.id())).info(groupId);
-					return peer.id() + ": " + info.getRoleInfoProto().getRole() + ", commit infos " + info.getCommitInfos();
+					return peer.id() + ": " + info.getRoleInfoProto().getRole() + logInfo(info) + ", commit infos "
+							+ info.getCommitInfos();
 				} catch (IOException | RuntimeException ex) {
 					return peer.id() + ": unreachable (" + ex.getMessage() + ")";
 				}

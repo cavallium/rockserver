@@ -142,10 +142,17 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 	private final ScheduledExecutorService worker;
 	private final Path resultsFile;
 	/**
-	 * The results file ended without a {@code \n} at the start (a torn append): the next {@link #persist} begins with
-	 * one, so that its line does not merge into the torn one and get rejected with it at the next start (R53-3 review).
+	 * The results file may end without a {@code \n} (an append torn at a start whose torn tail could not be cut off, or
+	 * an append that failed while the node runs, R54-1): the next {@link #persist} begins with one, so that its line
+	 * does not merge into the torn one and get rejected with it at the next start (R53-3 review).
 	 */
 	private boolean resultsFileTorn;
+	/**
+	 * The results file holds a checked line ({@link #checkedLine}, R54-2): from then on a line without a valid check is
+	 * a cut or damaged one and is rejected. The first {@link #persist} of a file without one writes {@link #FORMAT_LINE}
+	 * first, so that every line after it is checked, also when that first append is cut.
+	 */
+	private boolean resultsFileChecked;
 	private final Map<Long, Result> checksums = new ConcurrentHashMap<>();
 	/** By log index of the backup entry. */
 	private final Map<Long, BackupResult> backups = new ConcurrentHashMap<>();
@@ -854,11 +861,36 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 	 */
 	volatile java.util.function.@Nullable ToIntFunction<String> cutNextAppendForTesting;
 
-	/** Appends one line to the results file, so that a restarted node still answers about its past results. */
+	/** The content of the line that the first append of this version to a results file writes (R54-2). */
+	private static final String FORMAT_LINE = "format checked";
+	/** A checked line: its time, its content, and {@code " #"} with the CRC-32 of the content in 8 hex digits. */
+	private static final java.util.regex.Pattern CHECKED_LINE =
+			java.util.regex.Pattern.compile("(\\S+) (.*) #([0-9a-f]{8})");
+
+	/** The line of the results file for {@code content} written at {@code time}, with its check (R54-2). */
+	static String checkedLine(String time, String content) {
+		return time + " " + content + " #" + crc(content);
+	}
+
+	private static String crc(String content) {
+		var crc = new java.util.zip.CRC32();
+		crc.update(content.getBytes(StandardCharsets.UTF_8));
+		return String.format("%08x", crc.getValue());
+	}
+
+	/**
+	 * Appends one line to the results file, so that a restarted node still answers about its past results. The line
+	 * ends with a check of its content ({@link #checkedLine}), so that a line cut short (by a power loss, the file is
+	 * not synced, or a full disk) is told from a whole one wherever it ends up in the file (R54-2). An append that
+	 * fails may have written part of its line (a short write cut by ENOSPC or EIO while the node keeps running), so the
+	 * next one starts on a new line (R54-1).
+	 */
 	synchronized void persist(String line) {
 		try {
 			Files.createDirectories(resultsFile.getParent());
-			var record = (resultsFileTorn ? "\n" : "") + Instant.now() + " " + line + "\n";
+			var time = Instant.now().toString();
+			var record = (resultsFileTorn ? "\n" : "") + (resultsFileChecked ? "" : checkedLine(time, FORMAT_LINE) + "\n")
+					+ checkedLine(time, line) + "\n";
 			byte[] bytes = record.getBytes(StandardCharsets.UTF_8);
 			var cut = cutNextAppendForTesting;
 			cutNextAppendForTesting = null;
@@ -870,19 +902,23 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 				out.write(bytes);
 			}
 			resultsFileTorn = false;
+			resultsFileChecked = true;
 		} catch (IOException ex) {
+			// Part of the record may be in the file (R54-1): the next append starts on a line of its own.
+			resultsFileTorn = true;
 			LOG.warn("{}: failed to write {}: {}", config.nodeId(), resultsFile, ex.toString());
 		}
 	}
 
 	/**
-	 * The lines of {@code file} that are valid UTF-8, the others skipped and counted in {@code skipped} (R53-3): an append
-	 * cut by a full disk or a power loss can end inside a multi-byte character (a non-ASCII data directory in a
-	 * {@code DONE} line, an exception's text in a {@code FAILED} one), and {@code Files.readAllLines} then threw for the
-	 * whole file, so no line loaded at any start until the file was moved by hand. The file is a cache
+	 * The whole lines of {@code file} that are valid UTF-8, the others skipped and counted in {@code skipped} (R53-3):
+	 * an append cut by a full disk or a power loss can end inside a multi-byte character (a non-ASCII data directory in
+	 * a {@code DONE} line, an exception's text in a {@code FAILED} one), and {@code Files.readAllLines} then threw for
+	 * the whole file, so no line loaded at any start until the file was moved by hand. A last line without its
+	 * {@code \n} is torn: it is not returned, also when it decodes (R54-2: cut inside its last field it parsed as a
+	 * {@code DONE} result with a cut digest or directory), and {@code torn} is set. The file is a cache
 	 * ({@code backup.properties} is the record of a backup, {@code checksum-schedule} the schedule's fallback): a
-	 * damaged line costs only its own result, also a torn last line, since {@link #persist} starts the next line after
-	 * it on a line of its own ({@code torn} is set when the file does not end in {@code \n}).
+	 * damaged line costs only its own result; see {@link #loadResults} for the lines cut elsewhere.
 	 */
 	static List<String> readValidLines(Path file, java.util.concurrent.atomic.AtomicInteger skipped,
 			java.util.concurrent.atomic.AtomicBoolean torn) throws IOException {
@@ -898,6 +934,10 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 			while (end < bytes.length && bytes[end] != '\n') {
 				end++;
 			}
+			if (end == bytes.length) {
+				// The torn last line.
+				break;
+			}
 			int stop = end > start && bytes[end - 1] == '\r' ? end - 1 : end;
 			try {
 				lines.add(decoder.decode(java.nio.ByteBuffer.wrap(bytes, start, stop - start)).toString());
@@ -909,6 +949,30 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 		return lines;
 	}
 
+	/**
+	 * Cuts the torn last line off the results file (R54-2), so that the next append does not make it a middle line,
+	 * which a file without checked lines would load at a later start. Returns false if it could not.
+	 */
+	private boolean cutTornTail() {
+		try (var channel = java.nio.channels.FileChannel.open(resultsFile, StandardOpenOption.READ,
+				StandardOpenOption.WRITE)) {
+			long size = channel.size();
+			var one = ByteBuffer.allocate(1);
+			for (long at = size - 1; at >= 0; at--) {
+				one.clear();
+				if (channel.read(one, at) == 1 && one.get(0) == '\n') {
+					channel.truncate(at + 1);
+					return true;
+				}
+			}
+			channel.truncate(0);
+			return true;
+		} catch (IOException ex) {
+			LOG.warn("{}: failed to cut the torn last line of {}: {}", config.nodeId(), resultsFile, ex.toString());
+			return false;
+		}
+	}
+
 	private void loadResults() {
 		if (!Files.isRegularFile(resultsFile)) {
 			return;
@@ -917,12 +981,33 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 			var skipped = new java.util.concurrent.atomic.AtomicInteger();
 			var torn = new java.util.concurrent.atomic.AtomicBoolean();
 			var lines = readValidLines(resultsFile, skipped, torn);
-			resultsFileTorn = torn.get();
-			if (skipped.get() > 0) {
-				LOG.warn("{}: skipped {} line(s) of {} that are not valid UTF-8 (an append cut by a full disk or a crash):"
-						+ " the results they held are forgotten", config.nodeId(), skipped.get(), resultsFile);
+			if (torn.get()) {
+				LOG.warn("{}: the last line of {} is torn (an append cut by a full disk or a crash): the result it held is"
+						+ " forgotten", config.nodeId(), resultsFile);
+				resultsFileTorn = !cutTornTail();
 			}
-			for (String line : lines) {
+			int damaged = 0;
+			for (String text : lines) {
+				if (text.isEmpty()) {
+					continue;
+				}
+				String line;
+				var checked = CHECKED_LINE.matcher(text);
+				if (checked.matches()) {
+					if (!crc(checked.group(2)).equals(checked.group(3))) {
+						damaged++;
+						continue;
+					}
+					resultsFileChecked = true;
+					line = checked.group(1) + " " + checked.group(2);
+				} else if (resultsFileChecked) {
+					// After a checked line every line of this version is checked: this one was cut short.
+					damaged++;
+					continue;
+				} else {
+					// A line of a version before R54-2, which wrote no check.
+					line = text;
+				}
 				var parts = line.split(" ", 6);
 				if (parts.length < 6) {
 					continue;
@@ -950,8 +1035,13 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 						default -> {}
 					}
 				} catch (IllegalArgumentException malformed) {
-					// A line cut by a crash.
+					// A line of an older version cut by a crash.
 				}
+			}
+			if (skipped.get() + damaged > 0) {
+				LOG.warn("{}: skipped {} line(s) of {} that are not valid UTF-8 or fail their check (an append cut by a full"
+						+ " disk or a crash): the results they held are forgotten", config.nodeId(), skipped.get() + damaged,
+						resultsFile);
 			}
 		} catch (IOException ex) {
 			LOG.warn("{}: failed to read {}: {}", config.nodeId(), resultsFile, ex.toString());
