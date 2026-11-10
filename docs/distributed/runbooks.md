@@ -218,7 +218,8 @@ Failure branches:
   `db/`, its `db.restore-*` directories and `raft/`: `export-seed` refuses one inside them (also through a symbolic
   link, a dangling one too, and `DATA-DIR/db` itself when it is missing) with `a directory of the node being exported`,
   before it touches anything (R34-2). It builds the copy in `NEW.tmp` and refuses a `NEW.tmp` that already exists
-  (`The target's temporary directory ... already exists`) rather than delete it: remove it, or choose another target. It can also have `db/` behind that snapshot: `export-seed` verifies the snapshot and restores it into `db/` first, as a start of the
+  (`The target's temporary directory ... already exists`) rather than delete it: remove it, or choose another target
+(then also delete the `rockserver-replica-for-<name>.conf` next to it that the refusal names, if any: see "Backups"). It can also have `db/` behind that snapshot: `export-seed` verifies the snapshot and restores it into `db/` first, as a start of the
   node would, and its output then says `its database was behind its snapshot at index N, restored first`. If the
   crash damaged that snapshot, `export-seed` exits 1 with `Not exported: The replica's latest snapshot ... (at index N)
   is damaged`, the database's index, and writes nothing: that replica may have applied entries up to N that its `db/`
@@ -296,8 +297,13 @@ not help while their `--peer` gives the old address, which they read first, and 
 leader go there too. A removed id comes back only at its old address ("Removed node"). Only when the configuration
 itself holds a wrong address of a member that stays (written by an `admin` without this check, say), pass
 `--change-addresses` to an `add-peer` or `remove-peer` call that adds or removes a voter and whose `--peer` gives the
-right one: it prints `--change-addresses: this change also moves ...` and writes the `--peer` addresses. That fixes
-the record only (for `--join` nodes and `admin`); the running nodes already use the address of their `--peer`. Ratis
+right one: it prints `--change-addresses: this change also moves ...` and writes the `--peer` addresses. For a
+node started without `--join` that fixes the record only: it already uses the address of its `--peer`. A node
+started with `--join` takes its addresses from the configuration it first applies and keeps them while it runs, so
+every running node started with `--join` (the one this same `add-peer` adds included) still sends to the old address
+(R53-4). Once the call printed `OK`, restart those nodes one at a time: each one when `status` shows it caught up
+with the leader (its log then holds the fixed configuration, which the restart reads), and the next one only when it
+is back and caught up again. Ratis
 writes nothing for a configuration whose voters do not change, so `admin` refuses `--change-addresses` on a call
 that adds and removes no voter (a re-run of a `remove-peer`, or an `add-peer` of a voter already) with exit code 1: `FAILED: refused:
 --change-addresses on a call that adds and removes no voter ... Nothing was written.` Wait for the next replacement
@@ -356,9 +362,12 @@ A node on which the backup failed (a full disk, say) deletes what it had written
 attempt, and can be deleted. A backup of that name that existed already is never touched by the failure of another
 one. `export-seed` likewise leaves neither its target nor `<target>.tmp` when it fails. Its target appears only
 complete, without the old cluster's metadata: an export killed before its last rename (OOM, SIGKILL, power loss)
-leaves only `<target>.tmp`, which a rerun refuses (`The target's temporary directory ... already exists`): delete
+leaves `<target>.tmp`, which a rerun refuses (`The target's temporary directory ... already exists`): delete
 `<target>.tmp` and run the export again. An export killed after it leaves a complete target but printed no applied
-index: delete that target too and export again.
+index: delete that target too and export again. Either kill also leaves the copy's config next to the target,
+`rockserver-replica-for-<target name>.conf` (owner-only, the resolved Rockserver config with its secrets, such as the
+InfluxDB token and the `${?ENV}` values) (R53-6): both refusals name it when it is there. A rerun to the same target
+replaces and deletes it; if you export to another target instead, delete it by hand with `<target>.tmp`.
 
 Then, for each backup:
 
@@ -637,7 +646,7 @@ StartLimitBurst=5
 Restart=on-failure
 RestartPreventExitStatus=2 4 5
 SuccessExitStatus=143
-TimeoutStopSec=150
+TimeoutStopSec=600
 ```
 
 A restart on 4 or 5 is what those codes exist to prevent: the node would refuse to start again, or start a version
@@ -651,14 +660,28 @@ start takes a few seconds (the JVM, opening the database) never reaches; 5 in 5 
 that fails with 3 over and over, which needs an operator too.
 
 `SuccessExitStatus=143` is there because the JVM, not `run`, chooses the status of a stop by signal (below): without
-it, every `systemctl stop` leaves the unit "failed". `TimeoutStopSec=150` is there because a stop can outlast
+it, every `systemctl stop` leaves the unit "failed". `TimeoutStopSec=600` is there because a stop can outlast
 systemd's default of 90 s. The shutdown hook hands over leadership (up to 5 s for the transfer and 3 s for the
-successor's commit), then closes the node in place: the apply thread finishes its entry, its completer gets up to a
-minute, and the database closes (with its flush). When another thread had already started the close (a replica
-failure racing the signal), the hook waits up to 2 minutes for it. A stop past `TimeoutStopSec` gets SIGKILL, exit
-137, and the unit is "failed" whatever `SuccessExitStatus` says; for the node that is a crash (it replays its log at
-the next start), not a loss. 150 s covers the waits the node bounds itself; a database close slower than that is a
-disk problem to look at.
+successor's commit), then closes the node in place. First the API server (R53-2): its gRPC transport waits for the
+calls in flight up to `shutdown-graceful-timeout-ms` (1 minute), then cancels them and waits up to
+`shutdown-forced-timeout-ms` (1 minute); the writes it accepted get up to `scheduler-shutdown-timeout-ms`
+(2 minutes), its event loop 5 s, and its scheduler up to `scheduler-shutdown-timeout-ms` again. Then the apply thread
+finishes its entry, its completer gets up to a minute, and the database closes (with its flush; up to a minute more
+when it is closing on another thread). When another thread had already started the close (a replica failure racing
+the signal), the hook waits up to 2 minutes for it instead. A stop past `TimeoutStopSec` gets SIGKILL, exit 137, and
+the unit is "failed" whatever `SuccessExitStatus` says; for the node that is a crash (it replays its log at the next
+start), not a loss.
+
+The API server's close normally takes well under a second. It reaches its bounds only with a call that does not end:
+a client stream without a deadline holds the graceful minute and is then cancelled, and the two scheduler waits last
+only for writes or closes held up by the disk. With the defaults the waits the node bounds itself add up to about
+8 s + 6 min 5 s + 2 min, a little over 8 minutes, so 600 s leaves room for the database's flush; a stop slower than
+that is a disk problem to look at. To stop faster, lower the three properties with `-D` in the JVM options (for example
+`-Dit.cavallium.rockserver.grpc.server.shutdown-graceful-timeout-ms=10000`, and likewise
+`it.cavallium.rockserver.grpc.server.shutdown-forced-timeout-ms` and
+`it.cavallium.rockserver.grpc.server.scheduler-shutdown-timeout-ms`) and set `TimeoutStopSec` to at least
+8 s + graceful + forced + 2 × scheduler + 5 s + 2 min, plus the flush. A lower graceful wait cuts client streams
+sooner at a planned stop: they fail over to another node either way.
 
 | Code | `run` | `admin` | `repair-log` | `export-seed`, `restore-backup` |
 |---|---|---|---|---|
