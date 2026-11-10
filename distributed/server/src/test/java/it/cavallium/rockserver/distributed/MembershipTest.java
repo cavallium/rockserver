@@ -270,6 +270,28 @@ class MembershipTest {
 		// 3 when Ratis closes its Raft server (NOT_IN_CONF), 4 when its check while it hears no leader comes first (R11).
 		int code = cluster.awaitExit(removed, TIMEOUT);
 		assertTrue(code == 3 || code == 4, () -> code + "\n" + cluster.logTail(removed));
+
+		// Review of R59, 2: re-runs of the removal, with every member or with the others in --peer, and a remove-peer of
+		// an id that is not a voter, print OK and propose nothing: the leader receives no other setConfiguration.
+		var survivors = List.of("1", "2", "3").stream().filter(id -> !id.equals(removed)).toList();
+		var leader = leaderOf(survivors);
+		long received = setConfigurationsReceived(leader);
+		assertTrue(received >= 1, () -> "no setConfiguration logged by " + leader + ":\n" + cluster.logTail(leader));
+		for (var peerIds : List.of(List.of("1", "2", "3"), survivors)) {
+			var again = cluster.admin(peerIds, "remove-peer", removed);
+			assertOk(again);
+			assertTrue(again.contains(removed + " is not a voter: nothing to remove"), again);
+		}
+		var unknown = cluster.admin(survivors, "remove-peer", "9");
+		assertOk(unknown);
+		assertTrue(unknown.contains("9 is not a voter: nothing to remove"), unknown);
+		assertEquals(leader, leaderOf(survivors), "leadership moved during the re-runs");
+		assertEquals(received, setConfigurationsReceived(leader), () -> cluster.logTail(leader));
+	}
+
+	/** How many {@code setConfiguration} requests Ratis logged as received on node {@code id}, over all its starts. */
+	private long setConfigurationsReceived(String id) {
+		return cluster.output(id).lines().filter(line -> line.contains("receive setConfiguration")).count();
 	}
 
 	/**
@@ -421,6 +443,10 @@ class MembershipTest {
 				return leaderOf(List.of("4")).equals("4");
 			} catch (IOException e) {
 				throw new UncheckedIOException(e);
+			} catch (AssertionError notYet) {
+				// Review of R59, 3: leaderOf fails while 4 is still a FOLLOWER of its own group (before its election
+				// timeout), which this waits for; it failed the test twice in a row once the nodes logged more.
+				return false;
 			}
 		});
 		InProcessCluster.await(TIMEOUT, () -> {
@@ -586,8 +612,17 @@ class MembershipTest {
 		return root.resolve("rockserver.conf");
 	}
 
+	/**
+	 * Review of R59, 2: Ratis logs {@code receive setConfiguration} at INFO, on logger {@code RaftServer$Division}, first in
+	 * {@code RaftServerImpl.setConfigurationAsync} (before it finds that a configuration with the same voters needs no
+	 * entry). The nodes' WARN default hid it, so the checks for its absence passed whatever was proposed.
+	 */
+	private static final String LOG_SET_CONFIGURATION =
+			"-Dorg.slf4j.simpleLogger.log.org.apache.ratis.server.RaftServer$Division=info";
+
 	private void startAll(List<String> ids) throws IOException {
 		for (var id : ids) {
+			cluster.setJvmOptions(id, List.of(LOG_SET_CONFIGURATION));
 			cluster.start(id);
 		}
 		cluster.waitReady(READY_TIMEOUT);

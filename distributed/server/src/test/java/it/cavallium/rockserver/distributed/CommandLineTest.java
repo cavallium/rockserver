@@ -754,17 +754,24 @@ class CommandLineTest {
 		assertTrue(typo.out().contains("likely a typo of " + removed), typo.out());
 		assertTrue(typo.out().contains("Nothing was proposed"), typo.out());
 		assertTrue(!typo.out().strip().endsWith("OK"), typo.out());
+		// Review of R59, 2: changeVoters, the only caller of setConfiguration for remove-peer, prints this line before it
+		// proposes; assertVoters alone cannot tell a no-op proposal (Ratis writes nothing for the same voters) from none.
+		assertTrue(!typo.out().contains("this change adds"), typo.out());
 		assertVoters(all);
 
 		var unknown = run(admin(all, "remove-peer", "n9"));
 		assertEquals(0, unknown.code(), unknown.toString());
 		assertTrue(unknown.out().contains("n9 is not a voter: nothing to remove (voters [n0, n1, n2])"), unknown.out());
 		assertTrue(unknown.out().strip().endsWith("OK"), unknown.out());
+		assertTrue(!unknown.out().contains("this change adds"), unknown.out());
 		assertVoters(all);
 
 		var remove = run(admin(all, "remove-peer", removed));
 		assertEquals(0, remove.code(), remove.toString());
 		assertTrue(!remove.out().contains("is not a voter"), remove.out());
+		// Review of R59, 1: the removing call prints the voters read before its proposal, the removed id among them.
+		assertTrue(remove.out().contains("voters " + all + "; this change adds [] and removes [" + removed + "]"),
+				remove.out());
 		assertTrue(remove.out().strip().endsWith("OK"), remove.out());
 		var survivors = new ArrayList<>(all);
 		survivors.remove(removed);
@@ -777,8 +784,32 @@ class CommandLineTest {
 			assertTrue(again.out().contains(removed + " is not a voter: nothing to remove (voters " + survivors + ")"),
 					again.out());
 			assertTrue(again.out().strip().endsWith("OK"), again.out());
+			assertTrue(!again.out().contains("this change adds"), again.out());
 			assertVoters(survivors);
 		}
+	}
+
+	/**
+	 * Review of R59, 2: a {@code --peer} that misses a voter, with {@code remove-peer} of an id that is not a voter,
+	 * proposes nothing. Before R59-1 the target was {@code --peer} minus the id, so the call proposed removing the voter
+	 * missing from {@code --peer} (one voter, a safe change) and printed OK.
+	 */
+	@Test
+	void adminRemovePeerOfANonVoterWithAVoterMissingFromPeerProposesNothing() throws Exception {
+		cluster = new InProcessCluster(Files.createDirectories(temp.resolve("not-a-voter-short-peer")), 3, c -> c)
+				.startAll();
+		cluster.awaitLeader(TIMEOUT);
+		var all = List.of("n0", "n1", "n2");
+		var missing = cluster.anyFollower().config().nodeId();
+		var given = new ArrayList<>(all);
+		given.remove(missing);
+
+		var result = run(admin(given, "remove-peer", "n9"));
+		assertEquals(0, result.code(), result.toString());
+		assertTrue(result.out().contains("n9 is not a voter: nothing to remove (voters " + all + ")"), result.out());
+		assertTrue(!result.out().contains("this change adds"), result.out());
+		assertTrue(result.out().strip().endsWith("OK"), result.out());
+		assertVoters(all);
 	}
 
 	/** {@link #admin} with member {@code replaced} given as {@code peer} instead of its own address. */
