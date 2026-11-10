@@ -915,13 +915,15 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 	 * an append cut by a full disk or a power loss can end inside a multi-byte character (a non-ASCII data directory in
 	 * a {@code DONE} line, an exception's text in a {@code FAILED} one), and {@code Files.readAllLines} then threw for
 	 * the whole file, so no line loaded at any start until the file was moved by hand. A last line without its
-	 * {@code \n} is torn: it is not returned, also when it decodes (R54-2: cut inside its last field it parsed as a
-	 * {@code DONE} result with a cut digest or directory), and {@code torn} is set. The file is a cache
+	 * {@code \n} is torn: it is not returned among the lines, also when it decodes (R54-2: cut inside its last field it
+	 * parsed as a {@code DONE} result with a cut digest or directory), {@code torn} is set, and {@code tornLast} gets
+	 * it when it decodes, for {@link #loadResults} to keep if its check proves it whole (review of R54, 2). The file is a cache
 	 * ({@code backup.properties} is the record of a backup, {@code checksum-schedule} the schedule's fallback): a
 	 * damaged line costs only its own result; see {@link #loadResults} for the lines cut elsewhere.
 	 */
 	static List<String> readValidLines(Path file, java.util.concurrent.atomic.AtomicInteger skipped,
-			java.util.concurrent.atomic.AtomicBoolean torn) throws IOException {
+			java.util.concurrent.atomic.AtomicBoolean torn,
+			java.util.concurrent.atomic.AtomicReference<@Nullable String> tornLast) throws IOException {
 		byte[] bytes = Files.readAllBytes(file);
 		torn.set(bytes.length > 0 && bytes[bytes.length - 1] != '\n');
 		var lines = new ArrayList<String>();
@@ -936,6 +938,11 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 			}
 			if (end == bytes.length) {
 				// The torn last line.
+				try {
+					tornLast.set(decoder.decode(java.nio.ByteBuffer.wrap(bytes, start, end - start)).toString());
+				} catch (java.nio.charset.CharacterCodingException malformed) {
+					// Cut inside a character: not whole.
+				}
 				break;
 			}
 			int stop = end > start && bytes[end - 1] == '\r' ? end - 1 : end;
@@ -980,11 +987,24 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 		try {
 			var skipped = new java.util.concurrent.atomic.AtomicInteger();
 			var torn = new java.util.concurrent.atomic.AtomicBoolean();
-			var lines = readValidLines(resultsFile, skipped, torn);
+			var tornLast = new java.util.concurrent.atomic.AtomicReference<@Nullable String>();
+			var lines = readValidLines(resultsFile, skipped, torn, tornLast);
 			if (torn.get()) {
-				LOG.warn("{}: the last line of {} is torn (an append cut by a full disk or a crash): the result it held is"
-						+ " forgotten", config.nodeId(), resultsFile);
-				resultsFileTorn = !cutTornTail();
+				var last = tornLast.get();
+				var checked = last == null ? null : CHECKED_LINE.matcher(last);
+				if (checked != null && checked.matches() && crc(checked.group(2)).equals(checked.group(3))) {
+					// Only its \n was lost, its check proves the rest whole (review of R54, 2): kept, and the next append
+					// starts with the \n.
+					LOG.info("{}: the last line of {} has no line end (an append cut by a full disk or a crash right before"
+							+ " it); its check verifies, so it is kept", config.nodeId(), resultsFile);
+					lines = new ArrayList<>(lines);
+					lines.add(last);
+					resultsFileTorn = true;
+				} else {
+					LOG.warn("{}: the last line of {} is torn (an append cut by a full disk or a crash): the result it held"
+							+ " is forgotten", config.nodeId(), resultsFile);
+					resultsFileTorn = !cutTornTail();
+				}
 			}
 			int damaged = 0;
 			for (String text : lines) {

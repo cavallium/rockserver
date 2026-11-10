@@ -418,6 +418,35 @@ class ReplicaOpsTest {
 	}
 
 	/**
+	 * R54 review 2: a last line that lost only its {@code \n} (a power loss or a full disk cut the append right before
+	 * it) but whose check verifies is whole, so it loads, and the next append starts on a line of its own; a last line
+	 * whose check fails or is cut is still not loaded.
+	 */
+	@Test
+	void aCheckedLastLineThatLostOnlyItsNewlineLoads() throws Exception {
+		var config = NodeConfig.defaults("n0", List.of(new PeerConfig("n0", "127.0.0.1", 1, "127.0.0.1", 2)), temp);
+		var file = temp.resolve("replica-ops.log");
+		try (var ops = new ReplicaOps(config, null, new NodeMetrics("n0"))) {
+			ops.persist("checksum 7 DONE 3 " + DIGEST);
+			ops.persist("checksum 8 DONE 3 " + DIGEST);
+		}
+		var bytes = Files.readAllBytes(file);
+		Files.write(file, java.util.Arrays.copyOf(bytes, bytes.length - 1));
+		try (var ops = new ReplicaOps(config, null, new NodeMetrics("n0"))) {
+			assertEquals(List.of(7L, 8L), checksumIndexes(ops));
+			ops.persist("checksum 9 DONE 4 " + DIGEST);
+		}
+		try (var ops = new ReplicaOps(config, null, new NodeMetrics("n0"))) {
+			assertEquals(List.of(7L, 8L, 9L), checksumIndexes(ops));
+		}
+		bytes = Files.readAllBytes(file);
+		Files.write(file, java.util.Arrays.copyOf(bytes, bytes.length - 2));
+		try (var ops = new ReplicaOps(config, null, new NodeMetrics("n0"))) {
+			assertEquals(List.of(7L, 8L), checksumIndexes(ops));
+		}
+	}
+
+	/**
 	 * R54-2: a line this version wrote ends with a check of its content, so a line cut anywhere (a cut that a later
 	 * append made a middle line, a page of a power loss) or changed is rejected wherever it is in the file, while the
 	 * lines around it load. Lines of an older version, which have no check, still load before the first checked line.

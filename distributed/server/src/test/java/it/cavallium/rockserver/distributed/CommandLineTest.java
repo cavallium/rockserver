@@ -310,6 +310,19 @@ class CommandLineTest {
 	}
 
 	/**
+	 * Review of R54, 3: Ratis answers a snapshot request with success and the latest snapshot's index, 0 when there is
+	 * none, on a member that applied less than the creation gap past it: on a member that applied nothing past index 0
+	 * that is no snapshot, as is -1 (R54-3); a positive index is one.
+	 */
+	@Test
+	void aSnapshotReplyAtIndexZeroOrBelowIsNoSnapshot() {
+		assertEquals(ReplicatedServerMain.NO_SNAPSHOT_REASONS, ReplicatedServerMain.noSnapshotReason(-1));
+		assertEquals(ReplicatedServerMain.NOTHING_APPLIED_REASON, ReplicatedServerMain.noSnapshotReason(0));
+		assertEquals(null, ReplicatedServerMain.noSnapshotReason(1));
+		assertEquals(null, ReplicatedServerMain.noSnapshotReason(42));
+	}
+
+	/**
 	 * R54-3: {@code admin snapshot} reports a member that took no snapshot (a reply with log index -1: here its state
 	 * machine paused, as at the end of a snapshot install; also its retry backoff, or a database past what Ratis handed
 	 * over after a start) as {@code FAILED}, exit code 1, instead of {@code OK}; once the member takes one, it prints its

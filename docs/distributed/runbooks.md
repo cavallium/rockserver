@@ -306,13 +306,13 @@ node started without `--join` that fixes the record only: it already uses the ad
 started with `--join` takes its addresses from the configuration it first applies and keeps them while it runs, so
 every running node started with `--join` (the one this same `add-peer` adds included) still sends to the old address
 (R53-4). Once the call printed `OK`, run `status` and note the leader's `commit index`: the configuration entry is
-at or below it. Then restart those nodes one at a time, each one only when `status` shows its `applied index` at or
-past that number, and the next one only when the restarted node is back and its `applied index` has reached the
-leader's commit index again. A commit index that caught up is not enough: a restarted node reads the last
-configuration it applied (`raft-meta.conf`, which Ratis rewrites only when it applies a configuration entry) before
-its log, so a node with an apply backlog (`rockserver-apply-lag`) restarted at that moment builds its connections from
-the old configuration again (R54-4). If a node was restarted too early, restart it once more after its applied index
-passed the number. Ratis
+at or below it. Then restart those nodes one at a time, each one only when `status` shows its own `commit index` at
+or past that number (its `applied index` there is enough too, it is never past the commit index), and the next one
+only when the restarted node is back and its `commit index` has reached the leader's again. A node's commit index
+never passes the end of its own log, so its log then holds the configuration entry, and a restart loads every
+configuration entry of the log past the snapshot after `raft-meta.conf` (Ratis 3.3.1 `ServerState.initRaftLog`), so
+an apply backlog does not matter (review of R54, 1). If a node was restarted before its commit index reached the
+number, restart it once more after it did. Ratis
 writes nothing for a configuration whose voters do not change, so `admin` refuses `--change-addresses` on a call
 that adds and removes no voter (a re-run of a `remove-peer`, or an `add-peer` of a voter already) with exit code 1: `FAILED: refused:
 --change-addresses on a call that adds and removes no voter ... Nothing was written.` Wait for the next replacement

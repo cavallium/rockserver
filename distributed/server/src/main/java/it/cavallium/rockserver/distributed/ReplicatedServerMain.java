@@ -748,9 +748,9 @@ public final class ReplicatedServerMain {
 					var api = client.getSnapshotManagementApi(RaftPeerId.valueOf(member));
 					var taken = attempt(timeout, () -> api.create(timeout.toMillis()));
 					if (taken.isSuccess()) {
-						// R54-3: Ratis answers success with the index the state machine returned, -1 when it took none.
-						if (taken.getLogIndex() < 0) {
-							fail(member + " took no snapshot (" + NO_SNAPSHOT_REASONS + "): run it again in a while; see"
+						var none = noSnapshotReason(taken.getLogIndex());
+						if (none != null) {
+							fail(member + " took no snapshot (" + none + "): run it again in a while; see"
 									+ " \"Exit codes\" in docs/distributed/runbooks.md");
 						}
 						System.out.println(member + " took a snapshot at log index " + taken.getLogIndex()
@@ -998,6 +998,28 @@ public final class ReplicatedServerMain {
 	 */
 	static final String NO_SNAPSHOT_REASONS = "it is in its retry backoff after a failed snapshot, still replaying its"
 			+ " log after a start, or installing a snapshot";
+
+	/** Why a member whose state machine has applied nothing past the first configuration entry took no snapshot. */
+	static final String NOTHING_APPLIED_REASON = "it has applied nothing past log index 0, its group's first"
+			+ " configuration entry, so there is nothing to snapshot yet";
+
+	/**
+	 * Why the success reply of {@code admin snapshot} with {@code logIndex} means that the member took no snapshot and
+	 * holds none, or null when it took one or holds one there. Ratis 3.3.1 answers success with the index the state
+	 * machine returned, -1 when it took none (R54-3); and when the member applied less than the creation gap (1) past
+	 * its latest snapshot it answers that snapshot's index without asking, 0 when it has none: on a member that has
+	 * applied nothing past log index 0 that is no snapshot (review of R54, 3; this state machine takes none at index 0,
+	 * as Ratis asks it only one entry past the latest snapshot or index 0).
+	 */
+	static @Nullable String noSnapshotReason(long logIndex) {
+		if (logIndex < 0) {
+			return NO_SNAPSHOT_REASONS;
+		}
+		if (logIndex == 0) {
+			return NOTHING_APPLIED_REASON;
+		}
+		return null;
+	}
 
 	/** Exit code of {@code checksum} and {@code backup} when a member gave no final result, or no usable one. */
 	static final int EXIT_INCOMPLETE = 4;
@@ -1410,15 +1432,10 @@ public final class ReplicatedServerMain {
 	}
 
 	/**
-	 * Prints each member's role, applied and commit index ({@link #logInfo}) and commit infos, in the {@code --peer} order. The members are asked at once, each once
-	 * (no retry) and for at most {@link #PEER_ANSWER_TIMEOUT}: a dead or unroutable member prints "unreachable" after
-	 * that, instead of holding the others for the admin time limit, as the shared client's retries until the deadline
-	 * did (R27-1). Status is what the runbooks tell to look at exactly when members are down.
-	 */
-	/**
 	 * The member's applied and commit index, from its own log info (R54-4): the restart of a node started with
-	 * {@code --join} after a {@code --change-addresses} call waits until its applied index reaches the configuration
-	 * entry, since the restart reads the last configuration it applied. Empty when the answer carries none.
+	 * {@code --join} after a {@code --change-addresses} call waits until its commit index reaches the configuration
+	 * entry, as its log then holds the entry, which Ratis 3.3.1 loads at the restart after {@code raft-meta.conf} (review
+	 * of R54, 1). Empty when the answer carries none.
 	 */
 	static String logInfo(GroupInfoReply info) {
 		var log = info.getLogInfoProto();
@@ -1429,6 +1446,12 @@ public final class ReplicatedServerMain {
 				+ (log.hasCommitted() ? ", commit index " + log.getCommitted().getIndex() : "");
 	}
 
+	/**
+	 * Prints each member's role, applied and commit index ({@link #logInfo}) and commit infos, in the {@code --peer} order. The members are asked at once, each once
+	 * (no retry) and for at most {@link #PEER_ANSWER_TIMEOUT}: a dead or unroutable member prints "unreachable" after
+	 * that, instead of holding the others for the admin time limit, as the shared client's retries until the deadline
+	 * did (R27-1). Status is what the runbooks tell to look at exactly when members are down.
+	 */
 	private static void printStatus(List<PeerConfig> peers, RaftGroupId groupId) throws InterruptedException {
 		var executor = Executors.newVirtualThreadPerTaskExecutor();
 		var infoClient = infoClient(peers, groupId);

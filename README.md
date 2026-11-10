@@ -249,7 +249,7 @@ leader changes meanwhile): replace a lost node with `remove-peer <old>` and then
 new configuration, so `admin` refuses one that differs from the leader's configuration (a mistyped port) unless
 `--change-addresses` asks for it (on a call that adds or removes a voter: Ratis writes nothing for addresses alone,
 and `admin` refuses that; the running nodes started with `--join` keep the old address until a restart once their
-applied index in `admin status` passed the change, see the runbooks); to move a member to another address, replace it
+commit index in `admin status` passed the change, see the runbooks); to move a member to another address, replace it
 under a new id. An id keeps its address:
 the running nodes keep reaching a member id at the address they first knew, so an id removed and added again at
 another address never catches up (a removed id comes back only wiped, with `--join`, at its old address). See "Replacing a node" in the
