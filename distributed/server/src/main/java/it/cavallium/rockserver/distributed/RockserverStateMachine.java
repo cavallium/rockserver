@@ -1275,7 +1275,10 @@ final class RockserverStateMachine extends BaseStateMachine {
 			throw new IOException("Replica failed, not taking a snapshot");
 		}
 		if (getLifeCycleState() != LifeCycle.State.RUNNING) {
-			LOG.info("{}: not taking a snapshot while {} (an install)", config.nodeId(), getLifeCycleState());
+			// Ratis asks again after each entry while a snapshot is due, and a failed directory swap leaves the state
+			// machine PAUSED until a later chunk completes the install (R53-1 review): not worth a line each time.
+			LOG.debug("{}: not taking a snapshot while {} (an install, or one whose directory swap failed)",
+					config.nodeId(), getLifeCycleState());
 			return RaftLog.INVALID_LOG_INDEX;
 		}
 		if (snapshotBackoff.waiting(System.nanoTime())) {

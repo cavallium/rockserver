@@ -1131,7 +1131,8 @@ public final class ReplicatedNode implements AutoCloseable {
 	 */
 	static final String NOT_ADDED_ADVICE = "It never was a voter (started with --join): run add-peer for it. If its add"
 			+ " was abandoned, or it was added and removed long ago, stop it and wipe its data directory: add-peer refuses"
-			+ " a node that has a log";
+			+ " a node that has a log. An id that was removed comes back only at its old address (at another one, add a"
+			+ " node under a new id instead)";
 
 	/** Id to Raft address of every peer this node knows of: its startup list, then the peers of {@code conf}. */
 	private Map<String, String> memberAddresses(RaftConfiguration conf) {

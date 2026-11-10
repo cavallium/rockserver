@@ -219,7 +219,9 @@ Failure branches:
   link, a dangling one too, and `DATA-DIR/db` itself when it is missing) with `a directory of the node being exported`,
   before it touches anything (R34-2). It builds the copy in `NEW.tmp` and refuses a `NEW.tmp` that already exists
   (`The target's temporary directory ... already exists`) rather than delete it: remove it, or choose another target
-(then also delete the `rockserver-replica-for-<name>.conf` next to it that the refusal names, if any: see "Backups"). It can also have `db/` behind that snapshot: `export-seed` verifies the snapshot and restores it into `db/` first, as a start of the
+  (then also delete the `rockserver-replica-for-<name>.conf` next to it that the refusal names, if any: see
+  "Backups"). It can also have `db/` behind that snapshot: `export-seed` verifies the snapshot and restores it into
+  `db/` first, as a start of the
   node would, and its output then says `its database was behind its snapshot at index N, restored first`. If the
   crash damaged that snapshot, `export-seed` exits 1 with `Not exported: The replica's latest snapshot ... (at index N)
   is damaged`, the database's index, and writes nothing: that replica may have applied entries up to N that its `db/`
@@ -250,7 +252,7 @@ start, `starting, not known to be a member`, with `Membership <reason> (K* ..., 
 | `NEEDS_TERM` | The members that answered run a version without `Configuration2`: upgrade them. Their answers tell no terms, and their committed flag does not confirm a removal unless a member of this version (or the node itself) reports the same configuration committed. Until then judge with `status`, as above. |
 | `MEMBER_LATER_CONFIGURATION` | Clears by itself within seconds. If it lasts, the blocking members are stuck or were removed themselves: look at their logs and `status`. |
 | `OWN_LATER_CONFIGURATION` | Its own log holds a later configuration that includes it and may still commit: normally an `add-peer` of this node in flight (let it finish), or a configuration a leader appended just before it lost leadership, which clears once the next leader's configuration reaches this node. If it persists while a leader runs, check `status` on a member. |
-| `NOT_ADDED` | A `--join` node that never was a voter: run `add-peer`. If the add was abandoned, or the node was added and removed long ago, stop it and wipe its data directory (`add-peer` refuses a node that has a log). |
+| `NOT_ADDED` | A `--join` node that never was a voter: run `add-peer`. If the add was abandoned, or the node was added and removed long ago, stop it and wipe its data directory (`add-peer` refuses a node that has a log). A removed id comes back only at its old address (at another one, add it under a new id: see "One voter per change"). |
 | `INCONSISTENT` | A bug, or a data directory restored from elsewhere: wipe nothing, collect the logs of every node. |
 | `HEARD_LEADER` | A leader sent the node something during the check: it is a member again, or will be checked again. |
 | `MEMBER` (with `hears no leader`) | It is a member waiting for a leader; in Ratis' initializing state if it was started with `--join` and no node started without it. |
