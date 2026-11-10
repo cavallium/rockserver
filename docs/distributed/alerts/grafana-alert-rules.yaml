@@ -397,7 +397,7 @@ groups:
         execErrState: Error
         labels: {severity: warning, team: rockserver}
         annotations:
-          summary: "No snapshot for 24 hours while the Raft log holds more than 8 GiB: snapshots fail (see the node's log, and the disk space), so the log is not purged and a new member cannot catch up."
+          summary: "No snapshot for 24 hours (or none at all since the node started 24 hours ago: the age is then the node's uptime) while the Raft log holds more than 8 GiB: snapshots fail (see the node's log, and the disk space), so the log is not purged and a new member cannot catch up."
         data:
           - refId: A
             relativeTimeRange: {from: 3600, to: 0}
