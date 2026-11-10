@@ -313,6 +313,114 @@ class CheckpointStorageTest {
 		assertThrows(IOException.class, follower::reload);
 	}
 
+	/**
+	 * R52-1: a crash while an old installed snapshot is deleted. {@code NodeStore.deleteRecursively} deletes in reverse
+	 * path order, so {@code snapshot.properties.md5}, {@code snapshot.properties} and {@code installed.verified} go
+	 * before anything under {@code db/}, where Ratis' {@code .md5} side files stay: the leftover looks like an installed
+	 * snapshot that lost its position. It is older than the latest snapshot, which is whole, so the start goes on with
+	 * the latest and deletes the leftover instead of refusing to start.
+	 */
+	@Test
+	void anOldInstalledSnapshotPartlyDeletedByACrashIsDeletedAtTheStart() throws IOException {
+		var leader = initStorage(tempDir.resolve("leader"), RaftStorage.StartupOption.FORMAT);
+		put(store, column, 7, "installed");
+		setApplied(store, TermIndex.valueOf(4, 40));
+		leader.take(store);
+		Path followerRaftDir = tempDir.resolve("follower");
+		var follower = initStorage(followerRaftDir, RaftStorage.StartupOption.FORMAT);
+		install(leader, leader.getLatestSnapshot(), follower);
+		follower.reload();
+		setApplied(store, TermIndex.valueOf(5, 100));
+		follower.take(store);
+		Path snapshotsDir = follower.getSnapshotDir().toPath();
+		assertEquals(Set.of("snapshot-4-40", "snapshot-5-100"), fileNames(snapshotsDir));
+
+		Path old = snapshotsDir.resolve("snapshot-4-40");
+		Files.delete(old.resolve("snapshot.properties.md5"));
+		Files.delete(old.resolve("snapshot.properties"));
+		Files.delete(old.resolve("installed.verified"));
+		try (Stream<Path> walk = Files.walk(old.resolve("db"))) {
+			assertTrue(walk.anyMatch(file -> file.toString().endsWith(".md5")), "Ratis' side files are still there");
+		}
+		closeRaftStorages();
+
+		var restarted = initStorage(followerRaftDir, RaftStorage.StartupOption.RECOVER);
+		assertEquals(TermIndex.valueOf(5, 100), restarted.getLatestSnapshot().getTermIndex());
+		assertListsExactlyTheSnapshotFiles(restarted, restarted.getLatestSnapshot());
+		assertEquals(Set.of("snapshot-5-100"), fileNames(snapshotsDir));
+	}
+
+	/**
+	 * R52-1: an installed snapshot that lost its position stays fatal when it is the newest one, even with an older
+	 * whole snapshot next to it: the Raft log may start after the damaged one.
+	 */
+	@Test
+	void aDamagedInstalledSnapshotNewerThanAWholeOneStillFailsLoudly() throws IOException {
+		var leader = initStorage(tempDir.resolve("leader"), RaftStorage.StartupOption.FORMAT);
+		put(store, column, 7, "installed");
+		setApplied(store, TermIndex.valueOf(4, 40));
+		leader.take(store);
+		Path followerRaftDir = tempDir.resolve("follower");
+		var follower = initStorage(followerRaftDir, RaftStorage.StartupOption.FORMAT);
+		setApplied(store, TermIndex.valueOf(1, 5));
+		follower.take(store);
+		Path snapshotsDir = follower.getSnapshotDir().toPath();
+		install(leader, leader.getLatestSnapshot(), follower, file -> {
+		}, false);
+		Path aside = snapshotsDir.resolveSibling(snapshotsDir.getFileName() + ".tmp_installing");
+		Files.move(aside.resolve("snapshot-1-5"), snapshotsDir.resolve("snapshot-1-5"));
+		NodeStore.deleteRecursively(aside);
+		Path installed = snapshotsDir.resolve("snapshot-4-40");
+		Files.delete(installed.resolve("snapshot.properties"));
+		Files.delete(installed.resolve("snapshot.properties.md5"));
+		closeRaftStorages();
+
+		var failure = assertThrows(CheckpointStorage.DamagedSnapshotException.class,
+				() -> initStorage(followerRaftDir, RaftStorage.StartupOption.RECOVER));
+		assertTrue(failure.getMessage().contains("snapshot-4-40"), failure.getMessage());
+		assertTrue(Files.isDirectory(installed), "the damaged snapshot is kept for inspection");
+	}
+
+	/**
+	 * R52-1: an unused snapshot is moved out of {@code snapshots/} in one rename before its files are deleted, so a
+	 * crash during the delete never leaves part of one there; the start deletes what is left in {@code tmp/}.
+	 */
+	@Test
+	void anUnusedSnapshotLeavesTheSnapshotDirectoryWholeBeforeItsFilesAreDeleted() throws IOException {
+		Path raftDir = tempDir.resolve("raft");
+		var storage = initStorage(raftDir, RaftStorage.StartupOption.FORMAT);
+		Path snapshotsDir = storage.getSnapshotDir().toPath();
+		put(store, column, 1, "first");
+		setApplied(store, TermIndex.valueOf(1, 10));
+		storage.take(store);
+		setApplied(store, TermIndex.valueOf(2, 20));
+		storage.take(store);
+		setApplied(store, TermIndex.valueOf(2, 30));
+		var realHalt = CrashPoints.halt;
+		CrashPoints.halt = code -> {
+			throw new HaltedForTest();
+		};
+		try {
+			CrashPoints.arm(CrashPoints.Point.SNAPSHOT_DELETING, 0);
+			assertThrows(HaltedForTest.class, () -> storage.take(store));
+		} finally {
+			CrashPoints.disarm();
+			CrashPoints.halt = realHalt;
+		}
+		assertEquals(Set.of("snapshot-2-20", "snapshot-2-30"), fileNames(snapshotsDir));
+		closeRaftStorages();
+
+		var restarted = initStorage(raftDir, RaftStorage.StartupOption.RECOVER);
+		assertEquals(TermIndex.valueOf(2, 30), restarted.getLatestSnapshot().getTermIndex());
+		// A start keeps the latest snapshot only.
+		assertEquals(Set.of("snapshot-2-30"), fileNames(snapshotsDir));
+		assertEquals(Set.of(), fileNames(restarted.getTmpDir().toPath()));
+	}
+
+	/** What the replaced {@link CrashPoints#halt} throws, in place of halting the JVM. */
+	private static final class HaltedForTest extends RuntimeException {
+	}
+
 	@Test
 	void damagedInstallInterruptedBeforeTheOldSnapshotsWereDeletedFallsBackToThem() throws IOException {
 		var leader = initStorage(tempDir.resolve("leader"), RaftStorage.StartupOption.FORMAT);

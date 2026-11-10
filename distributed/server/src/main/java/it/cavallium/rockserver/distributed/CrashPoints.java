@@ -34,6 +34,11 @@ final class CrashPoints {
 		SNAPSHOT_BUILT,
 		/** A snapshot published in the snapshot directory, before Ratis learns of it (and can purge its log). */
 		SNAPSHOT_TAKEN,
+		/**
+		 * An unused snapshot moved out of the snapshot directory to be deleted, before any of its files is deleted
+		 * (R52-1).
+		 */
+		SNAPSHOT_DELETING,
 		/** A snapshot received from the leader, before this replica closes its database to load it. */
 		INSTALL_RECEIVED,
 		/** During the install of a received snapshot: the old database closed, the new one not restored yet. */

@@ -8,6 +8,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -45,7 +46,8 @@ import org.slf4j.LoggerFactory;
  * path is therefore never reused for different content, and a snapshot stays on disk while an installation may
  * still read it: {@link #take} keeps the previous snapshot, and also every older one whose file list was read
  * within the last {@link #DEFAULT_INSTALL_READ_LEASE} (an installation that read nothing for that long has timed
- * out). Other snapshots are deleted. A slow installation of a large database thus survives any number of newer
+ * out). Other snapshots are deleted, each renamed into {@code tmp/} first so that a crash during the delete leaves no part
+ * of one in {@code snapshots/} (R52-1). A slow installation of a large database thus survives any number of newer
  * snapshots, at the cost of the disk space of the table files that only its snapshot still links.</p>
  *
  * <p><b>Snapshots being received.</b> Ratis' installation writes the leader's files into
@@ -86,6 +88,11 @@ final class CheckpointStorage implements StateMachineStorage {
 	private static final String SNAPSHOT_PREFIX = "snapshot-";
 	/** Prefix of the directories Ratis receives snapshots into, under {@link #getTmpDir()}. */
 	private static final String INSTALL_PREFIX = "snapshot-";
+	/**
+	 * Prefix of an unused snapshot moved into {@link #getTmpDir()} to be deleted (R52-1); not {@link #INSTALL_PREFIX},
+	 * so {@link #discardFailedInstalls} leaves it alone, and {@link #init} deletes it with the rest of {@code tmp/}.
+	 */
+	private static final String DELETING_PREFIX = "deleting-";
 	private static final String DB_DIR = "db";
 	private static final String PROPERTIES_FILE = "snapshot.properties";
 	/** Prefix of the keys of {@link #PROPERTIES_FILE} that list the checkpoint's files with their sizes (R51-2). */
@@ -315,7 +322,14 @@ final class CheckpointStorage implements StateMachineStorage {
 		return snapshot;
 	}
 
-	/** Deletes every snapshot except the latest, {@code previous} and the ones an installation is reading. */
+	/**
+	 * Deletes every snapshot except the latest, {@code previous} and the ones an installation is reading. Each one is
+	 * first renamed into {@code tmp/} and the rename fsynced, then its files are deleted there (R52-1): a delete in place
+	 * goes in reverse path order, so a crash in the middle would leave in {@code snapshots/} an installed snapshot
+	 * without {@code snapshot.properties} or {@code installed.verified} but with Ratis' {@code .md5} files, which looks
+	 * like an installation that lost its position ({@link #findLatest} also copes with such a leftover from a version
+	 * before R52).
+	 */
 	private void deleteUnusedSnapshots(@Nullable Path previous) throws IOException {
 		long now = nanoClock.getAsLong();
 		for (Path dir : snapshotDirs(snapshotsDir)) {
@@ -327,8 +341,12 @@ final class CheckpointStorage implements StateMachineStorage {
 				LOG.info("Keeping snapshot {}: an installation is still reading it", dir);
 				continue;
 			}
-			NodeStore.deleteRecursively(dir);
+			Path deleting = tmpDir.resolve(DELETING_PREFIX + dir.getFileName() + "-" + System.nanoTime());
+			Files.move(dir, deleting, StandardCopyOption.ATOMIC_MOVE);
 			listed.remove(dir);
+			NodeStore.syncDirectory(snapshotsDir);
+			CrashPoints.reach(CrashPoints.Point.SNAPSHOT_DELETING);
+			NodeStore.deleteRecursively(deleting);
 		}
 	}
 
@@ -449,19 +467,58 @@ final class CheckpointStorage implements StateMachineStorage {
 	/**
 	 * The snapshot with the highest position among the snapshot directories in {@code parent}, verifying installed
 	 * snapshots first.
+	 *
+	 * <p>A damaged installed snapshot ({@link #verifyIfInstalled}) is fatal unless its directory name places it before a
+	 * usable snapshot (R52-1): then it is not needed (a newer whole snapshot was taken after it was installed, since an
+	 * installation replaces the whole snapshot directory) and is most likely the leftover of a delete that a crash
+	 * interrupted. It is logged and skipped, and {@link #deleteUnusedSnapshots} deletes it. A damaged snapshot at or
+	 * after the latest usable one, or one whose name tells no position, stays fatal: the Raft log may start after it.</p>
 	 */
 	private static @Nullable Path findLatest(Path parent) throws IOException {
 		Path best = null;
 		TermIndex bestTermIndex = null;
+		var damaged = new ArrayList<DamagedSnapshotException>();
 		for (Path dir : snapshotDirs(parent)) {
-			verifyIfInstalled(dir);
+			try {
+				verifyIfInstalled(dir);
+			} catch (DamagedSnapshotException damage) {
+				damaged.add(damage);
+				continue;
+			}
 			TermIndex termIndex = readTermIndex(dir);
 			if (termIndex != null && (bestTermIndex == null || termIndex.compareTo(bestTermIndex) > 0)) {
 				best = dir;
 				bestTermIndex = termIndex;
 			}
 		}
+		for (var damage : damaged) {
+			TermIndex named = namedTermIndex(damage.dir());
+			if (bestTermIndex == null || named == null || named.compareTo(bestTermIndex) >= 0) {
+				throw damage;
+			}
+		}
+		for (var damage : damaged) {
+			LOG.warn("Ignoring the snapshot {}, older than the latest snapshot {}: {} (the leftover of a delete interrupted"
+					+ " by a crash, most likely); it is deleted", damage.dir(), best, damage.reason());
+		}
 		return best;
+	}
+
+	/** The position in the name of a snapshot directory, {@code snapshot-<term>-<index>}, or null if it tells none. */
+	private static @Nullable TermIndex namedTermIndex(Path dir) {
+		String name = dir.getFileName().toString();
+		if (!name.startsWith(SNAPSHOT_PREFIX)) {
+			return null;
+		}
+		String[] parts = name.substring(SNAPSHOT_PREFIX.length()).split("-");
+		if (parts.length != 2) {
+			return null;
+		}
+		try {
+			return TermIndex.valueOf(Long.parseLong(parts[0]), Long.parseLong(parts[1]));
+		} catch (NumberFormatException e) {
+			return null;
+		}
 	}
 
 	private static List<Path> snapshotDirs(Path parent) throws IOException {
@@ -685,20 +742,8 @@ final class CheckpointStorage implements StateMachineStorage {
 		 * properties file may be what the crash damaged), or -1 if the name does not tell.
 		 */
 		long snapshotIndex() {
-			String name = dir.getFileName().toString();
-			if (!name.startsWith(SNAPSHOT_PREFIX)) {
-				return -1;
-			}
-			String[] parts = name.substring(SNAPSHOT_PREFIX.length()).split("-");
-			if (parts.length != 2) {
-				return -1;
-			}
-			try {
-				Long.parseLong(parts[0]);
-				return Long.parseLong(parts[1]);
-			} catch (NumberFormatException e) {
-				return -1;
-			}
+			TermIndex named = namedTermIndex(dir);
+			return named == null ? -1 : named.getIndex();
 		}
 	}
 }
