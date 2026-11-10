@@ -99,4 +99,19 @@ class VoterChangeTest {
 		var prioritized = RaftPeer.newBuilder(peer("3")).setPriority(5).build();
 		assertEquals(List.of(), VoterChange.addressChanges(current, List.of(peer("1"), peer("2"), prioritized)));
 	}
+
+	/**
+	 * R59-1: the voters whose id differs from a {@code remove-peer} id only by case, which {@code admin} refuses as a
+	 * likely typo (Ratis compares ids case-sensitively). An exact voter has none, even when another voter differs from
+	 * it only by case; an id that matches no voter in any case has none either (the re-run of a removal that committed).
+	 */
+	@Test
+	void theVotersThatDifferOnlyByCaseAreNamed() {
+		var current = peers("n1", "n2", "n3");
+		assertEquals(Set.of("n1"), VoterChange.caseVariants("N1", current));
+		assertEquals(Set.of(), VoterChange.caseVariants("n1", current));
+		assertEquals(Set.of(), VoterChange.caseVariants("n9", current));
+		assertEquals(Set.of(), VoterChange.caseVariants("N1", peers("n1", "N1", "n2")));
+		assertEquals(List.of("AB", "Ab"), List.copyOf(VoterChange.caseVariants("ab", peers("Ab", "AB", "abc"))));
+	}
 }

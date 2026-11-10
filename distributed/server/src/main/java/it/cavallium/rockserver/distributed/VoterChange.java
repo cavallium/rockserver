@@ -72,6 +72,20 @@ record VoterChange(SortedSet<String> added, SortedSet<String> removed) {
 	}
 
 	/**
+	 * R59-1: the voters of {@code currentServers} whose id differs from {@code id} only by case ({@code n1} for
+	 * {@code N1}), sorted; none if {@code id} is a voter itself. Ratis compares ids case-sensitively, so
+	 * {@code remove-peer N1} of the voter {@code n1} removes nothing: {@code admin} refuses it as a likely typo.
+	 */
+	static SortedSet<String> caseVariants(String id, Collection<RaftPeer> currentServers) {
+		var voters = ids(currentServers);
+		var variants = new TreeSet<String>();
+		if (!voters.contains(id)) {
+			voters.stream().filter(voter -> voter.equalsIgnoreCase(id)).forEach(variants::add);
+		}
+		return variants;
+	}
+
+	/**
 	 * R51-1: the members of {@code newServers} that are voters in {@code currentServers} too, at another address, each as
 	 * {@code id (at OLD in the configuration, NEW in --peer)}, in the order of {@code newServers}. Ratis writes the
 	 * address of every server of the new configuration as given, and a running leader keeps its connection to a member
