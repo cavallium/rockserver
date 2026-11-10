@@ -597,8 +597,8 @@ commit index of any member, so a member that is gone holds it back.
 1. `status`: a member that does not answer, or whose commit index stays behind.
 2. If it is gone for good, replace it (above), or remove it: `rs admin --peer <the others> remove-peer <id>`.
 3. If every member is there, check the snapshots: the alert `rockserver-snapshot-old` (its age is the time since the
-   node started when it has no snapshot at all, R60-3, so it fires a day after a start too; a restart starts that
-   count again) and the log (`snapshot taken`, or `snapshot failed`). A failing snapshot is usually a full disk. `rs admin $PEERS snapshot <id>` asks a member for
+   node started when it has no snapshot at all, R60-3, so it fires a day after a start too, with a log over 8 GiB;
+   a restart starts that count again) and the log (`snapshot taken`, or `snapshot failed`). A failing snapshot is usually a full disk. `rs admin $PEERS snapshot <id>` asks a member for
    one (`<id>` must be one of the `--peer` ids, spelled as there: another is refused as wrong usage, exit code 2, R58-2): it waits up to 2 minutes (or the time left of `--timeout-ms`) in one call, as long as the snapshot ends
    within the wait (R57-1: before, a snapshot slower than 2 s could run twice for one command, or end it with
    `FAILED` although the member took it; the request is still sent again after a broken connection or when Ratis

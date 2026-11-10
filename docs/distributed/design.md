@@ -5405,6 +5405,10 @@ install it (`apt-get install gcc libc6-dev`) and run with `-Drockserver.test.req
      value: Duplicate peer ids` before, also exit 2), and `admin` refuses a timeout above `Long.MAX_VALUE / 2` ns
      (about 146 years, so that the deadline stays comparable with `System.nanoTime`). Test:
      `CommandLineTest.adminRefusesUnknownOptionsAndMalformedValuesWithTwo` (red at `cab2ca5`).
+   - Review of R60, 1 (low, docs): runbooks "Raft log grows" step 3 said that without any snapshot
+     `rockserver-snapshot-old` fires a day after a start, leaving out the rule's other condition (a Raft log over
+     8 GiB, `$B > 86400 && $E > 8589934592`), which the alert table and the rule's summary state. It now says "a day
+     after a start too, with a log over 8 GiB". Docs only.
    - Review of R46, 1 (low, docs): the R46-2 recipe ran `dependency:build-classpath` on `distributed/server/pom.xml`
      alone, so Maven resolved `rockserver-core:${revision}` and that version's pom from `~/.m2` (or the snapshot
      repository): `grep -v /rockserver-core/` dropped the jar but kept the third-party jars of that pom, from whichever
