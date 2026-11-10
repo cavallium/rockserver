@@ -1096,13 +1096,30 @@ final class RockserverStateMachine extends BaseStateMachine {
 	private final AtomicBoolean snapshotByBytesPending =
 			new AtomicBoolean();
 	private final AtomicLong snapshotCalls = new AtomicLong();
-	private static final long SNAPSHOT_REQUEST_TIMEOUT_MS = 10L * 60 * 1000;
+	/** The longest timeout of the request {@link #snapshotByBytes} sends: the wait of {@code admin snapshot}. */
+	private static final long SNAPSHOT_BY_BYTES_MAX_REQUEST_TIMEOUT_MS = 120_000;
 	/** The shortest timeout of the request {@link #snapshotByBytes} sends; a seam for tests (R56-1). */
 	static volatile Duration snapshotByBytesMinRequestTimeout = Duration.ofSeconds(30);
+	/** The longest successful take since the start, in ns: see {@link #snapshotByBytesRequestTimeoutMillis}. */
+	private final AtomicLong slowestTakeNanos = new AtomicLong();
 
-	/** The timeout, in ms, of the request {@link #snapshotByBytes} sends (R56-1). */
+	/**
+	 * The timeout, in ms, of the request {@link #snapshotByBytes} sends (R56-1): twice the slowest take seen
+	 * ({@code slowestTakeNanos}), at least {@code min} (30 s), at most 2 minutes, the wait of {@code admin snapshot}.
+	 *
+	 * <p>Ratis 3.3.1 answers a request whose take threw only at the request's timeout: {@code StateMachineUpdater}
+	 * catches the IOException without {@code completeTakingSnapshot}, so the request stays pending, and every later
+	 * request on the member ({@code admin snapshot}, and the client's retries of it) joins it and runs no take
+	 * ({@code SnapshotManagementRequestHandler.takingSnapshotAsync} hands back the pending request's future, without
+	 * waking the updater or arming a timer). With the 10 minutes it had, one failed take of the byte trigger (a full
+	 * disk) made every {@code admin snapshot} for up to 10 minutes end with {@code took no snapshot within}, and kept
+	 * {@link #snapshotByBytesPending} set, although the backoff allows the next try after a minute at most. A timeout
+	 * that a take outlasts is harmless: the byte trigger logs a WARN and asks again after the next entries, and that
+	 * request is the one the running take completes.</p>
+	 */
 	static long snapshotByBytesRequestTimeoutMillis(Duration min, long slowestTakeNanos) {
-		return SNAPSHOT_REQUEST_TIMEOUT_MS;
+		long twice = TimeUnit.NANOSECONDS.toMillis(Math.min(slowestTakeNanos, Long.MAX_VALUE / 2) * 2);
+		return Math.min(SNAPSHOT_BY_BYTES_MAX_REQUEST_TIMEOUT_MS, Math.max(min.toMillis(), twice));
 	}
 
 	/**
@@ -1130,14 +1147,16 @@ final class RockserverStateMachine extends BaseStateMachine {
 		LOG.info("{}: {} bytes of log entries applied since the latest snapshot, taking one", config.nodeId(),
 				bytesSinceSnapshot.get());
 		try {
+			long timeoutMs = snapshotByBytesRequestTimeoutMillis(snapshotByBytesMinRequestTimeout, slowestTakeNanos.get());
 			var request = SnapshotManagementRequest.newCreate(
-					ClientId.randomId(), server.getId(), groupId, snapshotCalls.incrementAndGet(),
-					SNAPSHOT_REQUEST_TIMEOUT_MS);
+					ClientId.randomId(), server.getId(), groupId, snapshotCalls.incrementAndGet(), timeoutMs);
 			server.snapshotManagementAsync(request).whenComplete((reply, error) -> {
 				snapshotByBytesPending.set(false);
 				if (error != null || !reply.isSuccess()) {
-					LOG.warn("{}: the snapshot asked after {} bytes of log failed; asking again after the next entries",
-							config.nodeId(), config.snapshotEveryBytes(), error != null ? error : reply.getException());
+					// A failed take, one that outlasted the timeout, or a timer that an earlier request left in Ratis (R56-2).
+					LOG.warn("{}: the snapshot asked after {} bytes of log did not end within {} ms (see \"snapshot failed\""
+									+ " above, or a take still running); asking again after the next entries", config.nodeId(),
+							config.snapshotEveryBytes(), timeoutMs, error != null ? error : reply.getException());
 				}
 			});
 		} catch (RuntimeException ex) {
@@ -1323,6 +1342,7 @@ final class RockserverStateMachine extends BaseStateMachine {
 			CrashPoints.reach(CrashPoints.Point.SNAPSHOT_TAKEN);
 			bytesSinceSnapshot.addAndGet(-bytesBefore);
 			snapshotTime.since(start);
+			slowestTakeNanos.accumulateAndGet(System.nanoTime() - start, Math::max);
 			snapshotBackoff.succeeded();
 			LOG.info("{}: snapshot taken at {} in {} ms", config.nodeId(), position,
 					(System.nanoTime() - start) / 1_000_000);
