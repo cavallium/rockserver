@@ -248,14 +248,15 @@ leader changes meanwhile): replace a lost node with `remove-peer <old>` and then
 `add-peer <new>` and then `remove-peer <old>`. The `--peer` addresses of the members that stay are written into the
 new configuration, so `admin` refuses one that differs from the leader's configuration (a mistyped port) unless
 `--change-addresses` asks for it (on a call that adds or removes a voter: Ratis writes nothing for addresses alone,
-and `admin` refuses that; the running nodes started with `--join` keep the old address until a restart, see the
-runbooks); to move a member to another address, replace it under a new id. An id keeps its address:
+and `admin` refuses that; the running nodes started with `--join` keep the old address until a restart once their
+commit index in `admin status` passed the change, see the runbooks); to move a member to another address, replace it
+under a new id. An id keeps its address:
 the running nodes keep reaching a member id at the address they first knew, so an id removed and added again at
 another address never catches up (a removed id comes back only wiped, with `--join`, at its old address). See "Replacing a node" in the
 [runbooks](docs/distributed/runbooks.md) and the [design document](docs/distributed/design.md). Run every replicated node with `-XX:+ExitOnOutOfMemoryError` (it refuses to start
 without it) and preferably without `-Djava.io.tmpdir` (`run` extracts the RocksDB library into `DATA-DIR/tmp`, where
 it deletes the copies that killed runs leave, in either case), and see "Heap" there for the heap that a snapshot send
-needs. `admin status` asks the members at once and waits for their answers up to 3 s in all, so a member that is down
+needs. `admin status` prints each member's role, applied index and commit index; it asks the members at once and waits for their answers up to 3 s in all, so a member that is down
 prints `unreachable` without holding the others (closing its connections may take about 5 s more after the output);
 `admin checksum` and `admin backup` ask the members at once and propose through one that answers (within 3 s, or the
 time left of `--timeout-ms`), then ask every member for its result at once within the time left, and

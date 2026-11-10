@@ -143,7 +143,9 @@ import org.rocksdb.NativeLibraryLoader;
  * after that: see {@code status}, and run the command again. {@code add-peer} first reads the leader's configuration:
  * for a node that is a voter there at the same address it prints {@code OK} (a re-run) without asking the node. Else
  * it asks the new node what it holds, and refuses a node that does not run or that has a log of its own (after reading
- * the configuration again: a node that became a voter meanwhile is {@code OK}). {@code snapshot} makes a member take a snapshot now.</p>
+ * the configuration again: a node that became a voter meanwhile is {@code OK}). {@code snapshot} makes a member take a snapshot now, and fails with exit code 1 when it takes none (its retry
+ * backoff, a replay after a start, an install: Ratis answers that with success and log index -1, R54-3).
+ * {@code status} prints each member's role, applied and commit index (R54-4).</p>
  *
  * <p>{@code add-peer} and {@code remove-peer} build the new voters from {@code --peer} (plus or minus the one node), read
  * the leader's configuration (waiting while a change is under way), and refuse with exit code 1, before proposing
@@ -742,8 +744,19 @@ public final class ReplicatedServerMain {
 							.toList(), unsafe, changeAddresses, timeout, deadline);
 				}
 				case "snapshot" -> {
-					var api = client.getSnapshotManagementApi(RaftPeerId.valueOf(peerId(command)));
-					yield attempt(timeout, () -> api.create(timeout.toMillis()));
+					var member = peerId(command);
+					var api = client.getSnapshotManagementApi(RaftPeerId.valueOf(member));
+					var taken = attempt(timeout, () -> api.create(timeout.toMillis()));
+					if (taken.isSuccess()) {
+						var none = noSnapshotReason(taken.getLogIndex());
+						if (none != null) {
+							fail(member + " took no snapshot (" + none + "): run it again in a while; see"
+									+ " \"Exit codes\" in docs/distributed/runbooks.md");
+						}
+						System.out.println(member + " took a snapshot at log index " + taken.getLogIndex()
+								+ " (or holds one there already)");
+					}
+					yield taken;
 				}
 				case "checksum" -> {
 					if (command.size() != 1) {
@@ -978,6 +991,36 @@ public final class ReplicatedServerMain {
 		return ReplicaOps.provesNotProposed(status);
 	}
 
+	/**
+	 * Why a member answers a snapshot request with log index -1 (R54-3): {@code RockserverStateMachine.takeSnapshot}
+	 * takes none in its retry backoff after a failed snapshot, while its database is past what Ratis handed over after
+	 * a start (R48-1), and while its state machine is not running (the end of a snapshot install, R53-1).
+	 */
+	static final String NO_SNAPSHOT_REASONS = "it is in its retry backoff after a failed snapshot, still replaying its"
+			+ " log after a start, or installing a snapshot";
+
+	/** Why a member whose state machine has applied nothing past the first configuration entry took no snapshot. */
+	static final String NOTHING_APPLIED_REASON = "it has applied nothing past log index 0, its group's first"
+			+ " configuration entry, so there is nothing to snapshot yet";
+
+	/**
+	 * Why the success reply of {@code admin snapshot} with {@code logIndex} means that the member took no snapshot and
+	 * holds none, or null when it took one or holds one there. Ratis 3.3.1 answers success with the index the state
+	 * machine returned, -1 when it took none (R54-3); and when the member applied less than the creation gap (1) past
+	 * its latest snapshot it answers that snapshot's index without asking, 0 when it has none: on a member that has
+	 * applied nothing past log index 0 that is no snapshot (review of R54, 3; this state machine takes none at index 0,
+	 * as Ratis asks it only one entry past the latest snapshot or index 0).
+	 */
+	static @Nullable String noSnapshotReason(long logIndex) {
+		if (logIndex < 0) {
+			return NO_SNAPSHOT_REASONS;
+		}
+		if (logIndex == 0) {
+			return NOTHING_APPLIED_REASON;
+		}
+		return null;
+	}
+
 	/** Exit code of {@code checksum} and {@code backup} when a member gave no final result, or no usable one. */
 	static final int EXIT_INCOMPLETE = 4;
 
@@ -1176,7 +1219,10 @@ public final class ReplicatedServerMain {
 				var moved = VoterChange.addressChanges(current.servers(), target);
 				if (!moved.isEmpty()) {
 					refuseAddressChanges(moved, changeAddresses, change.size() == 0);
-					System.out.println(CHANGE_ADDRESSES + ": this change also moves " + String.join(", ", moved));
+					System.out.println(CHANGE_ADDRESSES + ": this change also moves " + String.join(", ", moved)
+							+ "; this fixes the record only: once it prints OK, restart every running node started with --join,"
+							+ " one at a time (\"One voter per change\" in docs/distributed/runbooks.md); until then they keep"
+							+ " the old address");
 				}
 				if (!change.safe()) {
 					if (!unsafe) {
@@ -1325,12 +1371,15 @@ public final class ReplicatedServerMain {
 	private static void refuseAddressChanges(List<String> moved, boolean changeAddresses, boolean noVoterChange) {
 		if (!changeAddresses) {
 			fail("refused: --peer gives members that stay another address than the leader's configuration: "
-					+ String.join(", ", moved) + ". The change writes the --peer address of every member that"
-					+ " stays into the configuration, which the nodes use once they restart. Fix --peer to the"
-					+ " addresses of the configuration; to move a member, add-peer a node under a new id at the new"
-					+ " address and remove-peer the old id (the running nodes keep the address they know for an id),"
-					+ " or pass " + CHANGE_ADDRESSES + " to write the --peer addresses. Nothing was proposed. See"
-					+ " \"Replacing a node\" in docs/distributed/runbooks.md");
+					+ String.join(", ", moved) + ". The change would write the --peer address of every member that"
+					+ " stays into the configuration, which admin and the nodes started with --join read. Nothing was"
+					+ " proposed. Fix --peer to the addresses of the configuration. A member does not move under its id"
+					+ " (the running nodes keep the address they know for an id): to move one, add-peer a node under a"
+					+ " new id at the new address and remove-peer the old id (\"Replacing a node\" in"
+					+ " docs/distributed/runbooks.md). Pass " + CHANGE_ADDRESSES + " only when the configuration itself"
+					+ " records a wrong address of a member that stays, on a call that adds or removes a voter: it never"
+					+ " moves a member, and every running node started with --join keeps the old address until it is"
+					+ " restarted, one at a time (\"One voter per change\" in docs/distributed/runbooks.md)");
 		}
 		if (noVoterChange) {
 			fail("refused: " + CHANGE_ADDRESSES + " on a call that adds and removes no voter: Ratis takes a"
@@ -1383,7 +1432,22 @@ public final class ReplicatedServerMain {
 	}
 
 	/**
-	 * Prints each member's role and commit infos, in the {@code --peer} order. The members are asked at once, each once
+	 * The member's applied and commit index, from its own log info (R54-4): the restart of a node started with
+	 * {@code --join} after a {@code --change-addresses} call waits until its commit index reaches the configuration
+	 * entry, as its log then holds the entry, which Ratis 3.3.1 loads at the restart after {@code raft-meta.conf} (review
+	 * of R54, 1). Empty when the answer carries none.
+	 */
+	static String logInfo(GroupInfoReply info) {
+		var log = info.getLogInfoProto();
+		if (log == null || !log.hasApplied()) {
+			return "";
+		}
+		return ", applied index " + log.getApplied().getIndex()
+				+ (log.hasCommitted() ? ", commit index " + log.getCommitted().getIndex() : "");
+	}
+
+	/**
+	 * Prints each member's role, applied and commit index ({@link #logInfo}) and commit infos, in the {@code --peer} order. The members are asked at once, each once
 	 * (no retry) and for at most {@link #PEER_ANSWER_TIMEOUT}: a dead or unroutable member prints "unreachable" after
 	 * that, instead of holding the others for the admin time limit, as the shared client's retries until the deadline
 	 * did (R27-1). Status is what the runbooks tell to look at exactly when members are down.
@@ -1395,7 +1459,8 @@ public final class ReplicatedServerMain {
 			var asked = peers.stream().map(peer -> CompletableFuture.supplyAsync(() -> {
 				try {
 					var info = infoClient.getGroupManagementApi(RaftPeerId.valueOf(peer.id())).info(groupId);
-					return peer.id() + ": " + info.getRoleInfoProto().getRole() + ", commit infos " + info.getCommitInfos();
+					return peer.id() + ": " + info.getRoleInfoProto().getRole() + logInfo(info) + ", commit infos "
+							+ info.getCommitInfos();
 				} catch (IOException | RuntimeException ex) {
 					return peer.id() + ": unreachable (" + ex.getMessage() + ")";
 				}

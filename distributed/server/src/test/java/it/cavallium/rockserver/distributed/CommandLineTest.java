@@ -285,6 +285,12 @@ class CommandLineTest {
 		assertTrue(refused.out().contains(staying + " (at " + self.raftAddress() + " in the configuration, "
 				+ mistyped.raftAddress() + " in --peer)"), refused.out());
 		assertTrue(refused.out().contains("--change-addresses"), refused.out());
+		// R54-5: the advice matches the runbook: a move is under a new id, the flag never moves a member, and the
+		// running nodes started with --join keep the old address until they are restarted one at a time.
+		assertTrue(!refused.out().contains("which the nodes use once they restart"), refused.out());
+		assertTrue(refused.out().contains("it never moves a member"), refused.out());
+		assertTrue(refused.out().contains("every running node started with --join keeps the old address"),
+				refused.out());
 		assertVoters(List.of("n0", "n1", "n2"));
 		assertEquals(self.raftAddress(), voterAddress(staying));
 
@@ -293,11 +299,70 @@ class CommandLineTest {
 				"--change-addresses"));
 		assertEquals(0, changed.code(), changed.toString());
 		assertTrue(changed.out().strip().endsWith("OK"), changed.out());
+		assertTrue(changed.out().contains("--change-addresses: this change also moves " + staying + " ("), changed.out());
+		assertTrue(changed.out().contains("this fixes the record only: once it prints OK, restart every running node"
+				+ " started with --join, one at a time"), changed.out());
 		assertVoters(survivors);
 		assertEquals(respelled.raftAddress(), voterAddress(staying));
 
 		var misplaced = run(with(List.of(admin(survivors, "status")), "--change-addresses"));
 		assertEquals(2, misplaced.code(), misplaced.toString());
+	}
+
+	/**
+	 * Review of R54, 3: Ratis answers a snapshot request with success and the latest snapshot's index, 0 when there is
+	 * none, on a member that applied less than the creation gap past it: on a member that applied nothing past index 0
+	 * that is no snapshot, as is -1 (R54-3); a positive index is one.
+	 */
+	@Test
+	void aSnapshotReplyAtIndexZeroOrBelowIsNoSnapshot() {
+		assertEquals(ReplicatedServerMain.NO_SNAPSHOT_REASONS, ReplicatedServerMain.noSnapshotReason(-1));
+		assertEquals(ReplicatedServerMain.NOTHING_APPLIED_REASON, ReplicatedServerMain.noSnapshotReason(0));
+		assertEquals(null, ReplicatedServerMain.noSnapshotReason(1));
+		assertEquals(null, ReplicatedServerMain.noSnapshotReason(42));
+	}
+
+	/**
+	 * R54-3: {@code admin snapshot} reports a member that took no snapshot (a reply with log index -1: here its state
+	 * machine paused, as at the end of a snapshot install; also its retry backoff, or a database past what Ratis handed
+	 * over after a start) as {@code FAILED}, exit code 1, instead of {@code OK}; once the member takes one, it prints its
+	 * log index and {@code OK}. R54-4: {@code status} prints each member's applied index, which the restart of a node
+	 * started with {@code --join} after {@code --change-addresses} waits for.
+	 */
+	@Test
+	void adminSnapshotFailsWhenTheMemberTakesNoneAndStatusShowsTheAppliedIndex() throws Exception {
+		cluster = new InProcessCluster(Files.createDirectories(temp.resolve("snapshot")), 1,
+				c -> c.withSnapshotEveryEntries(1_000_000)).startAll();
+		var leader = cluster.awaitLeader(TIMEOUT);
+		var api = leader.connection().getSyncApi(RequestContext.batch(TIMEOUT));
+		long column = api.createColumn("c", SCHEMA);
+		api.put(0, column, key(1), value("v1"), RequestType.none());
+		var stateMachine = leader.stateMachine();
+		InProcessCluster.await(TIMEOUT, () -> stateMachine.handedOverForTesting() >= stateMachine.appliedIndex().get());
+		var id = leader.config().nodeId();
+
+		stateMachine.pause();
+		try {
+			var none = run(admin(List.of(id), "snapshot", id));
+			assertEquals(1, none.code(), none.toString());
+			assertTrue(none.out().contains("FAILED: " + id + " took no snapshot"), none.out());
+			assertTrue(!none.out().contains("OK"), none.out());
+		} finally {
+			// As reinitialize does after an install.
+			stateMachine.getLifeCycle().startAndTransition(() -> {
+			});
+		}
+		var taken = run(admin(List.of(id), "snapshot", id));
+		assertEquals(0, taken.code(), taken.toString());
+		var latest = stateMachine.getLatestSnapshot();
+		assertTrue(latest != null, "a snapshot was taken");
+		assertTrue(taken.out().contains(id + " took a snapshot at log index " + latest.getIndex()), taken.out());
+		assertTrue(taken.out().strip().endsWith("OK"), taken.out());
+
+		var status = run(admin(List.of(id), "status"));
+		assertEquals(0, status.code(), status.toString());
+		assertTrue(status.out().contains(id + ": LEADER, applied index " + stateMachine.appliedIndex().get()),
+				status.out());
 	}
 
 	/**
