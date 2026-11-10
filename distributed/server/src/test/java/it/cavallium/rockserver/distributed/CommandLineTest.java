@@ -543,6 +543,74 @@ class CommandLineTest {
 			ReplicatedServerMain.snapshotRequestWait = wait;
 		}
 	}
+
+	/**
+	 * R57-1: Ratis 3.3.1's gRPC client gives each snapshot request a deadline of the client's {@code Rpc.requestTimeout}
+	 * ({@code GrpcClientProtocolClient.snapshotManagement}), not the request's own timeout; {@code admin} set it to the
+	 * election timeout, 2 s. A take longer than that ran past the first attempt, the client sent the request again 500 ms
+	 * later, and a take that ended in that gap answered no one: Ratis cleared its pending request, and the next attempt
+	 * was a new request that ran a second take, past the entries applied meanwhile (the creation gap is 1). Here the
+	 * take is held until the client's first attempt ran out (or, if none does, 3 s), so it ends in that gap, while
+	 * writes wait to be applied after it. The command must get the answer of its one take.
+	 */
+	@Test
+	void aTakeLongerThanTheElectionTimeoutAnswersAdminSnapshotWithOneTake() throws Exception {
+		var wait = ReplicatedServerMain.snapshotRequestWait;
+		ReplicatedServerMain.snapshotRequestWait = Duration.ofSeconds(20);
+		var writer = java.util.concurrent.Executors.newSingleThreadExecutor();
+		RockserverStateMachine held = null;
+		try {
+			cluster = new InProcessCluster(Files.createDirectories(temp.resolve("long-take")), 1,
+					c -> c.withSnapshotEveryEntries(1_000_000)).startAll();
+			var leader = cluster.awaitLeader(TIMEOUT);
+			var api = leader.connection().getSyncApi(RequestContext.batch(TIMEOUT));
+			long column = api.createColumn("c", SCHEMA);
+			api.put(0, column, key(1), value("v1"), RequestType.none());
+			var stateMachine = leader.stateMachine();
+			InProcessCluster.await(TIMEOUT, () -> stateMachine.handedOverForTesting() >= stateMachine.appliedIndex().get());
+			var id = leader.config().nodeId();
+
+			var hold = new java.util.concurrent.CountDownLatch(1);
+			stateMachine.snapshotHoldForTests = hold;
+			held = stateMachine;
+			long attempts = stateMachine.snapshotAttempts.get();
+			long retries = ReplicatedServerMain.adminRetriesForTests.get();
+			var released = new java.util.concurrent.atomic.AtomicLong();
+			var releaser = writer.submit(() -> {
+				InProcessCluster.await(TIMEOUT, () -> stateMachine.snapshotAttempts.get() > attempts);
+				long entered = System.nanoTime();
+				// Entries that are applied after the take, so that a second request would run a second take.
+				var puts = java.util.concurrent.CompletableFuture.runAsync(() -> {
+					for (long i = 2; i < 6; i++) {
+						api.put(0, column, key(i), value("v" + i), RequestType.none());
+					}
+				});
+				InProcessCluster.await(TIMEOUT, () -> ReplicatedServerMain.adminRetriesForTests.get() > retries
+						|| System.nanoTime() - entered > TimeUnit.SECONDS.toNanos(3));
+				released.set(System.nanoTime() - entered);
+				hold.countDown();
+				puts.get(TIMEOUT.toSeconds(), TimeUnit.SECONDS);
+				return null;
+			});
+			var taken = run(admin(List.of(id), "snapshot", id));
+			releaser.get(TIMEOUT.toSeconds(), TimeUnit.SECONDS);
+			assertEquals(0, taken.code(), taken.toString());
+			assertTrue(!taken.out().contains("FAILED"), taken.out());
+			assertEquals(attempts + 1, stateMachine.snapshotAttempts.get(), () -> "one take, for the command (the hold was"
+					+ " released " + TimeUnit.NANOSECONDS.toMillis(released.get()) + " ms after the take started, after "
+					+ (ReplicatedServerMain.adminRetriesForTests.get() - retries) + " retries): " + taken.out());
+			var latest = stateMachine.getLatestSnapshot();
+			assertTrue(latest != null, "a snapshot was taken");
+			assertTrue(taken.out().contains(id + " took a snapshot at log index " + latest.getIndex()), taken.out());
+			assertEquals(retries, ReplicatedServerMain.adminRetriesForTests.get(), "one call lasted the take");
+		} finally {
+			if (held != null) {
+				held.snapshotHoldForTests = null;
+			}
+			writer.shutdownNow();
+			ReplicatedServerMain.snapshotRequestWait = wait;
+		}
+	}
 	/**
 	 * R52-3: Ratis 3.3.1 takes a configuration with the same voter ids and priorities for no change
 	 * ({@code RaftConfigurationImpl.hasNoChange} never compares addresses) and answers success without writing it. A
