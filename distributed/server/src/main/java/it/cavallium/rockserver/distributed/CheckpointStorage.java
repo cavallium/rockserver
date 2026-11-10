@@ -205,17 +205,7 @@ final class CheckpointStorage implements StateMachineStorage {
 				throw new IOException("No snapshot in " + snapshotsDir + ", and " + gap + ": this replica cannot catch up"
 						+ " by itself, rebuild it from the other members");
 			}
-			Path chosen = null;
-			TermIndex chosenTermIndex = null;
-			for (Path aside : asides) {
-				if (usableSnapshot(aside)) {
-					TermIndex termIndex = readTermIndex(findLatest(aside));
-					if (chosenTermIndex == null || termIndex.compareTo(chosenTermIndex) > 0) {
-						chosen = aside;
-						chosenTermIndex = termIndex;
-					}
-				}
-			}
+			Path chosen = newestUsableAside(asides);
 			if (damagedInstall != null) {
 				LOG.warn("Discarding a snapshot installation interrupted by a crash", damagedInstall);
 				NodeStore.deleteRecursively(snapshotsDir);
@@ -235,6 +225,26 @@ final class CheckpointStorage implements StateMachineStorage {
 			}
 		}
 		deleteUnusedSnapshots(null);
+	}
+
+	/**
+	 * Of {@code asides}, the one whose latest usable snapshot is the newest, whatever the order of the list (the order
+	 * of a directory listing, R58-3); null if none holds a usable snapshot. Deletes the incomplete snapshots of each
+	 * ({@link #usableSnapshot}).
+	 */
+	static @Nullable Path newestUsableAside(List<Path> asides) throws IOException {
+		Path chosen = null;
+		TermIndex chosenTermIndex = null;
+		for (Path aside : asides) {
+			if (usableSnapshot(aside)) {
+				TermIndex termIndex = readTermIndex(findLatest(aside));
+				if (chosenTermIndex == null || termIndex.compareTo(chosenTermIndex) > 0) {
+					chosen = aside;
+					chosenTermIndex = termIndex;
+				}
+			}
+		}
+		return chosen;
 	}
 
 	/**

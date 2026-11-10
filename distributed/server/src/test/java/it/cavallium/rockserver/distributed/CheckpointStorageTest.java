@@ -626,6 +626,40 @@ class CheckpointStorageTest {
 		assertEquals(Set.of("snapshots", "tmp"), fileNames(stateMachineDir));
 	}
 
+	/**
+	 * Review of R58, 4: theNewestUsableAsideIsPromoted is red before the R58-3 fix only when the directory listing puts
+	 * an older aside first. The choice itself is checked here under every order of the asides, so a rule that takes
+	 * the first usable aside fails on any file system.
+	 */
+	@Test
+	void theNewestUsableAsideIsChosenWhateverTheOrderOfTheAsides() throws IOException {
+		var follower = initStorage(tempDir.resolve("follower"), RaftStorage.StartupOption.FORMAT);
+		setApplied(store, TermIndex.valueOf(1, 5));
+		follower.take(store);
+		setApplied(store, TermIndex.valueOf(2, 20));
+		follower.take(store);
+		Path snapshotsDir = follower.getSnapshotDir().toPath();
+		closeRaftStorages();
+		Path asidesDir = Files.createDirectories(tempDir.resolve("asides"));
+		Path older = asidesDir.resolve("older");
+		copyTree(snapshotsDir.resolve("snapshot-1-5"), older.resolve("snapshot-1-5"));
+		Path newest = asidesDir.resolve("newest");
+		copyTree(snapshotsDir.resolve("snapshot-2-20"), newest.resolve("snapshot-2-20"));
+		Path empty = Files.createDirectories(asidesDir.resolve("empty"));
+		var asides = List.of(older, newest, empty);
+		for (int first = 0; first < asides.size(); first++) {
+			for (int second = 0; second < asides.size(); second++) {
+				if (second == first) {
+					continue;
+				}
+				int third = 3 - first - second;
+				var order = List.of(asides.get(first), asides.get(second), asides.get(third));
+				assertEquals(newest, CheckpointStorage.newestUsableAside(order), "order " + order);
+			}
+		}
+		assertNull(CheckpointStorage.newestUsableAside(List.of(empty)));
+	}
+
 	/** Writes a Raft log segment file named {@code name} (content irrelevant here) under the raft directory. */
 	private static void writeLogSegment(Path raftDir, String name) throws IOException {
 		Path current = Files.createDirectories(raftDir.resolve("current"));
