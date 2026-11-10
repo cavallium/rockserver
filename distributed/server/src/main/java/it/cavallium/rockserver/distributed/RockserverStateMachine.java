@@ -1122,6 +1122,12 @@ final class RockserverStateMachine extends BaseStateMachine {
 		return Math.min(SNAPSHOT_BY_BYTES_MAX_REQUEST_TIMEOUT_MS, Math.max(min.toMillis(), twice));
 	}
 
+	/** The WARN of {@link #snapshotByBytes} when its request ended without a snapshot ({@code cause}). */
+	static String snapshotByBytesNotEnded(String nodeId, long everyBytes, long timeoutMs, @Nullable Throwable cause) {
+		return nodeId + ": the snapshot asked after " + everyBytes + " bytes of log did not end within " + timeoutMs
+				+ " ms (see \"snapshot failed\" above, or a take still running); asking again after the next entries";
+	}
+
 	/**
 	 * Asks Ratis for a snapshot once {@code snapshotEveryBytes} of log entries were applied since the latest one.
 	 * Ratis' own trigger counts entries ({@code snapshotEveryEntries}), and an entry holds up to 4096 requests or
@@ -1154,9 +1160,8 @@ final class RockserverStateMachine extends BaseStateMachine {
 				snapshotByBytesPending.set(false);
 				if (error != null || !reply.isSuccess()) {
 					// A failed take, one that outlasted the timeout, or a timer that an earlier request left in Ratis (R56-2).
-					LOG.warn("{}: the snapshot asked after {} bytes of log did not end within {} ms (see \"snapshot failed\""
-									+ " above, or a take still running); asking again after the next entries", config.nodeId(),
-							config.snapshotEveryBytes(), timeoutMs, error != null ? error : reply.getException());
+					var cause = error != null ? error : reply.getException();
+					LOG.warn(snapshotByBytesNotEnded(config.nodeId(), config.snapshotEveryBytes(), timeoutMs, cause), cause);
 				}
 			});
 		} catch (RuntimeException ex) {
