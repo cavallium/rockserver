@@ -941,6 +941,25 @@ class CommandLineTest {
 	}
 
 	/**
+	 * R58-2: {@code admin snapshot ID} of an id that is not one of {@code --peer} (a member outside the list, or a
+	 * different case) is wrong usage: exit 2 with the usage and the members, before anything is sent. Ratis' client
+	 * looked the id up in the group and threw an uncaught NullPointerException (exit 1, the code of a member whose
+	 * snapshot failed).
+	 */
+	@Test
+	void adminSnapshotOfAnIdOutsidePeerIsWrongUsage() {
+		var peers = List.of("admin", "--peer", "d1=127.0.0.1:1/127.0.0.1:1", "--peer", "d2=127.0.0.1:2/127.0.0.1:2",
+				"--timeout-ms", "3000");
+		for (var id : List.of("n9", "D1")) {
+			var refused = run(with(peers, "snapshot", id));
+			assertEquals(2, refused.code(), refused.toString());
+			assertTrue(refused.thrown() == null, refused.toString());
+			assertTrue(refused.err().contains("Usage:"), refused.err());
+			assertTrue(refused.err().contains(id + " is not one of --peer (d1, d2)"), refused.err());
+		}
+	}
+
+	/**
 	 * R28-3: {@code admin} refuses an option it does not know (a misspelled {@code --timout-ms} ran with the 10-minute
 	 * default, and swallowed the next word) and an option of another command ({@code --allow-skipped} is checksum's,
  * {@code --unsafe-multi-voter-change} add-peer's and remove-peer's), and
