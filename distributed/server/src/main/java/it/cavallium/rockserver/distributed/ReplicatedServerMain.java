@@ -1707,13 +1707,23 @@ public final class ReplicatedServerMain {
 	 * {@link #SNAPSHOT_ANSWER_MARGIN}, and the member waits the time left. An attempt that Ratis would send again (a
 	 * transport error, a member not up yet, the member's own timeout, or a timer left by an earlier request clearing
 	 * this one, R56-2) is sent again {@link #ADMIN_RETRY_SLEEP} later, as {@link #retryUntil} does, until the wait ends;
-	 * then it throws a {@link TimeoutIOException}. Any other exception (one that the blocking client rethrows at once,
+	 * then it throws a {@link TimeoutIOException}. The clock is read again after the sleep, so no attempt is sent once
+	 * the wait has ended (review of R57, 1: before, a failure in the last 500 ms of the wait still sent one, with 1 ms
+	 * left, which could start a take on the member after the command had given up). Any other exception (one that the blocking client rethrows at once,
 	 * a {@code GroupMismatchException} for example) is thrown as is.</p>
 	 */
 	static RaftClientReply requestSnapshot(RaftGroup group, NodeConfig anyConfig, RaftPeerId member, long waitMillis)
 			throws IOException, InterruptedException {
 		long end = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(waitMillis);
+		IOException last = null;
 		while (true) {
+			if (last != null) {
+				// After the sleep: an attempt sent now would outlast the wait (review of R57, 1).
+				if (System.nanoTime() - end >= 0) {
+					throw new TimeoutIOException("no snapshot within " + waitMillis + " ms: " + last.getMessage(), last);
+				}
+				adminRetriesForTests.incrementAndGet();
+			}
 			long left = Math.max(1, TimeUnit.NANOSECONDS.toMillis(end - System.nanoTime()));
 			var retryable = new java.util.concurrent.atomic.AtomicBoolean();
 			var client = RaftClient.newBuilder()
@@ -1734,6 +1744,7 @@ public final class ReplicatedServerMain {
 				if (System.nanoTime() - end >= 0) {
 					throw new TimeoutIOException("no snapshot within " + waitMillis + " ms: " + ex.getMessage(), ex);
 				}
+				last = ex;
 			} finally {
 				try {
 					client.close();
@@ -1741,7 +1752,6 @@ public final class ReplicatedServerMain {
 					// The answer, or the exception, is what counts.
 				}
 			}
-			adminRetriesForTests.incrementAndGet();
 			ADMIN_RETRY_SLEEP.sleep();
 		}
 	}

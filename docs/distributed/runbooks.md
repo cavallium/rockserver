@@ -566,9 +566,11 @@ commit index of any member, so a member that is gone holds it back.
 2. If it is gone for good, replace it (above), or remove it: `rs admin --peer <the others> remove-peer <id>`.
 3. If every member is there, check the snapshots: the alert `rockserver-snapshot-old` and the log (`snapshot taken`,
    or `snapshot failed`). A failing snapshot is usually a full disk. `rs admin $PEERS snapshot <id>` asks a member for
-   one: it waits up to 2 minutes (or the time left of `--timeout-ms`) in one call, however long the snapshot takes
-   (R57-1: before, a snapshot slower than 2 s could run twice for one command, or end it with `FAILED` although the
-   member took it), and, when the snapshot fails there, ends with
+   one: it waits up to 2 minutes (or the time left of `--timeout-ms`) in one call, as long as the snapshot ends
+   within the wait (R57-1: before, a snapshot slower than 2 s could run twice for one command, or end it with
+   `FAILED` although the member took it; the request is still sent again after a broken connection or when Ratis
+   ended it early, R56-2, and a snapshot that ends in the 500 ms before it is sent again is not reported: run it again), and,
+   when the snapshot fails there, ends with
    `FAILED: <id> took no snapshot within ... ms: its snapshot failed ...`, exit code 1: see that member's log. Once
    the disk is freed it takes one: a failed snapshot asked by `--snapshot-every-bytes` holds the member's snapshot
    requests for at most twice its slowest snapshot, at least 30 s and at most 2 minutes (R56-1), and the command asks
