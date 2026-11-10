@@ -40,6 +40,22 @@ class SnapshotByBytesTest {
 		}
 	}
 
+	/**
+	 * R56-1: the byte trigger's snapshot request times out soon after a take could have ended (twice the slowest take
+	 * seen, at least {@code min}, at most 2 minutes, the wait of {@code admin snapshot}): a take that fails leaves the
+	 * request pending in Ratis 3.3.1 until that timeout, and every {@code admin snapshot} meanwhile joins it and runs no
+	 * take. It was 10 minutes.
+	 */
+	@Test
+	void theByteTriggersRequestTimesOutSoonAfterATake() {
+		var min = Duration.ofSeconds(30);
+		assertEquals(30_000, RockserverStateMachine.snapshotByBytesRequestTimeoutMillis(min, 0));
+		assertEquals(30_000, RockserverStateMachine.snapshotByBytesRequestTimeoutMillis(min, TimeUnit.SECONDS.toNanos(3)));
+		assertEquals(80_000, RockserverStateMachine.snapshotByBytesRequestTimeoutMillis(min, TimeUnit.SECONDS.toNanos(40)));
+		assertEquals(120_000, RockserverStateMachine.snapshotByBytesRequestTimeoutMillis(min, TimeUnit.MINUTES.toNanos(5)));
+		assertEquals(2_000, RockserverStateMachine.snapshotByBytesRequestTimeoutMillis(Duration.ofSeconds(2), 0));
+	}
+
 	@Test
 	void aFewLargeEntriesTriggerASnapshot() throws Exception {
 		cluster = new InProcessCluster(temp, 3, c -> c.withSnapshotEveryEntries(1_000_000)

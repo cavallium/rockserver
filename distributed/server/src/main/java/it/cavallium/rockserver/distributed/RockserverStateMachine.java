@@ -1097,6 +1097,13 @@ final class RockserverStateMachine extends BaseStateMachine {
 			new AtomicBoolean();
 	private final AtomicLong snapshotCalls = new AtomicLong();
 	private static final long SNAPSHOT_REQUEST_TIMEOUT_MS = 10L * 60 * 1000;
+	/** The shortest timeout of the request {@link #snapshotByBytes} sends; a seam for tests (R56-1). */
+	static volatile Duration snapshotByBytesMinRequestTimeout = Duration.ofSeconds(30);
+
+	/** The timeout, in ms, of the request {@link #snapshotByBytes} sends (R56-1). */
+	static long snapshotByBytesRequestTimeoutMillis(Duration min, long slowestTakeNanos) {
+		return SNAPSHOT_REQUEST_TIMEOUT_MS;
+	}
 
 	/**
 	 * Asks Ratis for a snapshot once {@code snapshotEveryBytes} of log entries were applied since the latest one.
@@ -1248,6 +1255,8 @@ final class RockserverStateMachine extends BaseStateMachine {
 	private final SnapshotBackoff snapshotBackoff = new SnapshotBackoff();
 	/** Tests only: a failure that the next snapshots throw before their checkpoint. */
 	volatile @Nullable IOException snapshotFailureForTests;
+	/** Tests only: how long, in ms, each snapshot sleeps before its checkpoint (a slow take). */
+	volatile long snapshotDelayForTests;
 	/** Snapshots that this replica tried (the checkpoint started), for tests. */
 	final AtomicLong snapshotAttempts = new AtomicLong();
 
@@ -1298,6 +1307,15 @@ final class RockserverStateMachine extends BaseStateMachine {
 			var injected = snapshotFailureForTests;
 			if (injected != null) {
 				throw injected;
+			}
+			long delay = snapshotDelayForTests;
+			if (delay > 0) {
+				try {
+					Thread.sleep(delay);
+				} catch (InterruptedException ex) {
+					Thread.currentThread().interrupt();
+					throw new java.io.InterruptedIOException("interrupted in the delay of a test");
+				}
 			}
 			// Before the checkpoint: entries applied while it runs count towards the next one.
 			long bytesBefore = bytesSinceSnapshot.get();
