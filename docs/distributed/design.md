@@ -1765,8 +1765,10 @@ So the per-key lock stays, with pipelined updates as the measured option to shor
   `OK`; review of R54, 3: and with 0 on a member that has no snapshot and applied nothing past index 0). It waits for
   the member's snapshot up to 120 s, or the time left of `--timeout-ms`, and ends without an answer with
   `FAILED: ID took no snapshot within N ms: its snapshot failed ..., or did not finish in time, or the member did not
-  answer (...)`, exit code 1 (R55-3: Ratis 3.3.1 never answers a request whose take threw, so the command waited the
-  whole `--timeout-ms`, 10 minutes by default, and then printed the membership-change advice).
+  answer (...)`, exit code 1 (R55-3: Ratis 3.3.1 answers a request whose take threw only at the request's own timeout,
+  which was the whole `--timeout-ms`, 10 minutes by default, and the command then printed the membership-change
+  advice). A member that refuses the request at once (another `--group-id`, for example) ends it with
+  `FAILED: ID took no snapshot: it refused the request (...)`, exit code 1 (review of R55, 1).
 - **Replacing a node.** Start the new member first, under a new id, with an empty data directory, a peer list that
   includes itself and `--join`. It waits, also across restarts, for as long as you like. Then change one voter per
   command (round 14): `admin` refuses a call that adds and removes a voter together, or changes two, and so does the
@@ -4926,7 +4928,11 @@ install it (`apt-get install gcc libc6-dev`) and run with `-Drockserver.test.req
      upgrade from R54). The CRC still leaves out the time (`ChecksumTest` rewrites it). Not covered: R54's lines on a
      node rolled back from R54 to R53 (the runbooks' "Upgrades": move `replica-ops.log` aside first), the lines
      R55 appends after a rollback to R54 behind R54's own checked lines, which R54 rejects (a cache), and a torn last
-     line that a rolled-back R53 loads, as it always did. Tests: `ReplicaOpsTest.anOlderBinaryReadsTheResultsThisVersionWrites`
+     line that a rolled-back R53 loads, as it always did, and a fragment R55 leaves in the middle of the file (an
+     append cut while the node runs, the R54-1 path, or a result line whose check line `cutTornTail` removed): R55
+     rejects it, but a rolled-back R53 loads it, and one cut inside its digest or directory becomes a `DONE` result
+     with a truncated detail (a false REPLICAS DIVERGED); R53's own behaviour, not a regression (review of R55, 4).
+     Tests: `ReplicaOpsTest.anOlderBinaryReadsTheResultsThisVersionWrites`
      (a copy of round 53's parse over the lines `persist` wrote: red at `e023584` with `<digest> #7295e17b`,
      `/data/backups/b1 #8fdd8fbc`, `disk full #cdded266`), `ReplicaOpsTest.theCheckedLinesOfRound54StillLoad` (a
      guard, green before). The R54-2 tests pass unchanged on the new format.
@@ -4938,10 +4944,13 @@ install it (`apt-get install gcc libc6-dev`) and run with `-Drockserver.test.req
      its log, its applied index then being enough. README.md needed no change. No test (docs).
    - R55-3 / ADMIN-SNAPSHOT-FAILED-TAKE-HANGS (low): `admin snapshot` passed the whole `--timeout-ms` (10 minutes by
      default) as the server-side timeout of the request. When the member's take throws (a full disk), Ratis 3.3.1
-     logs it and never completes the request (per both votes, javap of `StateMachineUpdater.takeSnapshot` and
-     `SnapshotManagementRequestHandler`), the client's retries join the same request, so the command hung for the
-     whole limit and ended with `attempt()`'s membership-change text ("A leader that started a change goes on with
-     it"). Now the request asks the member to wait `snapshotRequestWait`, 120 s, at most the time left
+     logs it and leaves the request pending; `SnapshotManagementRequestHandler.takingSnapshotAsync` has scheduled
+     `TimeoutExecutor.onTimeout(request.getTimeoutMs())`, which clears it and completes it with `TimeoutIOException`
+     (`Failed to take a snapshot within timeout`), and the client's retries in the meantime join the same request
+     (correction of the review of R55, 2, checked with javap of 3.3.1: the entry said "never completes the request").
+     So the member answers at the request's own timeout, the command hung for exactly the whole limit and ended with
+     `attempt()`'s membership-change text ("A leader that started a change goes on with it"), and a later
+     `admin snapshot` is not stuck behind a dead pending request. Now the request asks the member to wait `snapshotRequestWait`, 120 s, at most the time left
      (`ReplicatedServerMain.snapshotWaitMillis`), the client retries only until then (`retryUntil` reads a deadline
      the command can move), and an answer that does not come ends with `FAILED: <id> took no snapshot within N ms:
      its snapshot failed (a full data disk, for example), or did not finish in time, or the member did not answer
@@ -4952,6 +4961,26 @@ install it (`apt-get install gcc libc6-dev`) and run with `-Drockserver.test.req
      wait shortened to 3 s, `--timeout-ms 30000`: about 5 s and the snapshot text; red at `e023584`: 34 s, `no result
      within the time limit of 30000 ms ... A leader that started a change`), `theSnapshotWaitIsAtMostTheTimeLeft` (a
      unit check of `snapshotWaitMillis`). Not covered: the 120 s default itself was not run.
+   - Review of R55, 1 (low): R55-3 printed the `took no snapshot within N ms: its snapshot failed ..., or did not
+     finish in time, or the member did not answer` text for every `IOException` of `api.create`, also for one that
+     Ratis' blocking client rethrows at once without retrying (a `GroupMismatchException` from a member started with
+     another `--group-id`): the operator read that the wait ran out and that the snapshot may have failed, where the
+     member refused straight away (`attempt()` had said "or the leader refused"). `snapshotNotTaken` now gives the
+     timeout text only when the exception or one of its causes is a `RaftRetryFailureException` (the client's retry
+     deadline, which is what the failing-take case throws here) or a `TimeoutIOException` (the member's answer at the
+     request's timeout), and otherwise `FAILED: <id> took no snapshot: it refused the request (<class>: <message>);
+     check the member's id, address and --group-id, see the status`, exit 1. Test:
+     `CommandLineTest.aSnapshotRequestRefusedAtOnceIsNotCalledATimeout` (a unit check of `snapshotNotTaken`: red before
+     the fix, the group mismatch got `within 3000 ms`).
+   - Review of R55, 2 (nit, docs): the mechanism of R55-3 is corrected there and in `snapshotWaitMillis`'s javadoc:
+     Ratis answers at the request's timeout, it does not leave the request unanswered. The fix stands.
+   - Review of R55, 3 (nit, test): `adminSnapshotWhoseTakeFailsEndsSoonAndSaysSo` asserted `took no snapshot`, which
+     R54-3's `took no snapshot (<reason>)` matches too (a retry meeting the snapshot backoff would have passed); it
+     asserts `took no snapshot within 3000 ms` now.
+   - Review of R55, 4 (nit, docs): the runbooks' rollback note and R55-1's "Not covered" now name the fragment R55
+     leaves in the middle of `replica-ops.log` (an append cut while the node runs, or a line whose check line was cut
+     off): R55 rejects it, a rolled-back R53 loads it, possibly as a `DONE` result with a truncated detail and a false
+     REPLICAS DIVERGED, as R53 always did. No test (docs).
    - Review of R46, 1 (low, docs): the R46-2 recipe ran `dependency:build-classpath` on `distributed/server/pom.xml`
      alone, so Maven resolved `rockserver-core:${revision}` and that version's pom from `~/.m2` (or the snapshot
      repository): `grep -v /rockserver-core/` dropped the jar but kept the third-party jars of that pom, from whichever
