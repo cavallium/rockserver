@@ -872,9 +872,9 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 	private static final java.util.regex.Pattern CHECKED_LINE =
 			java.util.regex.Pattern.compile("(\\S+) (.*) #([0-9a-f]{8})");
 	/**
-	 * The check line that this version writes after each line (R55-1): {@code #} and the CRC-32 of the whole line before
-	 * it, time included, in 8 hex digits. One field, so a binary of round 53 or 54 skips it (it needs 6) and reads the
-	 * line before it as it wrote its own.
+	 * The check line that this version writes after each line (R55-1): {@code #} and the CRC-32 of the line before it
+	 * past its time ({@link #lineCrc}), in 8 hex digits. One field, so a binary of round 53 or 54 skips it (it needs 6)
+	 * and reads the line before it as it wrote its own.
 	 */
 	private static final java.util.regex.Pattern CHECK_LINE = java.util.regex.Pattern.compile("#([0-9a-f]{8})");
 
@@ -883,8 +883,17 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 	 * round 53 writes and reads it, and its check line ({@link #CHECK_LINE}), each with its {@code \n}.
 	 */
 	static String checkedLines(String time, String content) {
-		var line = time + " " + content;
-		return line + "\n#" + crc(line) + "\n";
+		return time + " " + content + "\n#" + crc(content) + "\n";
+	}
+
+	/**
+	 * The check of {@code line} as {@link #CHECK_LINE} holds it: the CRC-32 of what follows its time, as R54-2's check
+	 * (the time is left out: {@code ChecksumTest} rewrites it by hand, and a changed time costs only the schedule's
+	 * fallback); null for a line without a time.
+	 */
+	private static @Nullable String lineCrc(String line) {
+		int space = line.indexOf(' ');
+		return space < 0 ? null : crc(line.substring(space + 1));
 	}
 
 	private static String crc(String content) {
@@ -1010,7 +1019,7 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 				var last = tornLast.get();
 				var checked = last == null ? null : CHECKED_LINE.matcher(last);
 				var check = last == null ? null : CHECK_LINE.matcher(last);
-				if (check != null && check.matches() && !lines.isEmpty() && crc(lines.getLast()).equals(check.group(1))
+				if (check != null && check.matches() && !lines.isEmpty() && check.group(1).equals(lineCrc(lines.getLast()))
 						|| checked != null && checked.matches() && crc(checked.group(2)).equals(checked.group(3))) {
 					// Only its \n was lost, its check proves the rest whole (review of R54, 2; for this version's check line,
 					// the line before it, R55-1): kept, and the next append starts with the \n.
@@ -1038,7 +1047,7 @@ final class ReplicaOps implements Applier.Maintenance, AutoCloseable {
 				if (check != null && check.matches()) {
 					// A line of this version and its check line (R55-1).
 					at++;
-					if (!crc(text).equals(check.group(1))) {
+					if (!check.group(1).equals(lineCrc(text))) {
 						damaged++;
 						continue;
 					}
