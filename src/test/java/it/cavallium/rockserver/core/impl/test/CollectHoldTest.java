@@ -148,10 +148,10 @@ class CollectHoldTest {
 		try {
 			var type = Class.forName("it.cavallium.rockserver.core.server.GrpcServerImpl");
 			Method method = type.getDeclaredMethod("collectNumbered", Flux.class, AtomicLong.class, long.class,
-					ToLongFunction.class, String.class);
+					Duration.class, ToLongFunction.class, String.class);
 			method.setAccessible(true);
 			ToLongFunction<Long> bytes = _ -> 100;
-			return (Mono<List<Long>>) method.invoke(null, items, budget, limit, bytes, "putMulti");
+			return (Mono<List<Long>>) method.invoke(null, items, budget, limit, Duration.ofSeconds(30), bytes, "putMulti");
 		} catch (InvocationTargetException ex) {
 			throw new IllegalStateException(ex.getCause());
 		} catch (ReflectiveOperationException ex) {

@@ -1055,11 +1055,14 @@ class CommandLineTest {
 		assertTrue(misspelled.err().contains("unknown option --timout-ms"), misspelled.err());
 		var otherCommands = run(with(peer, "--allow-skipped", "status"));
 		assertEquals(2, otherCommands.code(), otherCommands.toString());
-		assertTrue(otherCommands.err().contains("--allow-skipped"), otherCommands.err());
+		// R61-9: the problem line, not the option's name, which the usage text printed after it always holds.
+		assertTrue(otherCommands.err().contains("Error: --allow-skipped is an option of checksum only"),
+				otherCommands.err());
 		// R28 review 5: add-peer's and remove-peer's flag is refused with the other commands too.
 		var unsafeElsewhere = run(with(peer, "--unsafe-multi-voter-change", "status"));
 		assertEquals(2, unsafeElsewhere.code(), unsafeElsewhere.toString());
-		assertTrue(unsafeElsewhere.err().contains("--unsafe-multi-voter-change"), unsafeElsewhere.err());
+		assertTrue(unsafeElsewhere.err().contains(
+				"Error: --unsafe-multi-voter-change is an option of add-peer and remove-peer only"), unsafeElsewhere.err());
 		var badTimeout = run(with(peer, "--timeout-ms", "soon", "status"));
 		assertEquals(2, badTimeout.code(), badTimeout.toString());
 		var badGroup = run(with(peer, "--group-id", "nope", "status"));
@@ -1077,12 +1080,107 @@ class CommandLineTest {
 		assertTrue(repeatedPeer.err().contains("d1"), repeatedPeer.err());
 		var hugeTimeout = run(with(peer, "--timeout-ms", "9300000000000", "status"));
 		assertEquals(2, hugeTimeout.code(), hugeTimeout.toString());
-		assertTrue(hugeTimeout.err().contains("--timeout-ms"), hugeTimeout.err());
+		assertTrue(hugeTimeout.err().contains("Error: invalid --timeout-ms 9300000000000"), hugeTimeout.err());
 		for (var refused : List.of(misspelled, otherCommands, unsafeElsewhere, badTimeout, badGroup, badPeer, badIndex,
 				repeatedPeer, hugeTimeout)) {
 			assertTrue(refused.thrown() == null, refused.toString());
 			assertTrue(refused.err().contains("Usage:"), refused.err());
 		}
+	}
+
+	/**
+	 * R61-12, R61-3: a value below what the command can use is wrong usage too, exit 2 with the problem line, as an
+	 * unparsable one: a zero or negative {@code admin --timeout-ms} (a deadline in the past, or an
+	 * {@code ArithmeticException} below about -9.2e12), a port outside 1 to 65535 in {@code --peer} or in the argument
+	 * of {@code add-peer} (the node failed later, at bind, with exit 1), and, in the node's configuration, a zero,
+	 * negative or overflowing request timeout or election timeout ({@code run} maps what {@link NodeConfig} refuses to
+	 * usage; {@code StartupChecksTest.runRefusesMalformedValuesWithTwo} runs them through {@code run}).
+	 */
+	@Test
+	void nonPositiveAndOutOfRangeValuesAreUsageErrors() {
+		var peer = List.of("admin", "--peer", "d1=127.0.0.1:1/127.0.0.1:1");
+		for (var value : List.of("0", "-5", "-9300000000000")) {
+			var refused = run(with(peer, "--timeout-ms", value, "status"));
+			assertEquals(2, refused.code(), refused.toString());
+			assertTrue(refused.thrown() == null, refused.toString());
+			assertTrue(refused.err().contains("Error: invalid --timeout-ms " + value), refused.err());
+		}
+		for (var spec : List.of("d1=127.0.0.1:0/127.0.0.1:1", "d1=127.0.0.1:1/127.0.0.1:65536",
+				"d1=127.0.0.1:-1/127.0.0.1:1", "d1=127.0.0.1:1/127.0.0.1:99999")) {
+			var refused = run("admin", "--peer", spec, "status");
+			assertEquals(2, refused.code(), refused.toString());
+			assertTrue(refused.thrown() == null, refused.toString());
+			assertTrue(refused.err().contains("Error: invalid --peer " + spec), refused.err());
+			assertTrue(refused.err().contains("1 to 65535"), refused.err());
+		}
+		var badAdded = run(with(peer, "--timeout-ms", "1000", "add-peer", "d2=127.0.0.1:99999/127.0.0.1:1"));
+		assertEquals(2, badAdded.code(), badAdded.toString());
+		assertTrue(badAdded.err().contains("Error: invalid add-peer argument d2=127.0.0.1:99999/127.0.0.1:1"),
+				badAdded.err());
+
+		var defaults = NodeConfig.defaults("d1", List.of(PeerConfig.parse("d1=127.0.0.1:1/127.0.0.1:2")), Path.of("."));
+		var tooLong = Duration.ofMillis(Long.MAX_VALUE);
+		for (var timeout : List.of(Duration.ZERO, Duration.ofMillis(-5), tooLong)) {
+			var refusal = org.junit.jupiter.api.Assertions.assertThrows(IllegalArgumentException.class,
+					() -> defaults.withRequestTimeout(timeout), () -> "request timeout " + timeout);
+			assertTrue(refusal.getMessage().contains("requestTimeout"), refusal.getMessage());
+		}
+		for (var min : List.of(Duration.ZERO, Duration.ofMillis(-5))) {
+			var refusal = org.junit.jupiter.api.Assertions.assertThrows(IllegalArgumentException.class,
+					() -> defaults.withElectionTimeouts(min, Duration.ofSeconds(2)), () -> "election timeout " + min);
+			assertTrue(refusal.getMessage().contains("electionTimeoutMin"), refusal.getMessage());
+		}
+		var refusal = org.junit.jupiter.api.Assertions.assertThrows(IllegalArgumentException.class,
+				() -> defaults.withElectionTimeouts(Duration.ofSeconds(1), tooLong));
+		assertTrue(refusal.getMessage().contains("electionTimeoutMax"), refusal.getMessage());
+	}
+
+	/**
+	 * R61-11: {@code add-peer} and {@code remove-peer} read the leader's configuration from the leader that the members
+	 * of {@code --peer} name when none of them leads, asking it at the address their configuration gives. "Replacing a
+	 * node" in the runbooks prescribes such lists ({@code --peer n2 --peer n3} once n4, not yet in {@code PEERS}, was
+	 * added and may lead). The commands asked only the {@code --peer} members: on a healthy cluster they waited the
+	 * whole {@code --timeout-ms} and failed with "still waiting for a leader (.. is FOLLOWER, .. is FOLLOWER)".
+	 */
+	@Test
+	void addAndRemovePeerFollowTheLeaderThatIsNotInPeer() throws Exception {
+		cluster = new InProcessCluster(Files.createDirectories(temp.resolve("leader-outside")), 3, c -> c).startAll();
+		cluster.awaitLeader(TIMEOUT);
+		var all = List.of("n0", "n1", "n2");
+		var leader = cluster.awaitLeader(TIMEOUT).config().nodeId();
+		var given = new ArrayList<>(all);
+		given.remove(leader);
+
+		long start = System.nanoTime();
+		var check = run(admin(given, "remove-peer", "n9"));
+		var elapsed = Duration.ofNanos(System.nanoTime() - start);
+		assertEquals(0, check.code(), check.toString());
+		assertTrue(check.out().contains("n9 is not a voter: nothing to remove (voters " + all + ")"), check.out());
+		assertTrue(check.out().contains("the leader " + leader + " is not in --peer"), check.out());
+		assertTrue(check.out().strip().endsWith("OK"), check.out());
+		assertTrue(elapsed.compareTo(Duration.ofSeconds(15)) < 0, () -> "took " + elapsed + ": " + check.out());
+
+		var again = run(admin(given, "add-peer", cluster.config(leader).self().format()));
+		assertEquals(0, again.code(), again.toString());
+		assertTrue(again.out().contains("leader " + leader + ": voters " + all), again.out());
+		assertTrue(again.out().contains("is already a voter"), again.out());
+
+		// A change is proposed to that leader too: its own removal, the one change such a --peer can ask for.
+		var removal = run(admin(given, "remove-peer", leader));
+		assertEquals(0, removal.code(), removal.toString());
+		assertTrue(removal.out().contains("this change adds [] and removes [" + leader + "]"), removal.out());
+		// Review of R61, 7: once per command, not once per read of the leader's configuration.
+		assertEquals(1, removal.out().lines().filter(line -> line.startsWith("NOTE: the leader " + leader)).count(),
+				removal.out());
+		assertEquals(1, check.out().lines().filter(line -> line.startsWith("NOTE: the leader " + leader)).count(),
+				check.out());
+		assertEquals(1, again.out().lines().filter(line -> line.startsWith("NOTE: the leader " + leader)).count(),
+				again.out());
+		assertTrue(removal.out().strip().endsWith("OK"), removal.out());
+		InProcessCluster.await(TIMEOUT, () -> cluster.runningNodes().stream().anyMatch(node ->
+				given.contains(node.config().nodeId()) && node.isLeader()
+						&& node.stateMachine().division().getRaftConf().getCurrentPeers().stream()
+								.map(peer -> peer.getId().toString()).sorted().toList().equals(given)));
 	}
 
 	/**

@@ -771,6 +771,37 @@ final class Proposer implements Closeable {
 		return RocksDBException.of(RocksDBErrorType.SERVER_OVERLOADED, "The node is stopping");
 	}
 
+	private static final long NOT_HANDED_OVER_LOG_NANOS = TimeUnit.SECONDS.toNanos(10);
+	private final AtomicLong notHandedOverLoggedNanos = new AtomicLong(System.nanoTime() - NOT_HANDED_OVER_LOG_NANOS);
+	private final AtomicLong notHandedOverUnlogged = new AtomicLong();
+
+	/**
+	 * Logs that {@code what} (a batch, a resend) could not be handed to a thread, with the error (review of R61, 6): at
+	 * most one line per 10 s, with the count of those left out since the last one, since every
+	 * batch meets the same error while no thread can start.
+	 */
+	private void logNotHandedOver(String what, Throwable error) {
+		long now = System.nanoTime();
+		long last = notHandedOverLoggedNanos.get();
+		if (now - last < NOT_HANDED_OVER_LOG_NANOS || !notHandedOverLoggedNanos.compareAndSet(last, now)) {
+			notHandedOverUnlogged.incrementAndGet();
+			return;
+		}
+		try {
+			LoggerFactory.getLogger(Proposer.class).error("{} could not be handed to a thread, so its writes end without"
+					+ " (another) copy sent ({} more such failures were not logged since the last line)", what,
+					notHandedOverUnlogged.getAndSet(0), error);
+		} catch (Throwable alsoFailing) {
+			// Out of memory while logging: ending the batch matters more.
+		}
+	}
+
+	/** The failure of a batch that could not be handed to a thread ({@code error}, R61-6): it was not encoded or sent. */
+	private static RocksDBException notHandedOver(Throwable error) {
+		return RocksDBException.of(RocksDBErrorType.SERVER_OVERLOADED,
+				"The node could not start a thread to send the write: " + error);
+	}
+
 	private static RocksDBException callerDeadlinePassed() {
 		return RocksDBException.notApplied(RocksDBErrorType.READ_DEADLINE_EXCEEDED,
 				"The request deadline came before the write was sent; it was not applied");
@@ -887,10 +918,15 @@ final class Proposer implements Closeable {
 				boolean viaSender = !commits && !leaderHint;
 				try {
 					(viaSender ? sender : submitter).execute(() -> sendTaken(batch, viaSender));
-				} catch (RejectedExecutionException ex) {
-					// The node is stopping: nothing of this batch was encoded or sent.
+				} catch (Throwable ex) {
+					// The node is stopping (RejectedExecutionException), or the pool could not start a thread (R61-6: an
+					// OutOfMemoryError "unable to create native thread", which does not end the JVM): nothing of this
+					// batch was encoded or sent. Left as it was, the batch kept its slot and its writes stayed unanswered.
 					encodingEnded(batch);
-					fail(batch, stopping());
+					if (!(ex instanceof RejectedExecutionException)) {
+						logNotHandedOver("A batch", ex);
+					}
+					fail(batch, ex instanceof RejectedExecutionException ? stopping() : notHandedOver(ex));
 					synchronized (this) {
 						batchesInFlight--;
 					}
@@ -1223,7 +1259,13 @@ final class Proposer implements Closeable {
 								boolean viaSender = !leaderHint;
 								try {
 									(viaSender ? sender : submitter).execute(() -> resend.accept(viaSender));
-								} catch (RejectedExecutionException stopping) {
+								} catch (Throwable notHandedOver) {
+									// Stopping, or no thread could start (R61-6): the timer's task would keep an Error to
+									// itself, and the batch its slot. The writes end as unanswered, which does not say
+									// why: the log does (review of R61, 6).
+									if (!(notHandedOver instanceof RejectedExecutionException)) {
+										logNotHandedOver("A resend", notHandedOver);
+									}
 									end.run();
 								}
 							}, delay, TimeUnit.MILLISECONDS);

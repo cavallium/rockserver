@@ -158,7 +158,8 @@ enum RocksDBErrorType {
   INVALID_REQUEST = 46,
   MERGE_OPERATOR_FAILED = 47,
   OUTCOME_UNKNOWN = 48,
-  SESSION_EXPIRED = 49
+  SESSION_EXPIRED = 49,
+  CLIENT_CLOSED = 50
 }
 
 exception RocksDBThriftException {

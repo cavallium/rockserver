@@ -89,7 +89,8 @@ class GrpcConnectionCloseNumberedWriteTest {
 					.putAsync(0, 1, new Keys(Buf.wrap(new byte[] {2})), Buf.wrap(new byte[] {2}), RequestType.none());
 			var error = assertThrows(ExecutionException.class, () -> late.get(15, TimeUnit.SECONDS));
 			var rocks = rocks(error);
-			assertEquals(RocksDBErrorType.SERVER_OVERLOADED, rocks.getErrorUniqueId(), rocks::toString);
+			// R61-7: a type of its own, not an overload that a caller would wait out for ever.
+			assertEquals(RocksDBErrorType.CLIENT_CLOSED, rocks.getErrorUniqueId(), rocks::toString);
 			assertTrue(rocks.isNotApplied(), () -> "not flagged not applied: " + rocks);
 			assertEquals(1, puts.get(), "the late write reached the server");
 

@@ -29,7 +29,7 @@ import reactor.core.scheduler.Schedulers;
  * {@code flushWalAsync} and of {@code openClientSessionAsync} is a {@link DeferredCall}: its cancel and its outcome are
  * those of the real connection's call once that call is made (R47-2). A call that fails before then was never sent,
  * and its failure says so ({@link RocksDBException#isNotApplied()}): {@code READ_DEADLINE_EXCEEDED} for a deadline spent
- * while connecting, {@code SERVER_OVERLOADED} for a closed client, as the direct client's (R48-4). A failure of the
+ * while connecting, {@code CLIENT_CLOSED} for a closed client, as the direct client's (R48-4, R61-7). A failure of the
  * factory or of the handshake keeps its own exception, a transport failure that callers classify by its gRPC status.
  */
 final class DeferredRockserverConnection implements RocksDBConnection {
@@ -130,10 +130,12 @@ final class DeferredRockserverConnection implements RocksDBConnection {
 
 	/**
 	 * The client is closed, and no connection carries the call: nothing was sent, so the failure says so (R48-4), as
-	 * SessionWrites' for a write on a closed client.
+	 * SessionWrites' for a write on a closed client. {@code CLIENT_CLOSED}, not {@code SERVER_OVERLOADED} as it was: a
+	 * caller that waits out an overload without bound would send for ever a call that this client will never send
+	 * (R61-7).
 	 */
 	private static RuntimeException closedBeforeSent() {
-		return RocksDBException.notApplied(RocksDBErrorType.SERVER_OVERLOADED,
+		return RocksDBException.notApplied(RocksDBErrorType.CLIENT_CLOSED,
 				"Rockserver connection is closed; the request was not sent");
 	}
 

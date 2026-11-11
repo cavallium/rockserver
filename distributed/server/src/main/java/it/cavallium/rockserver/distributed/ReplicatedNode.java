@@ -256,6 +256,9 @@ public final class ReplicatedNode implements AutoCloseable {
 			this.apiServer = new GrpcServer(connection, new InetSocketAddress(apiHost, self.apiPort()));
 			apiServer.start();
 			started.add(apiServer);
+			// What the numbered streamed multi writes being collected hold of the API server's collect budget (64 MiB by
+			// default): while it is full, every such write is refused as overloaded.
+			metrics.exportedGauge("api.multi_collect.bytes", () -> apiServer.numberedMultiCollectBytes());
 			this.apiGateThread = Executors.newSingleThreadScheduledExecutor(
 					Thread.ofPlatform().daemon().name("rockserver-" + config.nodeId() + "-api-gate").factory());
 			this.raftWatchThread = Executors.newSingleThreadScheduledExecutor(

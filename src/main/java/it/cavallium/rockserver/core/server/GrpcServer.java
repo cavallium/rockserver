@@ -151,6 +151,14 @@ public class GrpcServer extends Server {
 		return DEFAULT_MAX_INBOUND_MESSAGE_BYTES;
 	}
 
+	/**
+	 * The counted bytes that the numbered streamed multi writes being collected hold now, of the server's collect
+	 * budget ({@code rockserver.grpc.numbered-multi-collect-bytes}): a replicated node exports it as a gauge.
+	 */
+	public long numberedMultiCollectBytes() {
+		return grpc.numberedCollectBytes();
+	}
+
 	@Override
 	public void start() throws IOException {
 		transport.start();

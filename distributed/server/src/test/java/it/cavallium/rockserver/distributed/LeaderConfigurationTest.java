@@ -98,6 +98,60 @@ class LeaderConfigurationTest {
 		assertTrue(settled.waitingFor().contains("a leader"), settled.waitingFor());
 	}
 
+	private static MemberAnswer followerOf(String id, String leaderId, String leaderAddress) {
+		return new MemberAnswer(id, RaftPeerRole.FOLLOWER, 0, 2, conf(List.of("n2", "n3", "n4"), List.of()),
+				leaderId == null ? null : new ReplicatedServerMain.LeaderHint(leaderId, leaderAddress, id));
+	}
+
+	/**
+	 * R61-11: the leader that the members of {@code --peer} name and that is not in {@code --peer} is asked too, once
+	 * per id and address; a leader in {@code --peer} was asked already, and a member that names none adds nothing.
+	 */
+	@Test
+	void theLeaderNamedByTheMembersIsAskedWhenItIsNotInPeer() {
+		var given = List.of("n2", "n3");
+		var outside = ReplicatedServerMain.leadersOutside(List.of(followerOf("n2", "n4", "10.0.0.4:9001"),
+				followerOf("n3", "n4", "10.0.0.4:9001")), given);
+		assertEquals(List.of(new ReplicatedServerMain.LeaderHint("n4", "10.0.0.4:9001", "n2")), outside);
+		assertEquals(List.of(), ReplicatedServerMain.leadersOutside(List.of(followerOf("n2", "n3", "10.0.0.3:9001"),
+				followerOf("n3", null, ""), leader("n3", 2, List.of("n2", "n3", "n4"))), given));
+		// Two addresses for one id (a member with an older configuration): both are asked.
+		assertEquals(2, ReplicatedServerMain.leadersOutside(List.of(followerOf("n2", "n4", "10.0.0.4:9001"),
+				followerOf("n3", "n4", "10.0.0.5:9001")), given).size());
+	}
+
+	/** R61-11: a follower's answer names its leader with the address of the follower's configuration. */
+	@Test
+	void aFollowersAnswerNamesItsLeaderAtTheAddressOfItsConfiguration() {
+		var role = RaftProtos.RoleInfoProto.newBuilder().setRole(RaftPeerRole.FOLLOWER)
+				.setFollowerInfo(RaftProtos.FollowerInfoProto.newBuilder().setLeaderInfo(
+						RaftProtos.ServerRpcProto.newBuilder().setId(RaftProtos.RaftPeerProto.newBuilder()
+								.setId(ByteString.copyFromUtf8("n4")).setAddress("stale:1")))).build();
+		var conf = RaftProtos.RaftConfigurationProto.newBuilder().addPeers(peer("n2")).addPeers(
+				RaftProtos.RaftPeerProto.newBuilder().setId(ByteString.copyFromUtf8("n4")).setAddress("10.0.0.4:9001"))
+				.build();
+		assertEquals(new ReplicatedServerMain.LeaderHint("n4", "10.0.0.4:9001", "n2"),
+				MemberAnswer.namedLeader("n2", role, conf));
+		assertEquals(new ReplicatedServerMain.LeaderHint("n4", "stale:1", "n2"), MemberAnswer.namedLeader("n2", role, null));
+		// No leader known (Ratis leaves the id empty), and a leader's own answer: none named.
+		var none = RaftProtos.RoleInfoProto.newBuilder().setRole(RaftPeerRole.FOLLOWER)
+				.setFollowerInfo(RaftProtos.FollowerInfoProto.newBuilder().setLeaderInfo(
+						RaftProtos.ServerRpcProto.newBuilder().setId(RaftProtos.RaftPeerProto.getDefaultInstance()))).build();
+		assertNull(MemberAnswer.namedLeader("n2", none, conf));
+		assertNull(MemberAnswer.namedLeader("n2",
+				RaftProtos.RoleInfoProto.newBuilder().setRole(RaftPeerRole.LEADER).build(), conf));
+	}
+
+	/** R61-11: a leader outside {@code --peer} that does not answer is named in the wait, with what to add. */
+	@Test
+	void aLeaderOutsidePeerThatDoesNotAnswerIsNamedInTheWait() {
+		assertEquals("", ReplicatedServerMain.notInPeer(List.of()));
+		var text = ReplicatedServerMain.notInPeer(List.of(new ReplicatedServerMain.LeaderHint("n4", "10.0.0.4:9001", "n2")));
+		assertTrue(text.contains("n2 names n4 as the leader, which is not in --peer and did not answer at 10.0.0.4:9001"),
+				text);
+		assertTrue(text.contains("add it with --peer"), text);
+	}
+
 	private static Membership membership(String leader, long term, List<String> voters) {
 		return new Membership(leader, term, voters.stream().map(id -> RaftPeer.newBuilder().setId(id)
 				.setAddress("127.0.0.1:1").build()).toList(), List.of());

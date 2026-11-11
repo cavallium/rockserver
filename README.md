@@ -169,6 +169,8 @@ The connection uses one node at a time, and moves within the one gRPC channel, s
 | `it.cavallium.rockserver.grpc.client.leader-hint` | `listed` | With several addresses, which leader addresses named by the nodes the connection uses for the calls the leader serves: `listed` only those in its list, `any` any, `off` none. A server could otherwise send the client anywhere, and the address the members use among themselves may not be reachable from the client. |
 | `it.cavallium.rockserver.grpc.server.max-connection-age-ms` | `0` (off) | On a server in front of another connection, such as a replicated node, the age at which a connection ends, +/-10%. The client then starts again from the top of its list, which is what brings it back to the first address. It has two costs: a silent first address costs every client the connect timeout at every cycle, not once, and calls that outlive the grace below fail with `UNAVAILABLE`, which includes `Compact` and long scans, on a healthy cluster too. Left off, a client stays on the node it failed over to until that node goes away. |
 | `it.cavallium.rockserver.grpc.server.max-connection-age-grace-ms` | `600000` | With a maximum age, the time left to the calls running on a connection that reached it. |
+| `it.cavallium.rockserver.grpc.server.keep-alive-time-ms` | `0` (off) | On the server, silence on a client connection before the server pings it. Off, gRPC's own default applies (a ping after two hours). With a time, a client host that vanished without closing its connections is noticed after the time plus the timeout and its calls end; a client frozen for that long loses its connection too. |
+| `it.cavallium.rockserver.grpc.server.keep-alive-timeout-ms` | `20000` | With a server keepalive time, the wait for the answer to a ping. |
 
 On a replicated cluster, when the node that died was the leader, the new calls also wait for the election.
 
@@ -185,7 +187,9 @@ numbered whatever its size; split a larger multi write yourself, or use `putBatc
 loss. `putBatch` and `mergeBatch` (when the server also advertises
 `numberedBatches`; otherwise they are streamed once, unnumbered, as before) are sent as numbered chunks of at most
 4 MiB, one call per chunk, in order, within the call's deadline; once a chunk took effect, a later failure ends the
-call with `INVALID_REQUEST` ("partly applied"), since resending the whole batch would apply the first chunks twice. When its outcome is unknown, because the connection was lost (`UNAVAILABLE`, or `CANCELLED` by a
+call with `INVALID_REQUEST` ("partly applied"), since resending the whole batch would apply the first chunks twice. A streamed
+multi write that goes unnumbered (over 4 MiB, or without sessions) is applied by the server item by item, and ends
+the same way, never flagged "not applied", when an item fails after earlier ones were applied. When its outcome is unknown, because the connection was lost (`UNAVAILABLE`, or `CANCELLED` by a
 server that stops) or the server answered `OUTCOME_UNKNOWN`, the connection sends the same numbered write again,
 after a pause of 50 ms that doubles up to 1 s, to whichever node it reaches, until the caller's deadline. The cluster
 applies a numbered write once and answers every copy with the first result. Only when the deadline ends that does the
@@ -196,7 +200,12 @@ write's future stops the resends: the future ends with `OUTCOME_UNKNOWN` if a co
 none was. A write that could not get a session was never sent: it ends with the failure flagged "not applied"
 (`SERVER_OVERLOADED` when the opening's own outcome was unknown), also when its own deadline came while it waited
 for a session another write was opening, including after its only copy was refused because its session had expired
-(`SESSION_EXPIRED`: that copy did not run). A synchronous call waits at most its deadline plus 5 s; if that cancels a
+(`SESSION_EXPIRED`: that copy did not run). A call that a closed client never sent says so:
+it fails with `CLIENT_CLOSED` flagged "not applied" (not `SERVER_OVERLOADED`: do not wait it out, the client will
+never send it). That holds for every call of the deferred client (`ClientBuilder.setDeferred(true)`) and for the
+numbered writes of a direct gRPC connection; its other calls (reads, unnumbered writes, every call with sessions
+off) are handed to the closed channel and fail with gRPC's own shutdown status, not flagged. A Java client built
+before this type cannot read it when a proxy server passes it on (`docs/distributed/design.md`, review of R61, 5). A synchronous call waits at most its deadline plus 5 s; if that cancels a
 write of which no copy was sent, it throws `READ_DEADLINE_EXCEEDED` flagged "not applied". A write staged in a transaction is sent once, as
 before: if its outcome is unknown, roll the transaction back and run it again, never send the staged write again.
 The connection decides whether it uses sessions once, at its handshake, and logs it: recreate it after upgrading
@@ -220,7 +229,13 @@ write reads its input stream whole before sending it (and its results whole befo
 stream is sent unnumbered and streamed, as before, once and without resends. Each chunk of a `put_batch` or
 `merge_batch` without a deadline gets its own 30 s window. On the server, numbered streamed multi writes being
 collected share a heap budget (`-Drockserver.grpc.numbered-multi-collect-bytes`, 64 MiB by default); one that does
-not fit is refused as `SERVER_OVERLOADED` with the not-applied flag: safe to send again.
+not fit is refused as `SERVER_OVERLOADED` with the not-applied flag: safe to send again. A collection that gets no
+item for `-Drockserver.grpc.numbered-multi-collect-idle-ms` (30 s by default, 0 for no limit) ends
+`READ_DEADLINE_EXCEEDED` with the not-applied flag and gives its share back, so a client that vanished mid-stream
+does not keep it. The limit is between whole items: one large item (up to 4 MiB) that takes longer than the limit
+to arrive, on a link slower than about 1.1 Mbit/s, ends the same way at every resend, so raise the property on
+nodes that serve such clients. The Rust client reads answers of up to 64 MiB (`MAX_DECODING_MESSAGE_SIZE`, as the Java client;
+`with_max_decoding_message_size` changes it); a larger answer to a numbered write ends `OUTCOME_UNKNOWN`.
 `client_sessions()` tells whether a view numbers; `without_client_sessions()` gives one that sends every write once.
 
 A replicated node without a leader for that long serves again by itself: once it has known a leader for one maximum

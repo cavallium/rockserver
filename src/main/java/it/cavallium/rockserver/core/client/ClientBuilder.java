@@ -24,7 +24,7 @@ public class ClientBuilder {
 	 * client report the call's own outcome: a cancel before the connection exists sends nothing, one after is the
 	 * call's cancel (a numbered write that sent a copy refuses it and ends OUTCOME_UNKNOWN), as without deferral. A call
 	 * that fails before the connection exists was never sent, and says so as without deferral: its deadline spent while
-	 * connecting is a {@code READ_DEADLINE_EXCEEDED}, a closed client a {@code SERVER_OVERLOADED}, both
+	 * connecting is a {@code READ_DEADLINE_EXCEEDED}, a closed client a {@code CLIENT_CLOSED}, both
 	 * {@link it.cavallium.rockserver.core.common.RocksDBException#isNotApplied() not applied}; a failure to connect keeps
 	 * its own exception (R48-4).
 	 */

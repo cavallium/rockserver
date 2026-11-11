@@ -22,6 +22,11 @@ use tonic::{Request, Status}; // Disambiguate from proto
 pub type Result<T> = std::result::Result<T, Status>;
 
 pub const REQUIRED_WORKLOAD_CONTRACT_VERSION: i32 = 3;
+/// The largest response message the client decodes, in bytes: 64 MiB, the default of the Java client
+/// (`it.cavallium.rockserver.grpc.client.max-inbound-message-size-bytes`), instead of tonic's 4 MiB. A larger answer
+/// fails with an `OUT_OF_RANGE` of the client's own decoder; for a numbered write that is an unknown outcome
+/// ([`crate::sessions::is_outcome_unknown`]). [`RockserverClient::with_max_decoding_message_size`] changes it.
+pub const MAX_DECODING_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
 
 /// The content hash `check_merge_operator` takes: SHA-256 of the jar, as the server computes it.
 pub fn merge_operator_hash(jar_payload: &[u8]) -> Vec<u8> {
@@ -172,7 +177,8 @@ impl RockserverClient {
 
     fn with_capabilities(channel: Channel, context: RequestContext, capabilities: &CapabilitiesResponse) -> Self {
         Self {
-            client: RocksDbServiceClient::with_interceptor(channel, DeadlineInterceptor),
+            client: RocksDbServiceClient::with_interceptor(channel, DeadlineInterceptor)
+                .max_decoding_message_size(MAX_DECODING_MESSAGE_SIZE),
             context,
             sessions: capabilities
                 .client_sessions
@@ -184,7 +190,8 @@ impl RockserverClient {
     #[cfg(test)]
     fn new_unchecked(channel: Channel, context: RequestContext) -> Self {
         Self {
-            client: RocksDbServiceClient::with_interceptor(channel, DeadlineInterceptor),
+            client: RocksDbServiceClient::with_interceptor(channel, DeadlineInterceptor)
+                .max_decoding_message_size(MAX_DECODING_MESSAGE_SIZE),
             context,
             sessions: None,
             session_retry_window: DEFAULT_RETRY_WINDOW,
@@ -1743,6 +1750,15 @@ impl RockserverClient {
         }
     }
 
+    /// A view of this client that decodes response messages of up to `limit` bytes
+    /// ([`MAX_DECODING_MESSAGE_SIZE`] by default).
+    pub fn with_max_decoding_message_size(&self, limit: usize) -> Self {
+        Self {
+            client: self.client.clone().max_decoding_message_size(limit),
+            ..self.clone()
+        }
+    }
+
     /// A view of this client that resends a numbered write of a context without a deadline for at most `window`
     /// (30 seconds by default).
     pub fn with_session_retry_window(&self, window: Duration) -> Self {
@@ -2888,6 +2904,100 @@ mod numbered_multi_tests {
             elapsed < Duration::from_secs(4),
             "ended after {elapsed:?}"
         );
+    }
+
+    /// A server that answers every call of the service with one result of 5 MiB.
+    #[derive(Clone)]
+    struct AnswersFiveMebibytes;
+
+    impl tonic::server::NamedService for AnswersFiveMebibytes {
+        const NAME: &'static str = "it.cavallium.rockserver.core.common.api.proto.RocksDBService";
+    }
+
+    struct LargeResult;
+
+    impl tonic::server::StreamingService<PutMultiRequest> for LargeResult {
+        type Response = Previous;
+        type ResponseStream = futures::stream::BoxStream<'static, Result<Previous>>;
+        type Future = std::future::Ready<Result<tonic::Response<Self::ResponseStream>>>;
+
+        fn call(&mut self, request: Request<tonic::Streaming<PutMultiRequest>>) -> Self::Future {
+            let results = async_stream::stream! {
+                let mut request = request.into_inner();
+                while let Ok(Some(_)) = request.message().await {}
+                yield Ok(Previous { previous: Some(vec![7u8; 5 * 1024 * 1024]) });
+            };
+            std::future::ready(Ok(tonic::Response::new(results.boxed())))
+        }
+    }
+
+    impl tonic::codegen::Service<tonic::codegen::http::Request<tonic::body::BoxBody>> for AnswersFiveMebibytes {
+        type Response = tonic::codegen::http::Response<tonic::body::BoxBody>;
+        type Error = std::convert::Infallible;
+        type Future = futures::future::BoxFuture<'static, std::result::Result<Self::Response, Self::Error>>;
+
+        fn poll_ready(
+            &mut self,
+            _context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::result::Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, request: tonic::codegen::http::Request<tonic::body::BoxBody>) -> Self::Future {
+            Box::pin(async move {
+                let mut grpc = tonic::server::Grpc::new(tonic::codec::ProstCodec::default());
+                Ok(grpc.streaming(LargeResult, request).await)
+            })
+        }
+    }
+
+    /// R61-10: the client accepts answers up to [`MAX_DECODING_MESSAGE_SIZE`] (64 MiB, the Java client's default),
+    /// not tonic's 4 MiB. A numbered write whose result is 5 MiB was applied and answered, and the client failed it
+    /// with a bare `OUT_OF_RANGE` of its own decoder, which reads as a plain failure of the write.
+    #[tokio::test]
+    async fn an_answer_over_tonics_four_mebibytes_is_read() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let incoming = tonic::transport::server::TcpIncoming::from_listener(listener, true, None).unwrap();
+        let server = tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(AnswersFiveMebibytes)
+                .serve_with_incoming(incoming),
+        );
+        let channel = Endpoint::from_shared(format!("http://127.0.0.1:{port}"))
+            .unwrap()
+            .connect_lazy();
+        let mut client = RockserverClient::new_unchecked(
+            channel,
+            RequestContext::batch_with_timeout(Duration::from_secs(20)),
+        );
+        client.sessions = Some(Arc::new(SessionWrites::with_open_session(true, 7)));
+        let item = || {
+            futures::stream::iter([Kv {
+                keys: vec![vec![1]],
+                value: vec![1],
+            }])
+        };
+        let numbered = client.put_multi_get_previous(0, 1, item()).await;
+        let unnumbered = client
+            .without_client_sessions()
+            .put_multi_get_previous(0, 1, item())
+            .await;
+        let mut read = Vec::new();
+        for results in [numbered, unnumbered] {
+            let results: Vec<_> = match results {
+                Ok(results) => results.collect().await,
+                Err(error) => vec![Err(error)],
+            };
+            read.push(results);
+        }
+        server.abort();
+        for (results, kind) in read.into_iter().zip(["numbered", "unnumbered"]) {
+            assert_eq!(results.len(), 1, "{kind}");
+            let previous = results.into_iter().next().unwrap();
+            let previous = previous.unwrap_or_else(|error| panic!("{kind}: {error:?}"));
+            assert_eq!(previous.previous.map(|value| value.len()), Some(5 * 1024 * 1024), "{kind}");
+        }
     }
 
     /// R6-4 review: a caller without a deadline gets its retry window from the moment the write is sent, not from

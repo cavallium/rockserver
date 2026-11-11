@@ -730,6 +730,77 @@ class ReplicationTest {
 	}
 
 	/**
+	 * R61-2: a failure while the completer completes a group fails that group's replies and names that group's last
+	 * position, also when the apply thread has gone on to a later group meanwhile. The completer's handler read the
+	 * apply thread's list, which that thread clears and refills for each group: it failed the replies of the later
+	 * group, left its own unanswered, and named the later position.
+	 */
+	@Test
+	void aCompletionThatFailsFailsItsOwnGroupWhileTheApplyThreadWorksOnTheNext() throws Exception {
+		cluster = new InProcessCluster(temp, 1, c -> c).startAll();
+		var node = cluster.awaitLeader(TIMEOUT);
+		long column = api(node).createColumn("c", SCHEMA);
+		cluster.awaitConverged(TIMEOUT);
+		var stateMachine = node.stateMachine();
+		var failure = new IllegalStateException("Injected completion failure");
+		var entered = new CountDownLatch(1);
+		var gate = new CountDownLatch(1);
+		var once = new java.util.concurrent.atomic.AtomicBoolean();
+		stateMachine.testHooks().beforeCompletions = () -> {
+			if (once.compareAndSet(false, true)) {
+				entered.countDown();
+				try {
+					gate.await(TIMEOUT.toSeconds(), TimeUnit.SECONDS);
+				} catch (InterruptedException ex) {
+					Thread.currentThread().interrupt();
+				}
+				throw failure;
+			}
+		};
+		long handedOver;
+		CompletableFuture<?> first;
+		CompletableFuture<?> second;
+		try {
+			first = node.connection().getAsyncApi(CONTEXT).putAsync(0, column, key(1), text("first"),
+					RequestType.none());
+			assertTrue(entered.await(TIMEOUT.toSeconds(), TimeUnit.SECONDS), "the first group never reached the completer");
+			handedOver = stateMachine.handedOverForTesting();
+			second = node.connection().getAsyncApi(CONTEXT).putAsync(0, column, key(2), text("second"),
+					RequestType.none());
+			// The apply thread applied the second group (its list now holds it) and queued its completions.
+			InProcessCluster.await(TIMEOUT, () -> "second".equals(localValue(node, column, 2)));
+		} finally {
+			gate.countDown();
+		}
+		var stopped = node.stopped().get(TIMEOUT.toSeconds(), TimeUnit.SECONDS);
+		assertSame(failure, stopped);
+		assertTrue(node.isFailed());
+		var failed = stateMachine.completionFailureForTesting();
+		assertNotNull(failed, "the completer's failure was not recorded");
+		long firstIndex = handedOver;
+		assertTrue(failed.getIndex() <= firstIndex,
+				() -> "the failure names a later group's position: " + failed + ", the first group ended by " + firstIndex);
+		// The first write's reply carries the failure; the handler failed the second group's reply instead.
+		var firstWrite = first;
+		var firstError = assertThrows(ExecutionException.class, () -> firstWrite.get(10, TimeUnit.SECONDS));
+		assertTrue(causes(firstError).contains("Injected completion failure"), causes(firstError));
+		try {
+			second.get(10, TimeUnit.SECONDS);
+		} catch (ExecutionException secondError) {
+			assertTrue(!causes(secondError).contains("Injected completion failure"), causes(secondError));
+		}
+		cluster.halt(node.config().nodeId());
+	}
+
+	private static String causes(Throwable error) {
+		var text = new StringBuilder();
+		for (Throwable cause = error; cause != null; cause = cause.getCause()) {
+			text.append(cause).append(" <- ");
+		}
+		return text.toString();
+	}
+
+	/**
 	 * A follower whose apply fails while Ratis waits for room in its apply queue stops (the failure frees the queue),
 	 * and the leader goes on with the other follower.
 	 */

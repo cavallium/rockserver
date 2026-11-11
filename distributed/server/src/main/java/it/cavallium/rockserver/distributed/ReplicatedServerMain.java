@@ -9,10 +9,13 @@ import java.nio.file.Path;
 import java.security.SecureRandom;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.TreeMap;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
@@ -182,6 +185,11 @@ import org.rocksdb.NativeLibraryLoader;
  *
  * <p>{@code --snapshot-every-bytes}, 4 GiB by default, makes a node also take a snapshot once it applied that many bytes
  * of log entries since its latest one, besides every {@code --snapshot-every} entries.</p>
+ *
+ * <p>Values are checked before anything starts, and a wrong one is wrong usage (exit 2): the request timeout, the
+ * election timeouts and {@code admin --timeout-ms} are positive, a port of {@code --peer} is in 1 to 65535 (R61-3,
+ * R61-12). {@code add-peer} and {@code remove-peer} read the leader's configuration also from a leader that is not in
+ * {@code --peer}, which the members listed name (R61-11, {@code leaderConfiguration}).</p>
  *
  * <p>{@code --parallel-apply-threads}, 0 (off) by default, applies the data entries of each group on that many threads
  * (at least 2), split by key, with the result of the serial apply: see "Partitioned apply" in the design document.</p>
@@ -687,6 +695,7 @@ public final class ReplicatedServerMain {
 	}
 
 	private static void admin(Options options) throws IOException, InterruptedException {
+		NOTED_LEADERS.get().clear();
 		var peers = options.peers();
 		var groupId = RaftGroupId.valueOf(options.uuid("--group-id", NodeConfig.DEFAULT_GROUP_ID));
 		var timeout = Duration.ofMillis(options.longValue("--timeout-ms", DEFAULT_ADMIN_TIMEOUT.toMillis()));
@@ -713,6 +722,11 @@ public final class ReplicatedServerMain {
 		// stays comparable with System.nanoTime) was an ArithmeticException, exit 1 with a stack trace.
 		if (timeout.compareTo(MAX_ADMIN_TIMEOUT) > 0) {
 			usage("invalid --timeout-ms " + timeout.toMillis() + ": at most " + MAX_ADMIN_TIMEOUT.toMillis());
+		}
+		// R61-12: zero or negative, the deadline was in the past (a time-limit failure, exit 1), and below about
+		// -9.2e12 toNanos() overflowed like the upper bound.
+		if (timeout.isNegative() || timeout.isZero()) {
+			usage("invalid --timeout-ms " + timeout.toMillis() + ": not positive");
 		}
 		long deadline = System.nanoTime() + timeout.toNanos();
 		var group = RaftGroup.valueOf(groupId, peers.stream().map(ReplicatedServerMain::raftPeer).toList());
@@ -1481,12 +1495,26 @@ public final class ReplicatedServerMain {
 	}
 
 	/**
+	 * The leaders outside {@code --peer} (id and address) that this thread's {@code admin} command has printed its
+	 * {@code NOTE:} line for: a command reads the leader's configuration several times (the check, then each round of
+	 * the change), and says it once (review of R61, 7). Cleared when a command starts.
+	 */
+	private static final ThreadLocal<Set<String>> NOTED_LEADERS = ThreadLocal.withInitial(HashSet::new);
+
+	/**
 	 * Asks the members of {@code --peer} until their answers settle on a leader with a settled (not joint)
 	 * configuration ({@link #settle}): a joint one means a change is under way, which it waits for. Fails at the deadline.
+	 *
+	 * <p>R61-11: a leader that is not in {@code --peer} is asked too, at the Raft address that the configuration of the
+	 * member that names it gives ({@link #leadersOutside}); its answer is settled with the others', and a line says that
+	 * it was asked. "Replacing a node" in the runbooks gives such lists ({@code --peer n2 --peer n3} after n4 was added,
+	 * before it is in {@code PEERS}): with n4 leading, the command waited the whole {@code --timeout-ms} for one of
+	 * {@code --peer} to lead. If that leader does not answer at that address, the wait says so and names it.</p>
 	 */
 	private static Membership leaderConfiguration(RaftClient infoClient, List<PeerConfig> peers, RaftGroupId groupId,
 			long deadlineNanos) throws InterruptedException {
 		String waitingFor = "an answer of a member";
+		var given = peers.stream().map(PeerConfig::id).toList();
 		while (true) {
 			// Down, or not in the group: the others answer.
 			var answers = askAll(peers, peer -> {
@@ -1498,17 +1526,96 @@ public final class ReplicatedServerMain {
 				}
 			});
 			if (!answers.isEmpty()) {
-				var settled = settle(answers);
-				if (settled.membership() != null) {
-					return settled.membership();
+				var outside = leadersOutside(answers, given);
+				var silent = new ArrayList<LeaderHint>();
+				for (var hint : outside) {
+					MemberAnswer answer = hint.address().isEmpty() ? null : askOutside(hint, peers, groupId, deadlineNanos);
+					if (answer != null) {
+						answers.add(answer);
+					} else {
+						silent.add(hint);
+					}
 				}
-				waitingFor = settled.waitingFor();
+				var settled = settle(answers);
+				var membership = settled.membership();
+				if (membership != null) {
+					outside.stream().filter(hint -> hint.id().equals(membership.leader())).findFirst()
+							.filter(hint -> NOTED_LEADERS.get().add(hint.id() + "@" + hint.address())).ifPresent(hint ->
+							System.out.println("NOTE: the leader " + hint.id() + " is not in --peer: asked at " + hint.address()
+									+ ", its Raft address in the configuration of " + hint.namedBy() + ". A change proposed with"
+									+ " this --peer would also remove " + hint.id() + ", like every voter that --peer lacks (a"
+									+ " change of more than one voter is refused)"));
+					return membership;
+				}
+				waitingFor = settled.waitingFor() + notInPeer(silent);
 			}
 			if (System.nanoTime() - deadlineNanos > 0) {
 				fail("no result within the time limit (--timeout-ms): still waiting for " + waitingFor
 						+ ". Nothing was proposed");
 			}
 			Thread.sleep(SEED_SNAPSHOT_POLL_MS);
+		}
+	}
+
+	/**
+	 * The leader that a member of {@code --peer} names and that is not itself in {@code --peer} (R61-11): its id, its
+	 * Raft address in that member's configuration (else the one of the member's role info; empty if it gives none), and
+	 * the member that names it.
+	 */
+	record LeaderHint(String id, String address, String namedBy) {}
+
+	/**
+	 * The leaders that {@code answers} name and that are not among {@code given}, the ids of {@code --peer}: one per id
+	 * and address, in the order of the answers. A member that leads, or knows no leader, names none.
+	 */
+	static List<LeaderHint> leadersOutside(List<MemberAnswer> answers, Collection<String> given) {
+		var hints = new ArrayList<LeaderHint>();
+		for (var answer : answers) {
+			var named = answer.namedLeader();
+			if (named != null && !given.contains(named.id()) && hints.stream().noneMatch(hint ->
+					hint.id().equals(named.id()) && hint.address().equals(named.address()))) {
+				hints.add(named);
+			}
+		}
+		return hints;
+	}
+
+	/** What a wait for a leader adds about the leaders outside {@code --peer} that did not answer; empty if none. */
+	static String notInPeer(List<LeaderHint> silent) {
+		if (silent.isEmpty()) {
+			return "";
+		}
+		return "; " + silent.stream().map(hint -> hint.namedBy() + " names " + hint.id() + " as the leader, which is not"
+				+ " in --peer and " + (hint.address().isEmpty() ? "has no address in its configuration"
+						: "did not answer at " + hint.address() + ", its Raft address in the configuration of " + hint.namedBy()))
+				.collect(java.util.stream.Collectors.joining("; ")) + ": add it with --peer ID=RAFTHOST:PORT/APIHOST:PORT";
+	}
+
+	/**
+	 * Asks the leader {@code hint}, which is not in {@code --peer}, once; null if it does not answer. It waits for the
+	 * answer no longer than the nodes' clients do (the default maximum election timeout) and no longer than what is left
+	 * until {@code deadlineNanos}, and does not ask once that has passed (review of R61, 7: a silent leader made each
+	 * round overrun {@code --timeout-ms} by the whole client timeout). A client per question: the address comes from
+	 * an answer and can change between rounds, and the rounds are {@link #SEED_SNAPSHOT_POLL_MS} apart.
+	 */
+	private static @Nullable MemberAnswer askOutside(LeaderHint hint, List<PeerConfig> peers, RaftGroupId groupId,
+			long deadlineNanos) {
+		long leftNanos = deadlineNanos - System.nanoTime();
+		if (leftNanos <= 0) {
+			return null;
+		}
+		var anyConfig = NodeConfig.defaults(peers.getFirst().id(), peers, Path.of("."));
+		var question = min(anyConfig.electionTimeoutMax(), Duration.ofMillis(Math.max(1, leftNanos / 1_000_000)));
+		var peer = RaftPeer.newBuilder().setId(hint.id()).setAddress(hint.address()).build();
+		try (var client = RaftClient.newBuilder()
+				.setClientId(ClientId.randomId())
+				.setRaftGroup(RaftGroup.valueOf(groupId, peer))
+				.setProperties(RaftSettings.adminClient(anyConfig, question))
+				.setRetryPolicy(RetryPolicies.noRetry())
+				.build()) {
+			return MemberAnswer.of(hint.id(), client.getGroupManagementApi(peer.getId()).info(groupId));
+		} catch (IOException | RuntimeException unanswered) {
+			return null;
 		}
 	}
 
@@ -1595,16 +1702,51 @@ public final class ReplicatedServerMain {
 
 	/**
 	 * One member's answer to {@link #leaderConfiguration}: its role, its term if it leads ({@code leaderTerm}, else 0),
-	 * the term of the last entry of its log (0 if none), and its configuration (null if it sent none).
+	 * the term of the last entry of its log (0 if none), its configuration (null if it sent none), and the leader it
+	 * follows if that is another member ({@code namedLeader}, null if it leads or knows none; R61-11).
 	 */
 	record MemberAnswer(String id, RaftPeerRole role, long leaderTerm, long lastEntryTerm,
-			RaftProtos.@Nullable RaftConfigurationProto conf) {
+			RaftProtos.@Nullable RaftConfigurationProto conf, @Nullable LeaderHint namedLeader) {
+
+		MemberAnswer(String id, RaftPeerRole role, long leaderTerm, long lastEntryTerm,
+				RaftProtos.@Nullable RaftConfigurationProto conf) {
+			this(id, role, leaderTerm, lastEntryTerm, conf, null);
+		}
+
 		static MemberAnswer of(String id, GroupInfoReply info) {
 			var role = info.getRoleInfoProto();
 			var log = info.getLogInfoProto();
+			var conf = info.getConf().orElse(null);
 			return new MemberAnswer(id, role.getRole(),
 					role.getRole() == RaftPeerRole.LEADER && role.hasLeaderInfo() ? role.getLeaderInfo().getTerm() : 0,
-					log != null && log.hasLastEntry() ? log.getLastEntry().getTerm() : 0, info.getConf().orElse(null));
+					log != null && log.hasLastEntry() ? log.getLastEntry().getTerm() : 0, conf, namedLeader(id, role, conf));
+		}
+
+		/**
+		 * The leader that a follower's role info names, with its address in the follower's configuration (the role
+		 * info's own if the configuration lacks it). Ratis 3.3.1 fills it from the follower's configuration, and leaves
+		 * the id empty while the follower knows no leader.
+		 */
+		static @Nullable LeaderHint namedLeader(String id, RaftProtos.RoleInfoProto role,
+				RaftProtos.@Nullable RaftConfigurationProto conf) {
+			if (role.getRole() != RaftPeerRole.FOLLOWER || !role.hasFollowerInfo()
+					|| !role.getFollowerInfo().hasLeaderInfo()) {
+				return null;
+			}
+			var leader = role.getFollowerInfo().getLeaderInfo().getId();
+			var leaderId = leader.getId().toStringUtf8();
+			if (leaderId.isEmpty() || leaderId.equals(id)) {
+				return null;
+			}
+			String address = leader.getAddress();
+			if (conf != null) {
+				for (var peer : conf.getPeersList()) {
+					if (peer.getId().toStringUtf8().equals(leaderId) && !peer.getAddress().isEmpty()) {
+						address = peer.getAddress();
+					}
+				}
+			}
+			return new LeaderHint(leaderId, address, id);
 		}
 	}
 

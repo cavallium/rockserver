@@ -71,6 +71,12 @@ public record NodeConfig(String nodeId,
 	/** 4 GiB: at 500k entries of the default interval, entries of 8 KiB on average. */
 	public static final long DEFAULT_SNAPSHOT_EVERY_BYTES = 4L << 30;
 
+	/**
+	 * The longest request timeout and election timeout (R61-3): 1000 days. Their multiples (30 request timeouts for a
+	 * session, 4 election timeouts) and the deadlines made of them stay far from the nanoseconds of a long.
+	 */
+	public static final Duration MAX_TIMEOUT = Duration.ofDays(1000);
+
 	public NodeConfig {
 		Objects.requireNonNull(nodeId, "nodeId");
 		peers = List.copyOf(peers);
@@ -84,8 +90,23 @@ public record NodeConfig(String nodeId,
 		if (peers.stream().map(PeerConfig::id).distinct().count() != peers.size()) {
 			throw new IllegalArgumentException("Duplicate peer ids");
 		}
+		// R61-3: zero or negative, the node started and failed every request at once (its deadlines were immediate, and
+		// its disk probe counted as hung whenever one was in flight); past MAX_TIMEOUT, toNanos() overflowed during the
+		// start, outside what run maps to wrong usage.
+		if (electionTimeoutMin.isNegative() || electionTimeoutMin.isZero()) {
+			throw new IllegalArgumentException("electionTimeoutMin must be positive");
+		}
 		if (electionTimeoutMin.compareTo(electionTimeoutMax) >= 0) {
 			throw new IllegalArgumentException("electionTimeoutMin must be lower than electionTimeoutMax");
+		}
+		if (electionTimeoutMax.compareTo(MAX_TIMEOUT) > 0) {
+			throw new IllegalArgumentException("electionTimeoutMax must be at most " + MAX_TIMEOUT.toMillis() + " ms");
+		}
+		if (requestTimeout.isNegative() || requestTimeout.isZero()) {
+			throw new IllegalArgumentException("requestTimeout must be positive");
+		}
+		if (requestTimeout.compareTo(MAX_TIMEOUT) > 0) {
+			throw new IllegalArgumentException("requestTimeout must be at most " + MAX_TIMEOUT.toMillis() + " ms");
 		}
 		if (snapshotEveryEntries <= 0) {
 			throw new IllegalArgumentException("snapshotEveryEntries must be positive");

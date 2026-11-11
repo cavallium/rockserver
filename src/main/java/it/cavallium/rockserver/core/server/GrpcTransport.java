@@ -133,6 +133,12 @@ final class GrpcTransport {
 		return interrupted;
 	}
 
+	/** Silence on a client connection before the server pings it, in milliseconds; zero, the default, leaves gRPC's. */
+	static final String KEEP_ALIVE_TIME_PROPERTY = "it.cavallium.rockserver.grpc.server.keep-alive-time-ms";
+	/** With a keepalive time, the wait for the answer to a ping before the connection is closed. */
+	static final String KEEP_ALIVE_TIMEOUT_PROPERTY = "it.cavallium.rockserver.grpc.server.keep-alive-timeout-ms";
+	private static final Duration DEFAULT_KEEP_ALIVE_TIMEOUT = Duration.ofSeconds(20);
+
 	private io.grpc.Server newTransport(SocketAddress socketAddress) {
 		var builder = NettyServerBuilder
 				.forAddress(socketAddress)
@@ -145,6 +151,15 @@ final class GrpcTransport {
 		}
 		if (leaderHint != null) {
 			builder.intercept(new LeaderHintInterceptor(leaderHint));
+		}
+		// Off by default: gRPC's own server default pings a connection after two hours of silence. With a time set, a
+		// client host that vanished without closing its connections (power loss, a cut link) is noticed after the time
+		// plus the timeout, and its calls end; a client frozen for that long loses its connection too.
+		var keepAliveTime = GrpcServerSettings.durationProperty(KEEP_ALIVE_TIME_PROPERTY, Duration.ZERO);
+		if (keepAliveTime.isPositive()) {
+			builder.keepAliveTime(keepAliveTime.toNanos(), TimeUnit.NANOSECONDS)
+					.keepAliveTimeout(GrpcServerSettings.durationProperty(KEEP_ALIVE_TIMEOUT_PROPERTY,
+							DEFAULT_KEEP_ALIVE_TIMEOUT).toNanos(), TimeUnit.NANOSECONDS);
 		}
 		return builder
 				.channelType(channelType)

@@ -345,7 +345,7 @@ class DeferredRockserverConnectionTest {
 	/**
 	 * R48-4: a call that fails before any connection exists was never sent, and says so as the direct client does
 	 * (GrpcConnection's expired deadline, SessionWrites' closed client): the deadline that came while connecting is a
-	 * not-applied READ_DEADLINE_EXCEEDED, and a closed client a not-applied SERVER_OVERLOADED, for a single call, a
+	 * not-applied READ_DEADLINE_EXCEEDED, and a closed client a not-applied CLIENT_CLOSED (R61-7; SERVER_OVERLOADED before), for a single call, a
 	 * stream, a WAL flush, a session opening and the synchronous API alike. A raw gRPC DEADLINE_EXCEEDED or an
 	 * IllegalStateException read as an unknown outcome. A failure of the connection itself (the factory, the
 	 * handshake) keeps its own exception: it is a transport failure, which callers classify by its gRPC status.
@@ -358,9 +358,9 @@ class DeferredRockserverConnectionTest {
 			int selected = operation;
 			var failure = assertThrows(ExecutionException.class,
 					() -> performAny(selected, closed).get(5, TimeUnit.SECONDS));
-			assertNotSent(RocksDBErrorType.SERVER_OVERLOADED, failure);
+			assertClosedNotSent(failure);
 		}
-		assertNotSent(RocksDBErrorType.SERVER_OVERLOADED,
+		assertClosedNotSent(
 				assertThrows(RuntimeException.class, () -> closed.getSyncApi(RequestContext.analytical())));
 
 		var entered = new CountDownLatch(1);
@@ -374,7 +374,7 @@ class DeferredRockserverConnectionTest {
 			var pending = closing.getAsyncApi(RequestContext.analytical()).getColumnIdAsync("pending");
 			assertTrue(entered.await(5, TimeUnit.SECONDS));
 			closing.close();
-			assertNotSent(RocksDBErrorType.SERVER_OVERLOADED,
+			assertClosedNotSent(
 					assertThrows(ExecutionException.class, () -> pending.get(5, TimeUnit.SECONDS)));
 		} finally {
 			release.countDown();
@@ -415,6 +415,17 @@ class DeferredRockserverConnectionTest {
 			case 3 -> deferred.openClientSessionAsync(context);
 			default -> throw new AssertionError(operation);
 		};
+	}
+
+	/**
+	 * R61-7: a closed client is not an overload. A caller that waits out {@code SERVER_OVERLOADED} for as long as it
+	 * takes would resend for ever a call that can never be sent; the failure has a type of its own, still flagged not
+	 * applied.
+	 */
+	private static void assertClosedNotSent(Throwable failure) {
+		var rocks = rocks(failure);
+		assertEquals(RocksDBErrorType.CLIENT_CLOSED, rocks.getErrorUniqueId(), rocks.toString());
+		assertTrue(rocks.isNotApplied(), "flagged not applied: " + rocks);
 	}
 
 	private static void assertNotSent(RocksDBErrorType type, Throwable failure) {

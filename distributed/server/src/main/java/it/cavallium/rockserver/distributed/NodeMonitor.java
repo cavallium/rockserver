@@ -1,7 +1,7 @@
 package it.cavallium.rockserver.distributed;
 
-import io.micrometer.core.instrument.Gauge;
-import io.micrometer.core.instrument.MeterRegistry;
+import it.cavallium.rockserver.core.impl.EmbeddedDB;
+import it.cavallium.rockserver.core.impl.StoragePressureSignal;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -334,19 +334,19 @@ final class NodeMonitor {
 		}
 	}
 
-	/** RocksDB's own stall state, from the gauges of the core server's storage pressure signal. */
+	/** RocksDB's own stall state, from the core server's storage pressure signal. */
 	private void checkWriteStall(long now) {
-		MeterRegistry registry;
+		EmbeddedDB db;
 		try {
 			var store = stateMachine.store();
-			registry = store == null ? null : store.db().getMetricsRegistry();
+			db = store == null ? null : store.db();
 		} catch (RuntimeException closing) {
-			registry = null;
+			db = null;
 		}
-		if (registry == null) {
+		if (db == null) {
 			return;
 		}
-		if (pressure(registry, "write_stopped")) {
+		if (writeStopped(db)) {
 			if (writeStopped.raised(now)) {
 				LOG.warn("{}: ALARM {}: RocksDB stopped writes on this node (write stall). Its apply waits, and so do the"
 						+ " cluster's writes if a majority stalls. Usually the compactions do not keep up, or the disk is full",
@@ -355,7 +355,7 @@ final class NodeMonitor {
 		} else if (writeStopped.cleared()) {
 			LOG.info("{}: alarm {} cleared", config.nodeId(), writeStopped.name);
 		}
-		if (pressure(registry, "delayed_write")) {
+		if (writeDelayed(db)) {
 			if (writeDelayed.raised(now)) {
 				LOG.warn("{}: ALARM {}: RocksDB slows writes on this node (delayed writes): compactions are behind",
 						config.nodeId(), writeDelayed.name);
@@ -365,9 +365,18 @@ final class NodeMonitor {
 		}
 	}
 
-	private static boolean pressure(MeterRegistry registry, String reason) {
-		Gauge gauge = registry.find("rockserver.workload.storage.pressure.reason").tag("reason", reason).gauge();
-		return gauge != null && gauge.value() > 0;
+	/**
+	 * Whether RocksDB stopped the writes of {@code db} (the {@code write-stopped} alarm). From the database's storage
+	 * pressure signal itself (R61-8), not its gauge: a gauge of the database's registry answers 0 while that registry
+	 * has no backend (JMX and InfluxDB both off or failed), and the alarm was never raised there.
+	 */
+	static boolean writeStopped(EmbeddedDB db) {
+		return (db.storagePressureReasons() & StoragePressureSignal.REASON_WRITE_STOPPED) != 0;
+	}
+
+	/** Whether RocksDB slows the writes of {@code db} down (the {@code write-delayed} alarm); see {@link #writeStopped}. */
+	static boolean writeDelayed(EmbeddedDB db) {
+		return (db.storagePressureReasons() & StoragePressureSignal.REASON_DELAYED_WRITE) != 0;
 	}
 
 	private static String bytes(double bytes) {

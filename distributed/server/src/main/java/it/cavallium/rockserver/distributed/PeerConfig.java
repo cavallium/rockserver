@@ -7,9 +7,9 @@ import java.util.Objects;
  *
  * @param id stable member id, also the Ratis peer id
  * @param raftHost host other members use to reach this member's Raft port
- * @param raftPort Raft (Ratis gRPC) port
+ * @param raftPort Raft (Ratis gRPC) port, 1 to 65535
  * @param apiHost host clients and other members use to reach the Rockserver API
- * @param apiPort Rockserver gRPC API port
+ * @param apiPort Rockserver gRPC API port, 1 to 65535
  */
 public record PeerConfig(String id, String raftHost, int raftPort, String apiHost, int apiPort) {
 
@@ -19,6 +19,15 @@ public record PeerConfig(String id, String raftHost, int raftPort, String apiHos
 		Objects.requireNonNull(apiHost, "apiHost");
 		if (id.isBlank() || id.contains(",") || id.contains("=")) {
 			throw new IllegalArgumentException("Invalid peer id: " + id);
+		}
+		// R61-12: any number parsed; a node then failed at bind, after the start-up checks, with exit 1.
+		requirePort("Raft", raftPort);
+		requirePort("API", apiPort);
+	}
+
+	private static void requirePort(String which, int port) {
+		if (port < 1 || port > 65535) {
+			throw new IllegalArgumentException("Invalid " + which + " port " + port + ": not in 1 to 65535");
 		}
 	}
 
@@ -49,6 +58,12 @@ public record PeerConfig(String id, String raftHost, int raftPort, String apiHos
 		if (colon <= 0) {
 			throw new IllegalArgumentException("Expected host:port, got: " + value);
 		}
-		return new HostPort(value.substring(0, colon), Integer.parseInt(value.substring(colon + 1)));
+		int port;
+		try {
+			port = Integer.parseInt(value.substring(colon + 1));
+		} catch (NumberFormatException ex) {
+			throw new IllegalArgumentException("Expected host:port with a port in 1 to 65535, got: " + value);
+		}
+		return new HostPort(value.substring(0, colon), port);
 	}
 }

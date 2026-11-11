@@ -97,7 +97,7 @@ groups:
         execErrState: Error
         labels: {severity: warning, team: rockserver}
         annotations:
-          summary: "More than 5 elections in 15 minutes: flapping links, long pauses or a stalled leader (leader.stall.stepdowns)."
+          summary: "A node's Raft term rose by more than 5 in 15 minutes: more than 5 elections (flapping links, long pauses or a stalled leader, leader.stall.stepdowns), or a node that was down or cut off through more than 5 terms came back. A node started with --join reports term 0 until add-peer makes it a member: those samples are left out, so adding it does not fire this."
         data:
           - refId: A
             relativeTimeRange: {from: 3600, to: 0}
@@ -107,7 +107,7 @@ groups:
               rawQuery: true
               resultFormat: time_series
               query: >-
-                SELECT spread("value") FROM "rockserver_replication_raft_term" WHERE "database-name" = 'CLUSTER' AND time > now() - 15m GROUP BY "node"
+                SELECT spread("value") FROM "rockserver_replication_raft_term" WHERE "database-name" = 'CLUSTER' AND "value" > 0 AND time > now() - 15m GROUP BY "node"
           - refId: B
             datasourceUid: __expr__
             model: {refId: B, type: reduce, expression: A, reducer: last, settings: {mode: dropNN}}

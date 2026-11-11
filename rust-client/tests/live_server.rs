@@ -333,6 +333,13 @@ async fn numbered_writes_against_a_live_server() {
     assert!(!plain.client_sessions());
     plain.put(0, column, key(60), b"plain".to_vec()).await.unwrap();
     assert_eq!(text(&client.get(0, column, key(60)).await.unwrap()).as_deref(), Some("plain"));
+
+    // R61-10: answers over tonic's default 4 MiB are read, a read's and a numbered write's result alike.
+    let large = vec![9u8; 5 * 1024 * 1024];
+    client.put(0, column, key(61), large.clone()).await.unwrap();
+    assert_eq!(client.get(0, column, key(61)).await.unwrap().map(|value| value.len()), Some(large.len()));
+    let previous = client.put_get_previous(0, column, key(61), b"small".to_vec()).await.unwrap();
+    assert_eq!(previous.map(|value| value.len()), Some(large.len()), "the 5 MiB previous value of a numbered put");
 }
 
 /// RA-2.6b: numbered writes whose calls are lost with a real leader. `RustClientLiveTest` drives it through the files

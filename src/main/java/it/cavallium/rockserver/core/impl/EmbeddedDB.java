@@ -1525,6 +1525,24 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		storageMetrics.refreshStoragePressure();
 	}
 
+	/**
+	 * The reasons of RocksDB's storage pressure at the last poll (one a second): a mask of
+	 * {@link StoragePressureSignal#REASON_WRITE_STOPPED} and the other {@code REASON_} bits, 0 if none. Read from the
+	 * signal itself: the gauges of the same reasons answer 0 while the metrics registry has no backend (R61-8).
+	 */
+	public int storagePressureReasons() {
+		return storagePressureSignal.reasonMask();
+	}
+
+	/**
+	 * Tests only: sets the storage pressure signal as a poll that read these two RocksDB properties would, until the
+	 * next poll (one a second) reads them again.
+	 */
+	@VisibleForTesting
+	public void setStoragePressureForTesting(long writeStopped, long actualDelayedWriteRate) {
+		storagePressureSignal.reset(writeStopped, actualDelayedWriteRate);
+	}
+
 	@VisibleForTesting
 	public void failStoragePressureRefreshForTesting(Throwable failure) {
 		storageMetrics.handleStoragePressureRefreshFailure(failure);
