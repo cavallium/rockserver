@@ -54,6 +54,25 @@ public final class LogWorkerGate {
 	}
 
 	/**
+	 * The worker's next task fails with {@code error}, as a write or an fsync does on a full or failing disk. Ratis
+	 * 3.3.1 then fails every later task of this log with "Log already failed", without touching the disk.
+	 */
+	public static void fail(RaftLog log, IOException error) throws ReflectiveOperationException {
+		add(log, new SegmentedRaftLog.Task() {
+			@Override
+			void execute() throws IOException {
+				throw error;
+			}
+
+			@Override
+			long getEndIndex() {
+				// Not below what the worker wrote last: such a failure is ignored, as that of an entry a snapshot replaced.
+				return Long.MAX_VALUE;
+			}
+		});
+	}
+
+	/**
 	 * Holds the write lock of {@code log} on a thread of its own until {@code release} opens, as Ratis does while an
 	 * append waits for room in the queue of a log worker that stopped writing (a hung disk): every read of the log that
 	 * takes its read lock ({@code getNextIndex}, {@code getTermIndex}, {@code getLastEntryTermIndex}, ...) waits
@@ -97,12 +116,16 @@ public final class LogWorkerGate {
 		void run() throws InterruptedException;
 	}
 
-	private static void run(RaftLog log, Wait wait) throws ReflectiveOperationException {
+	private static void add(RaftLog log, SegmentedRaftLog.Task task) throws ReflectiveOperationException {
 		var workerField = SegmentedRaftLog.class.getDeclaredField("fileLogWorker");
 		workerField.setAccessible(true);
 		var addTask = SegmentedRaftLogWorker.class.getDeclaredMethod("addIOTask", SegmentedRaftLog.Task.class);
 		addTask.setAccessible(true);
-		addTask.invoke(workerField.get(log), new SegmentedRaftLog.Task() {
+		addTask.invoke(workerField.get(log), task);
+	}
+
+	private static void run(RaftLog log, Wait wait) throws ReflectiveOperationException {
+		add(log, new SegmentedRaftLog.Task() {
 			@Override
 			void execute() throws IOException {
 				try {
