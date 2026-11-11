@@ -23,6 +23,15 @@ import org.junit.jupiter.api.io.TempDir;
  */
 class ConfigurationHistoryGapTest {
 
+	private NodeMetrics metrics;
+
+	@org.junit.jupiter.api.AfterEach
+	void closeMetrics() {
+		if (metrics != null) {
+			metrics.close();
+		}
+	}
+
 	@TempDir
 	Path temp;
 
@@ -42,7 +51,8 @@ class ConfigurationHistoryGapTest {
 	void anInstallNotificationDoesNotDropTheUpdatersConfiguration() throws Exception {
 		var peers = List.of(new PeerConfig("n0", "127.0.0.1", 1, "127.0.0.1", 2));
 		var config = NodeConfig.defaults("n0", peers, temp);
-		var stateMachine = new RockserverStateMachine(config, _ -> {}, new NodeMetrics("n0"));
+		metrics = new NodeMetrics("n0");
+		var stateMachine = new RockserverStateMachine(config, _ -> {}, metrics);
 		stateMachine.notifyConfigurationChanged(4, 30, conf("n0", "n1", "n2"));
 		CompletableFuture.runAsync(() -> stateMachine.notifyConfigurationChanged(0, 40, conf("n0", "n1"))).get();
 		// What notifyTermIndexUpdated(4, 30) on this thread hands to the apply thread with the position (the apply

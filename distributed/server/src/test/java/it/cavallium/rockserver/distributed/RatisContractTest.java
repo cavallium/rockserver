@@ -974,6 +974,11 @@ class RatisContractTest {
 
 	/** The failure of a call of a proxy without a registry: Java's message says which reference was null. */
 	private static void assertRegistryNpe(NullPointerException npe) {
+		if (npe.getStackTrace().length == 0 && npe.getMessage() == null) {
+			// Omitted by the JVM (OmitStackTraceInFastThrow): nothing is left to read; the proxy has no registry, which
+			// proxyWithoutRegistry() checked, and the call threw the exception that the omission replaces.
+			return;
+		}
 		assertTrue(String.valueOf(npe.getMessage()).contains("\"this.registry\" is null"), npe::getMessage);
 	}
 
