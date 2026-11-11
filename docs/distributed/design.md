@@ -6024,6 +6024,15 @@ install it (`apt-get install gcc libc6-dev`) and run with `-Drockserver.test.req
        node whose `--peer` list gives two members one placeholder API address no longer starts (exit 2, which a
        supervisor does not restart): check `PEERS` before the upgrade. The core server's `Main` has a shutdown hook of
        the shape R61-13 fixed here (it waits for a latch that only the main thread releases) and was not changed.
+   - R66-1 (test, upstream): `RatisStaleInstallConfigurationTest.aChunkThatRatisRejectsForItsTermStillReplacesItsConfiguration`
+     failed once in the full suite of `40cb407` (`NoSuchFileException` on `raft-meta.conf.tmp` at the
+     `installSnapshot` call). Cause: a stock Ratis race, the test's own call and the state machine updater both write
+     `raft-meta.conf` through one temporary name with no lock (see "Upstream", R66). The test installed a chunk as
+     soon as its single node led, while the leader's start configuration entry was still being applied. It has no
+     Rockserver code in it, so no product fault is hidden. The test now waits until the entry is applied before it
+     installs. Reproduction with the test method looped in one JVM (4 JVMs in parallel under 28 busy loops, 32
+     cores): 7 failures in 90 runs before (some runs hang, the updater being dead), 0 in 600 runs after; and 5 in 20
+     runs before on an idle machine, 0 in 20 after.
    - Review of R46, 1 (low, docs): the R46-2 recipe ran `dependency:build-classpath` on `distributed/server/pom.xml`
      alone, so Maven resolved `rockserver-core:${revision}` and that version's pom from `~/.m2` (or the snapshot
      repository): `grep -v /rockserver-core/` dropped the jar but kept the third-party jars of that pom, from whichever
@@ -6100,6 +6109,19 @@ install it (`apt-get install gcc libc6-dev`) and run with `-Drockserver.test.req
      `getTarget()`, checked with javap); reflection or a helper in Ratis' package would tie the Proposer to Ratis
      internals, and a per-peer lock held across the call would hold resets back for an attempt timeout, which
      `resetConnection` exists to avoid.
+   - Two writers of `raft-meta.conf` with no lock between them (R66): `RaftStorageImpl.writeRaftConfiguration` writes
+     the file through `AtomicFileOutputStream`, which uses one fixed temporary name (`raft-meta.conf.tmp`) and renames
+     it on close. It is called by the state machine updater for every configuration entry it applies
+     (`RaftServerImpl.applyLogToStateMachine`, a new leader's start entry included) and by
+     `SnapshotInstallationHandler.installSnapshotImpl` on the thread that handles an install request, in both cases
+     without a lock shared with the other. Two overlapping writes open the same temporary file, the first rename
+     takes it, and the second fails with `NoSuchFileException: .../current/raft-meta.conf.tmp -> .../raft-meta.conf`:
+     the install request fails, or the updater dies with `RaftLogIOException` ("caught a Throwable") and the division's
+     close then waits for it. Read in the 3.3.1 bytecode (callers found with `javap -c`); reproduced with a plain
+     Ratis server and no Rockserver code. The product does not write that file itself, and a node installs a snapshot
+     only after it has joined a group whose entries it applies, so the window is a follower that applies a
+     configuration entry while an install request arrives; not seen in a cluster run, and not avoidable from here
+     without a lock inside Ratis.
    - The same race on the server side (R9-1): every `GrpcLogAppender` of a division makes a `GrpcServerMetrics` with
      one shared registry name (member id, `ratis_grpc`, `log_appender`), and its stop unregisters it. An appender made
      while another one stops (`LeaderStateImpl.restart` is stop then add, and is not synchronized; a removed follower;
