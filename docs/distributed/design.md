@@ -5874,6 +5874,23 @@ install it (`apt-get install gcc libc6-dev`) and run with `-Drockserver.test.req
      anything else after it, as the `IllegalStateException` of a closed log on a leader whose log failed: bounded,
      since that leader stops within a second (R62-2). "Writes, exactly once" says so. The bytes of the release are
      pinned by two tests of `RatisContractTest` (see the row).
+   - R63-1 / TEST-METRICS-THREADS-LEFT-RUNNING (test only): a full run of the distributed suite (1687 tests, two runs)
+     failed in two places that pass alone. `WatchdogThreadsTest.aFailedStartStopsTheBackgroundThreads` waits for the
+     threads of node `n0` to be gone and found 29 `rockserver-metrics-n0`: every `NodeMetrics` starts a logger thread
+     that only `close()` stops, and `ReplicaOpsTest` made 27 of them (and 2 named `a`, `b`) without closing, as did
+     `ConfigurationHistoryGapTest` (1); a surefire JVM runs the classes one after the other, so they were still there.
+     Not a product leak that this run showed: `ReplicatedNode.stopBackgroundTasks` closes its metrics, and the
+     assertion is right to be global, a node id names one node. Both tests close theirs now, and `ReplicaOpsTest`
+     checks in an `@AfterAll` that it left no `rockserver-metrics-*` thread behind (red before: the 10 s wait ended
+     with the threads alive).
+   - R63-2 / TEST-NPE-MESSAGE-OMITTED-BY-THE-JVM (test only): `RatisContractTest.aProxyMadeWhileTheOneBeforeItClosesCanGetNoMetricRegistry`
+     asserted that the message of the `NullPointerException` of a proxy without a registry names `this.registry`. After
+     `ProposerBrokenProxyTest` (it throws that exception from the same place again and again) the JIT compiler throws a
+     preallocated one there, with no message and no stack trace (`OmitStackTraceInFastThrow`: 0 frames and a null message,
+     printed in a run of the two classes), and the assertion failed with the code unchanged; alone, it passed. The check
+     now accepts exactly that exception (no frames, no message) and still demands the message of any other; that the
+     proxy has no registry is still checked, by the loop that finds it. Pinned by
+     `theRegistryCheckHoldsWhenTheJvmOmitsTheMessageOfTheNullPointerException`, red before.
    - Review of R46, 1 (low, docs): the R46-2 recipe ran `dependency:build-classpath` on `distributed/server/pom.xml`
      alone, so Maven resolved `rockserver-core:${revision}` and that version's pom from `~/.m2` (or the snapshot
      repository): `grep -v /rockserver-core/` dropped the jar but kept the third-party jars of that pom, from whichever
