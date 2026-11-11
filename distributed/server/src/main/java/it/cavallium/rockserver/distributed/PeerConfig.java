@@ -1,7 +1,9 @@
 package it.cavallium.rockserver.distributed;
 
+import java.net.InetAddress;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.Objects;
 
 /**
@@ -35,9 +37,9 @@ public record PeerConfig(String id, String raftHost, int raftPort, String apiHos
 
 	/**
 	 * The first pair of members of {@code peers} that share a Raft address or an API address, as a refusal text naming
-	 * both ids; {@code null} when there is none (R61-15). Hosts are compared case-insensitively and ports as numbers;
-	 * nothing is resolved, so two names of one machine are not caught. A member's own Raft and API addresses are not
-	 * compared with each other.
+	 * both ids; {@code null} when there is none (R61-15). Hosts are compared case-insensitively and ports as numbers,
+	 * and an IP address in any of its spellings is one host ({@link #comparableHost}); nothing is resolved, so two
+	 * names of one machine are not caught. A member's own Raft and API addresses are not compared with each other.
 	 */
 	public static String sharedAddress(List<PeerConfig> peers) {
 		for (int i = 0; i < peers.size(); i++) {
@@ -47,15 +49,30 @@ public record PeerConfig(String id, String raftHost, int raftPort, String apiHos
 				if (a.id().equals(b.id())) {
 					continue;
 				}
-				if (a.raftPort == b.raftPort && a.raftHost.equalsIgnoreCase(b.raftHost)) {
+				if (a.raftPort == b.raftPort && comparableHost(a.raftHost).equals(comparableHost(b.raftHost))) {
 					return "members " + a.id() + " and " + b.id() + " share the Raft address " + a.raftAddress();
 				}
-				if (a.apiPort == b.apiPort && a.apiHost.equalsIgnoreCase(b.apiHost)) {
+				if (a.apiPort == b.apiPort && comparableHost(a.apiHost).equals(comparableHost(b.apiHost))) {
 					return "members " + a.id() + " and " + b.id() + " share the API address " + a.apiHost + ":" + a.apiPort;
 				}
 			}
 		}
 		return null;
+	}
+
+	/**
+	 * {@code host} as {@link #sharedAddress} compares it: in lower case, and an IP address (with or without the
+	 * brackets of an IPv6 one) in the one spelling the JDK prints, so that {@code [::1]} and {@code [0:0:0:0:0:0:0:1]}
+	 * are one host (review of R65). Only the text is read: a name is never looked up.
+	 */
+	static String comparableHost(String host) {
+		var lower = host.toLowerCase(Locale.ROOT);
+		var literal = lower.startsWith("[") && lower.endsWith("]") ? lower.substring(1, lower.length() - 1) : lower;
+		try {
+			return InetAddress.ofLiteral(literal).getHostAddress();
+		} catch (RuntimeException notAnAddress) {
+			return lower;
+		}
 	}
 
 	/** {@code peers} without the members that share an address with an earlier one: what a client needs of them. */

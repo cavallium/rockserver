@@ -52,7 +52,10 @@ public class MetricsManager implements AutoCloseable {
 
 	private static final String REDACTED = "<redacted>";
 
-	/** The influx token, user and the user info (and its parts) of the url, as far as they can be read. */
+	/**
+	 * The influx token, user and the user info of the url (whole and in parts, as written and percent-decoded), as far as
+	 * they can be read.
+	 */
 	private static java.util.List<String> influxSecrets(DatabaseConfig config) {
 		var secrets = new ArrayList<String>();
 		try {
@@ -77,9 +80,21 @@ public class MetricsManager implements AutoCloseable {
 					int at = url.lastIndexOf('@', end - 1);
 					if (at > authority) {
 						var userInfo = url.substring(authority, at);
-						secrets.add(userInfo);
-						for (var part : userInfo.split(":", -1)) {
-							secrets.add(part);
+						var written = new ArrayList<String>();
+						written.add(userInfo);
+						written.addAll(java.util.List.of(userInfo.split(":", -1)));
+						secrets.addAll(written);
+						// Percent-encoded in the url, and a failure can echo it decoded (review of R65). The parts are
+						// decoded one by one too: a decoded ':' or '@' belongs to its part.
+						for (var encoded : written) {
+							try {
+								var decoded = java.net.URLDecoder.decode(encoded.replace("+", "%2B"), StandardCharsets.UTF_8);
+								if (!decoded.equals(encoded)) {
+									secrets.add(decoded);
+								}
+							} catch (IllegalArgumentException notEncoded) {
+								// As written only.
+							}
 						}
 					}
 				}
