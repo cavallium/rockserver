@@ -308,6 +308,9 @@ final class RockserverStateMachine extends BaseStateMachine {
 	private final NodeMetrics.Series applyTime;
 	private final NodeMetrics.Series applyRequests;
 
+	/** Tests only: called with the node id at the end of {@link #initialize}'s open of the store; what it throws fails the start (R63-3). */
+	static volatile @Nullable Consumer<String> initializedForTesting;
+
 	@Override
 	public void initialize(RaftServer server, RaftGroupId groupId, RaftStorage raftStorage) throws IOException {
 		super.initialize(server, groupId, raftStorage);
@@ -317,6 +320,10 @@ final class RockserverStateMachine extends BaseStateMachine {
 		getLifeCycle().startAndTransition(() -> {
 			openStore();
 			requireKnownClusterVersion();
+			var hook = initializedForTesting;
+			if (hook != null) {
+				hook.accept(config.nodeId());
+			}
 		});
 		seedBytesSinceSnapshot(raftStorage.getStorageDir().getCurrentDir().toPath());
 	}

@@ -5928,6 +5928,24 @@ install it (`apt-get install gcc libc6-dev`) and run with `-Drockserver.test.req
      stack and cause chain) whose messages have the token, the user and the user info of the `url` (whole and in parts)
      masked as `<redacted>`, since a configuration error can echo a value it read (R60-1). `MetricsManager(config, logger)`
      is the seam of `MetricsManagerTest.aFailedInfluxInitialisationLogsItsCauseWithoutTheCredentials`, red before.
+   - R61-15 / PEER-ADDRESS-DUPLICATE-UNCHECKED (validation; low): two different members could share a Raft or an API
+     address (a copy-paste typo in `--peer`): `run`, `admin add-peer` and `admin remove-peer` accepted it, the first leader
+     wrote it into the genesis configuration and the member never got an append. `PeerConfig.sharedAddress` finds the
+     first such pair (host compared case-insensitively, port as a number, no DNS: two names of one machine pass; a
+     member's own Raft and API address, or one member's Raft with another's API, are not compared). `NodeConfig`
+     refuses it (`Duplicate peer addresses: members n1 and n2 share the Raft address h:p`), which `run` maps to exit 2;
+     `admin add-peer` and `remove-peer` check the group the change leaves, without the member of the same id that
+     `add-peer` replaces and without the member that `remove-peer` removes, so a wrong recorded address of either can
+     still be repaired (and `--change-addresses` with a corrected `--peer` address works). `status`, `transfer-leader`
+     and `snapshot` check nothing, and `admin` builds its clients' configuration from the members with distinct
+     addresses (`adminConfig`), so a list that a repair needs is not refused by `NodeConfig`. Pinned by
+     `CommandLineTest.adminRefusesMembersSharingAnAddress` and two cases of
+     `StartupChecksTest.runRefusesMalformedValuesWithTwo` (red before), and `PeerConfigAddressTest`.
+   - R63-3 (test gap): `WatchdogThreadsTest.aRuntimeFailureOfTheStateMachineInitializeStopsEverythingItStarted` fails the
+     state machine's `initialize` inside `server.start()` with an `IllegalStateException` (seam
+     `RockserverStateMachine.initializedForTesting`, after the store is open) and asserts that no thread with the node id
+     in its name is left (`rockserver-metrics-<id>`, `<id>-apply`, Ratis'), that the Raft port is free, and that the
+     next start of the same directory works. It passed on the code as it was: no leak found, no production change.
    - Review of R46, 1 (low, docs): the R46-2 recipe ran `dependency:build-classpath` on `distributed/server/pom.xml`
      alone, so Maven resolved `rockserver-core:${revision}` and that version's pom from `~/.m2` (or the snapshot
      repository): `grep -v /rockserver-core/` dropped the jar but kept the third-party jars of that pom, from whichever

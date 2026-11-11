@@ -269,6 +269,38 @@ class WatchdogThreadsTest {
 		assertNoThreadOf("r63b");
 	}
 
+	/**
+	 * R63-3: a start whose state machine fails to initialize inside {@code server.start()} with a
+	 * {@code RuntimeException} that does not end the JVM: {@code closeFailedStart} closes the Raft server and the state
+	 * machine, so that no {@code rockserver-metrics-<id>} thread, no {@code <id>-apply} thread and no Raft thread of the
+	 * node is left, and the Raft port can be bound by the next start.
+	 */
+	@Test
+	@Timeout(120)
+	void aRuntimeFailureOfTheStateMachineInitializeStopsEverythingItStarted() throws Exception {
+		var ports = ProcessCluster.freePorts(2, List.of());
+		var config = NodeConfig.defaults("r65a", List.of(new PeerConfig("r65a", "127.0.0.1", ports.get(0), "127.0.0.1",
+				ports.get(1))), Files.createDirectory(temp.resolve("r65a")));
+		RockserverStateMachine.initializedForTesting = id -> {
+			if (id.equals("r65a")) {
+				throw new IllegalStateException("test: the state machine's initialize");
+			}
+		};
+		try {
+			assertThrows(RuntimeException.class, () -> ReplicatedNode.start(config));
+		} finally {
+			RockserverStateMachine.initializedForTesting = null;
+		}
+		assertNoThreadOf("r65a");
+		// The Raft server is closed: its port is free and nothing of the refused start is in the way of the next one.
+		try (var probe = new java.net.ServerSocket(ports.get(0))) {
+			assertTrue(probe.isBound());
+		}
+		var node = ReplicatedNode.start(config);
+		node.halt();
+		assertNoThreadOf("r65a");
+	}
+
 	/** Waits for every platform thread with {@code nodeId} in its name to end. */
 	private static void assertNoThreadOf(String nodeId) {
 		try {
