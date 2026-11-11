@@ -56,6 +56,22 @@ class PortInUseProcessTest {
 		}
 	}
 
+	/**
+	 * Review of R65: a Raft bind host that is no address of the machine (192.0.2.1 is reserved for documentation) takes
+	 * the same exit of Ratis as a taken port.
+	 */
+	@Test
+	void aRaftBindHostTheMachineLacksEndsRunWithOne() throws Exception {
+		var ports = ProcessCluster.freePorts(2, List.of());
+		var command = command(tempDir, ReplicatedServerMain.class, ports.get(0), ports.get(1), List.of());
+		command.set(command.indexOf("--raft-bind-host") + 1, "192.0.2.1");
+		var output = runExpectingExit(command);
+		assertTrue(output.contains("Failed to start Grpc server"), output);
+		assertTrue(output.contains("Failed to bind to address /192.0.2.1:" + ports.get(0)), output);
+		assertTrue(output.contains("Node a does not start: its start called System.exit"), output);
+		assertFalse(output.contains("READY"), output);
+	}
+
 	/** The thread dump of a node that did not exit, for the failure message: where its exit waits. */
 	static String threads(long pid) throws Exception {
 		var jstack = new ProcessBuilder(Path.of(System.getProperty("java.home"), "bin", "jstack").toString(),
@@ -90,7 +106,10 @@ class PortInUseProcessTest {
 
 	/** Runs a single node with these ports; it must exit with 1 within {@link #EXIT_SECONDS}. Returns its output. */
 	private String runExpectingExit(int raftPort, int apiPort) throws Exception {
-		var command = command(tempDir, ReplicatedServerMain.class, raftPort, apiPort, List.of());
+		return runExpectingExit(command(tempDir, ReplicatedServerMain.class, raftPort, apiPort, List.of()));
+	}
+
+	private String runExpectingExit(List<String> command) throws Exception {
 		var log = tempDir.resolve("run.log");
 		var process = new ProcessBuilder(command).redirectErrorStream(true).redirectOutput(log.toFile()).start();
 		try {
