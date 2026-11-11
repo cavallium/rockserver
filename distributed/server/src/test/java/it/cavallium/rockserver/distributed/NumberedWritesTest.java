@@ -307,6 +307,11 @@ class NumberedWritesTest {
 				assertNull(localValue(node, column, 999), "on " + node.config().nodeId());
 				assertEquals("v", localValue(node, column, 10_000), "on " + node.config().nodeId());
 				assertEquals("v", localValue(node, column, 11_999), "on " + node.config().nodeId());
+				// R61-5: each node exports what its collections hold of the budget; nothing, once they have ended.
+				var held = node.stateMachine().store().db().getMetricsRegistry()
+						.find("rockserver.replication.api.multi_collect.bytes").tag("node", node.config().nodeId()).gauge();
+				assertNotNull(held, "api.multi_collect.bytes is not exported on " + node.config().nodeId());
+				assertEquals(0, held.value(), "on " + node.config().nodeId());
 			}
 		}
 	}

@@ -37,6 +37,7 @@ import java.util.Map.Entry;
 import java.util.Objects;
 import java.util.Set;
 
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Consumer;
 import java.util.function.Function;
@@ -48,6 +49,7 @@ import org.slf4j.LoggerFactory;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Scheduler;
+import reactor.core.scheduler.Schedulers;
 
 /**
  * The gRPC service: maps each request to its command and runs it through {@link GrpcRequestContexts},
@@ -1071,8 +1073,17 @@ final class GrpcServerImpl extends ReactorRocksDBServiceGrpc.RocksDBServiceImplB
 		return DEFAULT_NUMBERED_MULTI_COLLECT_BYTES;
 	}
 
-	/** Counted bytes the numbered multi writes being collected hold now (tests). */
-	long numberedCollectBytesForTesting() {
+	/**
+	 * System property: how long a numbered multi write being collected may go without a new item, in milliseconds,
+	 * before its collection ends; zero turns the limit off.
+	 */
+	static final String NUMBERED_MULTI_COLLECT_IDLE_PROPERTY = "rockserver.grpc.numbered-multi-collect-idle-ms";
+	private static final Duration DEFAULT_NUMBERED_MULTI_COLLECT_IDLE = Duration.ofSeconds(30);
+	private final Duration numberedCollectIdle = GrpcServerSettings.durationProperty(
+			NUMBERED_MULTI_COLLECT_IDLE_PROPERTY, DEFAULT_NUMBERED_MULTI_COLLECT_IDLE);
+
+	/** Counted bytes the numbered multi writes being collected hold now, of {@link #numberedCollectLimit}. */
+	long numberedCollectBytes() {
 		return numberedCollectBytes.get();
 	}
 
@@ -1097,22 +1108,31 @@ final class GrpcServerImpl extends ReactorRocksDBServiceGrpc.RocksDBServiceImplB
 		if (context.profile() == WorkloadProfile.LATENCY) {
 			return collectLatencyMulti(dataFlux, encodedInputBytes, requestName);
 		}
-		return collectNumbered(dataFlux, numberedCollectBytes, numberedCollectLimit, encodedInputBytes, requestName);
+		return collectNumbered(dataFlux, numberedCollectBytes, numberedCollectLimit, numberedCollectIdle,
+				encodedInputBytes, requestName);
 	}
 
 	/**
 	 * The collection of {@link #collectMulti} outside LATENCY, against the collect budget {@code budget} of at most
 	 * {@code limit} bytes: each item takes its bytes through a {@link CollectHold}, which gives them back on every end of
 	 * the collection, a cancel included (static for tests).
+	 *
+	 * <p>A client that goes silent without closing its connection would keep what its stream took until the transport
+	 * notices, which can take very long. So a collection that gets no item for {@code idle} (zero: no limit) ends, as a
+	 * cancel does, and the call fails with {@code READ_DEADLINE_EXCEEDED} flagged not applied: nothing of a collected
+	 * write is applied before its last item. One periodic check per collection, not a timer per item; it fires between
+	 * {@code idle} and 1.25 times it.</p>
 	 */
-	static <T> Mono<List<T>> collectNumbered(Flux<T> dataFlux, AtomicLong budget, long limit,
+	static <T> Mono<List<T>> collectNumbered(Flux<T> dataFlux, AtomicLong budget, long limit, Duration idle,
 			ToLongFunction<T> encodedInputBytes, String requestName) {
 		return Mono.defer(() -> {
 			var buffer = new LatencyMultiBuffer<T>(NUMBERED_MULTI_MAX_ITEMS, NUMBERED_MULTI_MAX_BYTES,
 					"numbered " + requestName);
 			var hold = new CollectHold(budget, limit);
-			return dataFlux
+			var lastItemNanos = new AtomicLong(System.nanoTime());
+			var collection = dataFlux
 					.doOnNext(value -> {
+						lastItemNanos.lazySet(System.nanoTime());
 						long bytes = numberedItemBytes(value, encodedInputBytes.applyAsLong(value));
 						buffer.add(value, bytes);
 						if (!hold.take(bytes)) {
@@ -1123,6 +1143,22 @@ final class GrpcServerImpl extends ReactorRocksDBServiceGrpc.RocksDBServiceImplB
 					})
 					.then(Mono.fromSupplier(buffer::values))
 					.doFinally(_ -> hold.end());
+			if (idle.isZero() || idle.isNegative()) {
+				return collection;
+			}
+			// The first to end cancels the other: the idle failure cancels the collection (and with it the call's
+			// request stream), which gives its bytes back; a collection that ends stops the check.
+			return Mono.firstWithSignal(collection, Mono.<List<T>>create(sink -> {
+				long idleNanos = idle.toNanos();
+				long periodNanos = Math.max(TimeUnit.MILLISECONDS.toNanos(1), idleNanos / 4);
+				sink.onDispose(Schedulers.parallel().schedulePeriodically(() -> {
+					if (System.nanoTime() - lastItemNanos.get() >= idleNanos) {
+						sink.error(RocksDBException.notApplied(RocksDBErrorType.READ_DEADLINE_EXCEEDED,
+								"numbered " + requestName + ": no item arrived for " + idle.toMillis()
+										+ " ms while the server was collecting the write; it was not applied"));
+					}
+				}, periodNanos, periodNanos, TimeUnit.NANOSECONDS));
+			}));
 		});
 	}
 

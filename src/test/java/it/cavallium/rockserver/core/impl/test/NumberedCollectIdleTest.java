@@ -124,6 +124,36 @@ class NumberedCollectIdleTest {
 		}
 	}
 
+	/**
+	 * The server keepalive ({@code it.cavallium.rockserver.grpc.server.keep-alive-time-ms}, off by default) pings a
+	 * silent connection: a live client answers and keeps its connection and its open stream. (A client that vanished
+	 * needs a real silent peer, not tested here.)
+	 */
+	@Test
+	void aServerKeepaliveLeavesALiveClientConnected() throws Exception {
+		System.setProperty("it.cavallium.rockserver.grpc.server.keep-alive-time-ms", "300");
+		System.setProperty("it.cavallium.rockserver.grpc.server.keep-alive-timeout-ms", "300");
+		var backend = new Backend();
+		try (var server = new GrpcServer(backend, new InetSocketAddress("127.0.0.1", 0))) {
+			server.start();
+			var channel = ManagedChannelBuilder.forAddress("127.0.0.1", server.getPort()).usePlaintext().build();
+			try {
+				var stub = ReactorRocksDBServiceGrpc.newReactorStub(channel);
+				// One stream open over several pings, with items 1 s apart (the collect idle limit is 30 s).
+				var slow = Flux.concat(Flux.just(initial()),
+						Flux.interval(Duration.ofSeconds(1)).take(3).map(i -> item(i.intValue())));
+				stub.putMulti(slow).block(Duration.ofSeconds(20));
+				assertEquals(1, backend.writes.get());
+			} finally {
+				channel.shutdownNow();
+				channel.awaitTermination(5, TimeUnit.SECONDS);
+			}
+		} finally {
+			System.clearProperty("it.cavallium.rockserver.grpc.server.keep-alive-time-ms");
+			System.clearProperty("it.cavallium.rockserver.grpc.server.keep-alive-timeout-ms");
+		}
+	}
+
 	private static final class Backend implements RocksDBConnection {
 
 		private final AtomicInteger writes = new AtomicInteger();
