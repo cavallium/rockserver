@@ -37,6 +37,13 @@ import org.jetbrains.annotations.Nullable;
  * read sent to a node that just died fails over only after a few seconds or its request timeout, whichever comes
  * first: fault tests should use short request timeouts.</p>
  *
+ * <p>A connection knows one node only, and the core client sends a numbered write (with sessions on: every write
+ * outside a transaction) again on it until the call's deadline, whatever the failure, and then reports an unknown
+ * outcome: a refused connection no longer surfaces as one. So before a call on an open connection whose node has not
+ * answered this client for a second, the node's port is asked for a TCP connection, and a refusal moves the call to
+ * the next node with nothing sent (R62-5 and its review). A node that goes down within that second is found the old
+ * way: the write waits out its deadline there and is {@code UNKNOWN}.</p>
+ *
  * <p>The first attempt on a node opens its connection, whose handshake waits up to 10 seconds for an answer. A
  * frozen node (SIGSTOP) still accepts TCP connections, so the attempt waits for the handshake only as long as the
  * request timeout and the remaining retry time allow, then moves on; the handshake goes on in the background and
@@ -56,6 +63,11 @@ public final class ClusterClient implements AutoCloseable {
 
 	private static final Duration ROUND_PAUSE = Duration.ofMillis(100);
 	private static final int PROBE_TIMEOUT_MILLIS = 1_000;
+	/**
+	 * A node that has not answered this client for this long is asked for a TCP connection before a call on its open
+	 * connection. Not before every call: a workload's calls follow each other within milliseconds.
+	 */
+	private static final Duration QUIET_BEFORE_PROBE = Duration.ofSeconds(1);
 	private static final Set<RocksDBErrorType> RETRYABLE_TYPES = Set.of(RocksDBErrorType.SERVER_OVERLOADED,
 			RocksDBErrorType.OUTCOME_UNKNOWN,
 			RocksDBErrorType.UPDATE_RETRY,
@@ -71,6 +83,8 @@ public final class ClusterClient implements AutoCloseable {
 	private final Duration retryTimeout;
 	private final boolean retryAmbiguousWrites;
 	private final Map<String, CompletableFuture<GrpcConnection>> connections = new ConcurrentHashMap<>();
+	/** When each node last answered a call of this client ({@code System.nanoTime}). */
+	private final Map<String, Long> lastAnswer = new ConcurrentHashMap<>();
 	private volatile String preferred;
 
 	/**
@@ -244,8 +258,24 @@ public final class ClusterClient implements AutoCloseable {
 			// Unreachable or frozen node: no connection, so no request was sent. Always worth another node.
 			return new Attempt<>(null, e, false, true);
 		}
+		var answered = lastAnswer.get(node);
+		if (answered != null && System.nanoTime() - answered > QUIET_BEFORE_PROBE.toNanos()) {
+			try {
+				probe(addresses.get(node));
+			} catch (UncheckedIOException e) {
+				if (isRefusedConnection(e)) {
+					// The node went down since it last answered: nothing is sent, and the call moves on. Without this a
+					// numbered write (R62-5) would be sent again to this one address until the call's own deadline and
+					// end as of unknown outcome, since the connection knows no other node.
+					return new Attempt<>(null, e, false, true);
+				}
+				// A node that does not answer the probe in time (frozen): the call finds out, as before.
+			}
+		}
 		try {
-			return new Attempt<>(operation.apply(connection.getSyncApi(context)), null, true, false);
+			var value = operation.apply(connection.getSyncApi(context));
+			lastAnswer.put(node, System.nanoTime());
+			return new Attempt<>(value, null, true, false);
 		} catch (NotApplied e) {
 			return new Attempt<>(null, e.getCause(), false, isRetryable(e.getCause()));
 		} catch (RuntimeException e) {
@@ -297,6 +327,8 @@ public final class ClusterClient implements AutoCloseable {
 	/** The handshake retries a refused connection for seconds: fail fast on a node that is down instead. */
 	private static void probe(HostAndPort address) {
 		try (var socket = new Socket()) {
+			// Closed with a reset: no port of this host waits out a TIME_WAIT for a probe.
+			socket.setSoLinger(true, 0);
 			socket.connect(new InetSocketAddress(address.host(), address.port()), PROBE_TIMEOUT_MILLIS);
 		} catch (IOException e) {
 			throw new UncheckedIOException("Node unreachable at " + address, e);
