@@ -41,6 +41,9 @@ class LaggingInstallTest {
 	private static final long SNAPSHOT_EVERY = 100;
 	private static final Duration CRASH_TIMEOUT = Duration.ofSeconds(60);
 
+	/** Size of a log segment: a few seconds of the workload, so that the leader has closed segments to purge. */
+	private static final long SEGMENT_BYTES = 4 << 20;
+
 	@TempDir
 	Path root;
 	private ProcessCluster cluster;
@@ -158,6 +161,10 @@ class LaggingInstallTest {
 				"--rockserver-config", rockserverConfig.toString(),
 				"--election-timeout-ms", "400:800",
 				"--request-timeout-ms", "5000",
+				// Ratis purges whole closed segments only, and a segment closes when it is full: with the default of
+				// 64 MiB the workload below (about 300 entries of 1 KiB a second) fills the first one in over 3 minutes,
+				// and until then the log starts at 0 whatever the snapshots say (R62-6).
+				"--log-segment-bytes", String.valueOf(SEGMENT_BYTES),
 				"--snapshot-every", String.valueOf(SNAPSHOT_EVERY)), CrashPointMain.class.getName());
 		for (var id : cluster.members()) {
 			CrashPointMain.purgeUpToSnapshot(cluster.dataDir(id));

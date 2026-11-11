@@ -182,7 +182,8 @@ class MembershipTest {
 		startAll(List.of("1", "2", "3"));
 		client = new ClusterClient(cluster.apiAddresses(), TIMEOUT, true);
 		assertSeedServed(seed, List.of("1", "2", "3"));
-		assertTrue(cluster.output(leaderOf(List.of("1", "2", "3"))).contains("(seeded: true)"),
+		// The line goes on with the seed's digest (R3-G2b): "(seeded: true, seed digest ...)".
+		assertTrue(cluster.output(leaderOf(List.of("1", "2", "3"))).contains("(seeded: true, seed digest "),
 				"the cluster was not initialized as seeded");
 
 		long filler = client.createColumn("filler", SCHEMA, CONTEXT).valueOrThrow();

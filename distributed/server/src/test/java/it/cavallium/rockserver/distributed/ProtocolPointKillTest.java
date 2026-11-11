@@ -8,6 +8,7 @@ import static it.cavallium.rockserver.distributed.ScenarioSupport.SCHEMA;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import it.cavallium.buffer.Buf;
 import it.cavallium.rockserver.distributed.CrashPoints.Point;
 import java.io.IOException;
 import java.nio.file.Files;
@@ -56,9 +57,22 @@ class ProtocolPointKillTest {
 	Path root;
 	private ProcessCluster cluster;
 	private ClusterClient client;
+	/** A client of one node only, with few retries: see the isolated leader's test. */
+	private ClusterClient leaderClient;
+	private final List<Thread> stranded = new ArrayList<>();
+
+	private synchronized ClusterClient toLeader(String leader) {
+		if (leaderClient == null) {
+			leaderClient = new ClusterClient(Map.of(leader, cluster.apiAddress(leader)), Duration.ofSeconds(2), false);
+		}
+		return leaderClient;
+	}
 
 	@AfterEach
 	void tearDown() {
+		if (leaderClient != null) {
+			leaderClient.close();
+		}
 		if (client != null) {
 			client.close();
 		}
@@ -222,7 +236,20 @@ class ProtocolPointKillTest {
 			var leader = support.awaitLeader(PHASE_TIMEOUT);
 			var followers = cluster.nodeIds().stream().filter(id -> !id.equals(leader)).toList();
 			long leaderTerm = support.lastEntryTerm(leader);
+			// Connected before the cut: the handshake of a new connection could outlast the leader's last moments.
+			assertEquals(column, toLeader(leader).getColumnId("data", BATCH_CONTEXT).valueOrThrow());
 			cluster.network().isolate(leader);
+			// Two writes of the test's own, straight to the leader, right after the cut (R62-9): it appends them while it
+			// still leads (it misses its majority only after an election timeout, and appends nothing once it stepped
+			// down) and can send them to nobody. Without them its log was ahead of the followers' only if a write of the
+			// workload happened to be between the leader's append and its send at the cut: each writer waits for its
+			// write in flight, which reached the followers, so none sends another one in time, and the wait below failed
+			// in one run of four.
+			for (int i = 0; i < 2; i++) {
+				long key = -1 - i;
+				stranded.add(Thread.ofPlatform().daemon().name("stranded-write-" + i).start(
+						() -> toLeader(leader).put(column, ScenarioSupport.key(key), Buf.wrap(new byte[] {1}), BATCH_CONTEXT)));
+			}
 			// The followers' copies of this leader's log can no longer grow (the test reaches every node directly). Read
 			// their last entries once what was in flight had time to land, and before an election (at least 400 ms) can
 			// add entries of a new term; then wait for the leader to append past both: those entries of its term exist on
@@ -263,6 +290,10 @@ class ProtocolPointKillTest {
 			workload.awaitMore(100, PHASE_TIMEOUT, "after the old leader rejoined");
 		} finally {
 			workload.stop();
+		}
+		for (var thread : stranded) {
+			thread.join(Duration.ofSeconds(60));
+			assertTrue(!thread.isAlive(), "a write sent to the isolated leader is still waiting");
 		}
 		support.awaitQuiescent();
 		ScenarioSupport.checkWrites(client, column, workload.writes());

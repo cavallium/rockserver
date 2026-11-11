@@ -56,7 +56,8 @@ final class GrpcRequestErrors {
 			var statusCode = lateErrorStatusCode(status, rocksError);
 			Long suppressed = rocksError.getErrorUniqueId() == RocksDBErrorType.READ_DEADLINE_EXCEEDED
 					? claimLateReadDeadlineLog("<uncontextualized>")
-					: 0L;
+					// Boxed: beside a primitive 0L the claim is unboxed, and its null (a suppressed line) threw.
+					: Long.valueOf(0L);
 			if (suppressed == null) {
 				return;
 			}
@@ -140,7 +141,8 @@ final class GrpcRequestErrors {
 			var statusCode = lateErrorStatusCode(status, rocksDBException);
 			Long suppressed = rocksDBException.getErrorUniqueId() == RocksDBErrorType.READ_DEADLINE_EXCEEDED
 					? claimLateReadDeadlineLog(requestName)
-					: 0L;
+					// Boxed, see logUncontextualizedLateError.
+					: Long.valueOf(0L);
 			if (suppressed == null) {
 				return;
 			}

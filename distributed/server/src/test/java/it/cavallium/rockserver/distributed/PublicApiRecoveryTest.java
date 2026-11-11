@@ -131,12 +131,14 @@ class PublicApiRecoveryTest {
 		var api = connection.getAsyncApi(RequestContext.batch(CALL_TIMEOUT));
 		// The connection to the leader is open before its link starts losing replies.
 		assertEquals(doomed, api.getColumnIdAsync("doomed").get(10, TimeUnit.SECONDS));
+		openSession(api);
 
 		cluster.clientLink(leader).dropReplies();
 		CompletableFuture<Boolean> deletion = api.deleteColumnIfExistsAsync("doomed");
 		ScenarioSupport.await(PHASE_TIMEOUT, () -> !client.getColumnId("doomed", BATCH_CONTEXT).acknowledged(),
 				"the deletion did not apply");
-		assertTrue(cluster.clientLink(leader).hasLostReplies(), "the reply was not lost");
+		awaitLostReply(leader);
+		assertFalse(deletion.isDone(), "the deletion was answered although its reply was lost");
 		// Another client creates the name again: a copy that ran again would delete it.
 		long recreated = client.createColumn("doomed", SCHEMA, BATCH_CONTEXT).valueOrThrow();
 		assertTrue(recreated != doomed);
@@ -159,6 +161,7 @@ class PublicApiRecoveryTest {
 		var jar = jar("first");
 		var hash = MessageDigest.getInstance("SHA-256").digest(jar);
 		assertNull(api.checkMergeOperatorAsync("op", hash).get(10, TimeUnit.SECONDS));
+		openSession(api);
 
 		cluster.clientLink(leader).dropReplies();
 		CompletableFuture<Long> upload = api.uploadMergeOperatorAsync("op", OPERATOR_CLASS, jar);
@@ -167,6 +170,8 @@ class PublicApiRecoveryTest {
 			var check = client.read(BATCH_CONTEXT, other -> other.checkMergeOperator("op", hash));
 			return check.acknowledged() && (stored[0] = check.value()) != null;
 		}, "the upload did not apply");
+		awaitLostReply(leader);
+		assertFalse(upload.isDone(), "the upload was answered although its reply was lost");
 		// A later version under the same name: the copy must still answer with the first one's.
 		var second = jar("second");
 		long later = client.write(BATCH_CONTEXT, other -> other.uploadMergeOperator("op", OPERATOR_CLASS, second))
@@ -186,8 +191,32 @@ class PublicApiRecoveryTest {
 		for (var id : cluster.members()) {
 			assertFalse(cluster.output(id).contains(reapplied), () -> "node " + id + " applied the upload again");
 		}
-		assertEquals(later, client.write(BATCH_CONTEXT, other -> other.uploadMergeOperator("op", OPERATOR_CLASS,
-				second)).valueOrThrow(), "the same content keeps its version");
+		// Through the test's own client, whatever node it used last (review of R62, 5): when that is the killed leader,
+		// the client finds its port closed and takes the upload, a numbered write, to the next node with nothing sent.
+		// Before, the core client sent it again to that one refused address until the call's deadline and ended it as
+		// of unknown outcome, one run in three (ClusterClientNumberedFailoverTest).
+		assertEquals(later, client.write(BATCH_CONTEXT, other -> other.uploadMergeOperator("op", OPERATOR_CLASS, second))
+				.valueOrThrow(), "the same content keeps its version");
+	}
+
+	/**
+	 * Opens the client session of {@code api}'s connection, with a numbered write that changes nothing (R62-5). The
+	 * client opens its session with its first numbered write (a schema change or an upload is one, a column lookup is
+	 * not). Without this the first message through the lossy link was {@code openClientSession}: its reply was the one
+	 * lost, the call ran to its deadline, the channel moved to a follower, and the write under test went there and was
+	 * answered, with no reply of its own lost.
+	 */
+	private static void openSession(it.cavallium.rockserver.core.common.RocksDBAsyncAPI api) throws Exception {
+		assertEquals(Boolean.FALSE, api.deleteColumnIfExistsAsync("never-created").get(20, TimeUnit.SECONDS));
+	}
+
+	/**
+	 * Waits until the leader's client link dropped bytes of a reply. The caller saw the write applied through another
+	 * client, which can be a moment before the leader's own reply reaches the link.
+	 */
+	private void awaitLostReply(String leader) {
+		ScenarioSupport.await(Duration.ofSeconds(10), () -> cluster.clientLink(leader).hasLostReplies(),
+				"the reply was not lost");
 	}
 
 	/** Ends the lost-reply state: the link is reset (the leader stays), or the leader is killed. */

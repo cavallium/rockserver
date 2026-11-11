@@ -146,6 +146,8 @@ final class RockserverStateMachine extends BaseStateMachine {
 			new ConcurrentHashMap<>();
 	/** Transactions started from a {@link LocalProposal}, without decoding; for tests. */
 	private final LongAdder localProposalsTaken = new LongAdder();
+	/** Gives back the permits of the transactions that {@link #preAppendTransaction} refuses. */
+	private final RefusedPermits refusedPermits = new RefusedPermits();
 
 	private final NodeConfig config;
 	private final CheckpointStorage storage = new CheckpointStorage();
@@ -555,6 +557,11 @@ final class RockserverStateMachine extends BaseStateMachine {
 		return created;
 	}
 
+	/** For tests. */
+	RefusedPermits refusedPermits() {
+		return refusedPermits;
+	}
+
 	@Nullable RaftServer.Division division() {
 		var server = this.server;
 		if (server == null) {
@@ -658,7 +665,10 @@ final class RockserverStateMachine extends BaseStateMachine {
 		}
 	}
 
-	/** Runs on the leader under Ratis' log append lock, in log order. */
+	/**
+	 * Runs on the leader under Ratis' log append lock, in log order. A refusal here gives back the permit that Ratis
+	 * took for the request and would keep (R62-3, see {@link RefusedPermits}).
+	 */
 	@Override
 	public TransactionContext preAppendTransaction(TransactionContext trx) throws IOException {
 		if (!(trx.getStateMachineContext() instanceof Proposal proposal)) {
@@ -668,6 +678,16 @@ final class RockserverStateMachine extends BaseStateMachine {
 		if (division == null) {
 			return trx;
 		}
+		try {
+			return admit(trx, proposal, division);
+		} catch (IOException | RuntimeException | Error refused) {
+			refusedPermits.release(division, trx.getClientRequest());
+			throw refused;
+		}
+	}
+
+	private TransactionContext admit(TransactionContext trx, Proposal proposal, RaftServer.Division division)
+			throws IOException {
 		var session = leaderSession(division.getInfo().getCurrentTerm());
 		if (session == null) {
 			throw new StateMachineException("Not the leader", new NotReadyException("Not the leader"), false);
