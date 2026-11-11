@@ -363,11 +363,41 @@ class ProposerSubmitThreadsTest {
 			failing.set(true);
 			return pendingLimitFull();
 		};
-		var write = proposer.propose(put(1));
-		var error = assertThrows(ExecutionException.class, () -> write.get(5, TimeUnit.SECONDS),
-				"the write was not answered after the resend's hand-off failed");
-		assertInstanceOf(RocksDBException.class, error.getCause());
+		// Review of R61, 6: the Error is logged, with its text; the write's own failure does not carry it.
+		var originalErr = System.err;
+		var captured = new java.io.ByteArrayOutputStream();
+		System.setErr(new java.io.PrintStream(new java.io.OutputStream() {
+			@Override
+			public void write(int b) {
+				originalErr.write(b);
+				synchronized (captured) {
+					captured.write(b);
+				}
+			}
+
+			@Override
+			public void write(byte[] bytes, int offset, int length) {
+				originalErr.write(bytes, offset, length);
+				synchronized (captured) {
+					captured.write(bytes, offset, length);
+				}
+			}
+		}, true));
+		try {
+			var write = proposer.propose(put(1));
+			var error = assertThrows(ExecutionException.class, () -> write.get(5, TimeUnit.SECONDS),
+					"the write was not answered after the resend's hand-off failed");
+			assertInstanceOf(RocksDBException.class, error.getCause());
+		} finally {
+			System.setErr(originalErr);
+		}
 		assertTrue(failed.get() >= 1, "precondition: the resend's hand-off never failed");
+		String logged;
+		synchronized (captured) {
+			logged = captured.toString();
+		}
+		assertTrue(logged.lines().anyMatch(line -> line.contains("could not be handed to a thread")), logged);
+		assertTrue(logged.contains("unable to create native thread (thrown by the test)"), logged);
 		long until = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
 		while (proposer.batchesInFlight() != 0 && System.nanoTime() - until < 0) {
 			Thread.sleep(10);

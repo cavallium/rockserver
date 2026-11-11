@@ -1169,6 +1169,13 @@ class CommandLineTest {
 		var removal = run(admin(given, "remove-peer", leader));
 		assertEquals(0, removal.code(), removal.toString());
 		assertTrue(removal.out().contains("this change adds [] and removes [" + leader + "]"), removal.out());
+		// Review of R61, 7: once per command, not once per read of the leader's configuration.
+		assertEquals(1, removal.out().lines().filter(line -> line.startsWith("NOTE: the leader " + leader)).count(),
+				removal.out());
+		assertEquals(1, check.out().lines().filter(line -> line.startsWith("NOTE: the leader " + leader)).count(),
+				check.out());
+		assertEquals(1, again.out().lines().filter(line -> line.startsWith("NOTE: the leader " + leader)).count(),
+				again.out());
 		assertTrue(removal.out().strip().endsWith("OK"), removal.out());
 		InProcessCluster.await(TIMEOUT, () -> cluster.runningNodes().stream().anyMatch(node ->
 				given.contains(node.config().nodeId()) && node.isLeader()

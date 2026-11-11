@@ -152,6 +152,50 @@ class StreamedMultiPartlyAppliedTest {
 		}
 	}
 
+	/**
+	 * Review of R61, 2: a refusal as {@code SERVER_OVERLOADED} that is not flagged (a stopping node, a batch that could
+	 * not be handed to a thread) after the first item was applied. Callers that classify by type alone resend an
+	 * overload, and the whole stream again would apply the first item twice: the call ends "partly applied" too.
+	 */
+	@Test
+	void anUnflaggedOverloadAfterAnAppliedItemIsPartlyApplied() throws Exception {
+		for (var call : calls(3).entrySet()) {
+			var backend = new Backend(1, 0L, false);
+			try (var server = new GrpcServer(backend, new InetSocketAddress("127.0.0.1", 0))) {
+				server.start();
+				var channel = channel(server);
+				try {
+					var error = failure(call.getValue().apply(ReactorRocksDBServiceGrpc.newReactorStub(channel)));
+					assertEquals(1, backend.applied.get(), call.getKey());
+					assertPartlyApplied(call.getKey(), error);
+					assertTrue(error.getStatus().getDescription().contains("at least 1 "), call.getKey() + ": " + error);
+				} finally {
+					close(channel);
+				}
+			}
+		}
+	}
+
+	/** Nothing applied yet: an unflagged overload of the first item keeps its type, and stays unflagged. */
+	@Test
+	void anUnflaggedOverloadOfTheFirstItemPassesUnchanged() throws Exception {
+		for (var call : calls(3).entrySet()) {
+			var backend = new Backend(0, 0L, false);
+			try (var server = new GrpcServer(backend, new InetSocketAddress("127.0.0.1", 0))) {
+				server.start();
+				var channel = channel(server);
+				try {
+					var error = failure(call.getValue().apply(ReactorRocksDBServiceGrpc.newReactorStub(channel)));
+					assertEquals(0, backend.applied.get(), call.getKey());
+					assertEquals(Status.Code.RESOURCE_EXHAUSTED, error.getStatus().getCode(), call.getKey() + ": " + error);
+					assertEquals(RocksDBException.MAYBE_APPLIED, error.getTrailers().get(APPLIED), call.getKey());
+				} finally {
+					close(channel);
+				}
+			}
+		}
+	}
+
 	/** putMultiEnsure applies groups of 4096 items: the second group is refused after the first was applied. */
 	@Test
 	void aFlaggedRefusalAfterAnAppliedGroupOfPutMultiEnsureIsPartlyApplied() throws Exception {
@@ -224,16 +268,20 @@ class StreamedMultiPartlyAppliedTest {
 		channel.awaitTermination(5, TimeUnit.SECONDS);
 	}
 
-	/** Applies the first {@code accepted} writes (each after {@code applyMillis}), and refuses the next ones, flagged. */
+	/** Applies the first {@code accepted} writes (each after {@code applyMillis}), and refuses the next ones, flagged or not. */
 	private static final class Backend implements RocksDBConnection {
 
 		private final int accepted;
 		private final long applyMillis;
+		private final boolean flagged;
 		private final AtomicInteger applied = new AtomicInteger();
 		private final RocksDBSyncAPI syncApi = new RocksDBSyncAPI() {
 			@Override
 			public <R, RS, RA> RS requestSync(RocksDBAPICommand<R, RS, RA> request) {
 				if (applied.get() >= accepted) {
+					if (!flagged) {
+						throw RocksDBException.of(RocksDBErrorType.SERVER_OVERLOADED, "The node is stopping");
+					}
 					throw RocksDBException.notApplied(RocksDBErrorType.SERVER_OVERLOADED,
 							"The node is not accepting writes; it was not applied");
 				}
@@ -251,8 +299,13 @@ class StreamedMultiPartlyAppliedTest {
 		};
 
 		private Backend(int accepted, long applyMillis) {
+			this(accepted, applyMillis, true);
+		}
+
+		private Backend(int accepted, long applyMillis, boolean flagged) {
 			this.accepted = accepted;
 			this.applyMillis = applyMillis;
+			this.flagged = flagged;
 		}
 
 		public RockserverCapabilities getCapabilities() {
