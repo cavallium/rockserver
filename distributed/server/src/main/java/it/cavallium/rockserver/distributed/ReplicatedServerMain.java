@@ -232,10 +232,10 @@ public final class ReplicatedServerMain {
 	static volatile IntConsumer exiter = System::exit;
 
 	/**
-	 * How the shutdown hook ends the process once the node stopped after a failure: {@link Runtime#halt}, unless a test
-	 * replaced it. A test also replaces {@link #shutdownHooks}, to run the hook itself.
+	 * How the shutdown hook ends the process once the node stopped after a failure: {@link ProcessHalt#halt}, unless a
+	 * test replaced it. A test also replaces {@link #shutdownHooks}, to run the hook itself.
 	 */
-	static volatile IntConsumer halter = code -> Runtime.getRuntime().halt(code);
+	static volatile IntConsumer halter = ProcessHalt::halt;
 	/** Where {@code run} registers its shutdown hook: the JVM's, unless a test replaced it. */
 	static volatile Consumer<Thread> shutdownHooks = hook -> Runtime.getRuntime().addShutdownHook(hook);
 
@@ -301,11 +301,16 @@ public final class ReplicatedServerMain {
 		boolean allowWithoutExitOnOom = options.flag("--allow-without-exit-on-oom");
 		options.requireConsumed();
 		requireExitOnOutOfMemory(allowWithoutExitOnOom);
+		if (!ProcessHalt.prepare()) {
+			System.err.println("WARNING: libc's _exit could not be linked: a halt of this node falls back to Runtime.halt,"
+					+ " which may leave the process hanging while RocksDB is writing");
+		}
 		var directMemoryWatch = DirectMemoryWatch.start(error -> {
 			// Like -XX:+ExitOnOutOfMemoryError: at once, without shutdown hooks.
 			System.err.println("Node " + config.nodeId() + " ran out of direct memory, exiting: " + error);
 			System.err.flush();
-			Runtime.getRuntime().halt(3);
+			// Not Runtime.halt: the database is open and writing, and that halt would not end the process (R62-1).
+			ProcessHalt.halt(3);
 		});
 		startAndServe(config, directMemoryWatch);
 	}
@@ -445,7 +450,7 @@ public final class ReplicatedServerMain {
 	 * Prints {@code READY} if {@code announce} (not when a signal is stopping the node already), then waits until the
 	 * node stops and exits with {@link #failedExitStatus} if it failed. The
 	 * main thread's {@code exit} is a {@link System#exit}, which runs the hook, and the hook ends with
-	 * {@link Runtime#halt}: so both give the same status, or the hook's 3 would replace the 4 of a node that found out
+	 * {@link ProcessHalt#halt}: so both give the same status, or the hook's 3 would replace the 4 of a node that found out
 	 * it was removed and the 5 of a replica that met a newer cluster version ({@code RestartPreventExitStatus=4 5}
 	 * relies on those).
 	 */

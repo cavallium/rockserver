@@ -10,7 +10,8 @@ import org.jetbrains.annotations.Nullable;
  * but at a chosen step instead of a random moment. Nothing is armed in production: {@link #reach} is then one volatile
  * read. A test arms one point in a node's JVM (the process tests do it through {@code CrashPointMain}); the next time
  * the node passes it, after {@code skip} passes, the node prints a line naming the point and halts with
- * {@link #EXIT_CODE}, without shutdown hooks, flushes or a leadership hand-off.
+ * {@link #EXIT_CODE}, without shutdown hooks, flushes or a leadership hand-off ({@link ProcessHalt}: the process is
+ * gone at once, also while RocksDB is flushing or compacting).
  */
 final class CrashPoints {
 
@@ -51,7 +52,7 @@ final class CrashPoints {
 
 	private static volatile @Nullable Armed armed;
 	/** Halts the JVM; tests of this class replace it. */
-	static volatile IntConsumer halt = code -> Runtime.getRuntime().halt(code);
+	static volatile IntConsumer halt = ProcessHalt::halt;
 
 	private CrashPoints() {}
 
