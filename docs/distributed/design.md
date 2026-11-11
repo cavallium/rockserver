@@ -1907,6 +1907,28 @@ So the per-key lock stays, with pipelined updates as the measured option to shor
   of `changeVoters` after a refusal, `standingRefusal`, and the members asked at once, `askAll`); not checked against
   a real deposed leader in a cluster.
 
+  A leader that is not in `--peer` (R61-11): `add-peer` and `remove-peer` asked only the members of `--peer`, and
+  settled only on one that itself answered LEADER. "Replacing a node" gives `--peer n2 --peer n3` for the calls after
+  `n4` was added and before it is in `PEERS`; with `n4` leading, the command waited the whole `--timeout-ms` (10
+  minutes by default) and failed with `still waiting for a leader (n2 is FOLLOWER, n3 is FOLLOWER)` on a healthy
+  cluster. Now each round also asks the leader that a follower's role info names when its id is not in `--peer`
+  (`leadersOutside`), at the Raft address that follower's configuration gives for it (`MemberAnswer.namedLeader`;
+  Ratis 3.3.1 fills the role info from the follower's configuration and leaves the id empty while it knows no
+  leader), through a client of its own for that one peer (Ratis' client throws for an id outside its group, R58-2).
+  The answer is settled with the others' by the same rule, so a leader named by a stale follower is taken only if
+  it answers LEADER and no member shows a later term. A `NOTE:` line says that the leader was asked outside `--peer`
+  and that a change built from this `--peer` would remove it. If it does not answer there, the wait names it, its
+  address and the `--peer` to add (`notInPeer`), and the command still ends at `--timeout-ms`: an address that the
+  `admin` host cannot reach is not told apart from a leader that is down, and a member of `--peer` may be elected
+  meanwhile. Following was chosen over failing fast with the leader's name because the runbook's lists then work as
+  written and the answer is the same configuration the proposal is compared against. The target is still built from
+  `--peer`, as before: with the leader left out, the one change that passes the one-voter rule is the removal of the
+  leader itself, which Ratis' client carries to it (it follows the `NotLeaderException` of a listed member to a
+  leader outside its group; `CommandLineTest.addAndRemovePeerFollowTheLeaderThatIsNotInPeer` removes the leader
+  this way); the `--unsafe-multi-voter-change` path already took the leader's address from the configuration.
+  The other commands are unchanged (the finding did not affect `transfer-leader`, `checksum` or `backup`); `status`
+  and `checksum` report on the members listed only.
+
   A re-run of `add-peer` for a node that is a voter already (after a timeout, or of a call that succeeded) answers
   `already a voter` and `OK` from the leader's settled configuration, before it asks the node anything: until the node
   has applied the genesis or its snapshot, its `nodeState` looks like a log of its own, and the old order (fitness
@@ -2960,8 +2982,10 @@ of the log line (`metrics.lag-sample-ms`) read Ratis' log under its read lock, o
 hung disk stops the samples, not the log line. The node also logs
 the alarms it can tell by itself, once when they start, every minute while they last and once when they end: less than
 10% free on either disk, a Raft log above 4 snapshots' worth of `--snapshot-every-bytes` (a member gone for good holds
-it back), and RocksDB stopping or delaying writes (the core server's `rockserver.workload.storage.pressure.reason`
-gauges). The alert rules are [alerts/grafana-alert-rules.yaml](alerts/grafana-alert-rules.yaml), with what each means
+it back), and RocksDB stopping or delaying writes (the reasons of the core server's storage pressure signal, read
+from the signal itself, `EmbeddedDB.storagePressureReasons`, polled once a second: its
+`rockserver.workload.storage.pressure.reason` gauges answer 0 while the database's meter registry has no backend, JMX
+and InfluxDB both off or failed, so the two alarms were never logged on such a node, R61-8). The alert rules are [alerts/grafana-alert-rules.yaml](alerts/grafana-alert-rules.yaml), with what each means
 and what to do in [runbooks.md](runbooks.md). A replica failure ends the process with exit code 3, so the alert for it is
 a node that stops reporting.
 
@@ -3102,6 +3126,8 @@ failover" below).
 | `NumberedCollectIdleTest` (core) | R61-5, over a real gRPC server: a numbered `putMulti` that sends two items and goes silent holds bytes of the collect budget (`GrpcServer.numberedMultiCollectBytes`), ends `DEADLINE_EXCEEDED` with `rockserver-applied: no` once the idle limit (400 ms here) passed, gives its bytes back and applies nothing; a stream whose items arrive 150 ms apart for over a second is collected and applied (red at `3f9382d`: the accessor did not exist, and nothing ended the collection). With the server keepalive set to 300 ms, a live client keeps a stream open across several pings. `CollectHoldTest` passes the new idle argument. `NumberedWritesTest.numberedStreamedMultiWritesTakeTheServersCollectBudget` also reads the exported `api.multi_collect.bytes` of every node (0 once the collections ended; added with the fix). |
 | `DeferredRockserverConnectionTest`, `SessionWritesTest`, `GrpcConnectionCloseNumberedWriteTest` (core) | R61-7: a call on a closed deferred client (a single call, a stream, a WAL flush, a session opening, the synchronous API, and a call pending when the client closes), a numbered write ended by the close before it was sent, one sent on a closed `SessionWrites`, and one started while `GrpcConnection.close()` waits, all end `CLIENT_CLOSED` flagged not applied (red at `375bbbd`: `SERVER_OVERLOADED`). |
 | Rust unit tests (`cargo test`), `tests/live_server.rs` | R61-10: against an in-process tonic server that answers `putMultiGetPrevious` with one result of 5 MiB, a numbered and an unnumbered call both read it (`an_answer_over_tonics_four_mebibytes_is_read`; red at `f0017fc`: `OUT_OF_RANGE ... the limit is: 4194304 bytes`); an untyped `OUT_OF_RANGE` is an unknown outcome and ends `SessionWrites::run` as `OUTCOME_UNKNOWN` after one copy, while a typed failure with that code is not (`an_answer_the_decoder_refuses_ends_the_write_as_outcome_unknown`). Live (`RustClientLiveTest`): a `get` of a 5 MiB value and the 5 MiB previous value of a numbered `put_get_previous` (fails with the limit set back to 4 MiB). |
+| `CommandLineTest`, `StartupChecksTest`, `LeaderConfigurationTest` (R61) | R61-11: on a three-node cluster, `remove-peer n9`, `add-peer` of the leader and `remove-peer` of the leader, each with `--peer` listing only the two followers, answer from the leader's configuration within seconds, print the `NOTE:` line, and the last one removes the leader (`addAndRemovePeerFollowTheLeaderThatIsNotInPeer`; red at `b7ce9c8`, 30 s then `still waiting for a leader`); `leadersOutside`, `MemberAnswer.namedLeader` and `notInPeer` on built answers. R61-3, R61-12: `admin --timeout-ms` 0, -5 and -9300000000000, `--peer` and `add-peer` ports 0, -1, 65536 and 99999 end with exit 2 and the problem line, and `NodeConfig` refuses zero, negative and overlong request and election timeouts (`nonPositiveAndOutOfRangeValuesAreUsageErrors`); the same values through `run` in short JVMs (`runRefusesMalformedValuesWithTwo`). R61-9: the refusals of `adminRefusesUnknownOptionsAndMalformedValuesWithTwo` are asserted on their `Error:` line. |
+| `ReplicationTest` (R61-2), `ProposerSubmitThreadsTest` (R61-6), `NodeMonitorTest` (R61-8) | R61-2: a completion that throws while the apply thread has applied a later group stops the node with that failure, names its own group's position and fails its own write (`aCompletionThatFailsFailsItsOwnGroupWhileTheApplyThreadWorksOnTheNext`). R61-6: an `OutOfMemoryError` thrown by the submit executor at the hand-off of a batch, and at the hand-off of a resend after a refusal for Ratis' pending limit, answers the write, frees the slot and the admitted bytes, and the next write is applied. R61-8: on a database with JMX off, `NodeMonitor.writeStopped` and `writeDelayed` follow the storage pressure signal. All red at `b7ce9c8`. |
 | `ConfigPrinterSecretsTest` (core) | R60-1: the configuration each database open logs prints the InfluxDB token and user and the user info of its URL as `<redacted>`, the URL's host, port and path, the bucket and the org as they are; empty values print as they are (`theInfluxCredentialsAreNotPrinted`, red before: all three printed; `emptyCredentialsPrintAsTheyAre`). |
 | `GrpcProxyCallerRequestIdTest` (core) | R58-1: a `GrpcServer` over a `GrpcConnection` to a fake upstream that offers sessions and applies each request id once forwards two copies of a merge numbered (42, 7) by the downstream client with that id, applied once, and still numbers an unnumbered merge in its own session (red at `7dda2ad`: (5, 0) and (5, 1), applied twice). Review of R58, 2: the same with INGEST, no timeout and no stub deadline (`aProxyPassesTheRequestIdOfACallerWithNoTimeoutThrough`, red at `91677ce`: (5, 0) and (5, 1)). |
 | `ClientSessionTest` (in-process) | A merge and a transaction commit whose leader dies after its followers applied them and before it answered: the client sends them again with their request ids through the next node, the merge applies once and the commit answers `true` from its record. Copies of a commit and of the write that ends an update answer "unknown" while the first is in flight, then from the record. Copies of a numbered `mergeBatch` chunk, `deleteColumnIfExists`, `deleteColumn` and `deleteRange` take effect once; a numbered batch of two chunks is refused with nothing applied; the client library sends batches as numbered chunks over gRPC, a three-chunk batch of items that fill a chunk to the byte taking exactly one number per chunk (the client's and the server's split agree after encoding); a client batch whose leader dies after committing its first chunk, unanswered, resends that chunk with its number and every key is merged exactly once. |
@@ -5495,6 +5521,72 @@ install it (`apt-get install gcc libc6-dev`) and run with `-Drockserver.test.req
      Tests: the two Rust unit tests and the live test in the table (unit tests red at `f0017fc`; the live
      assertions fail with the limit set back to 4 MiB). Not covered: an answer over 64 MiB from a real server;
      `cargo test` ran on a scratch copy, not in place, and no clippy.
+   - R61-2 / APPLY-COMPLETER-SHARED-GROUP-LIST (low): `applyLoop` kept one list of the group being applied, cleared
+     and refilled for each group, and `applyGroup` handed it to the completer, whose failure handler read it
+     (`failAll(group, ...)`, `positionOf(group.getLast())`) after the apply thread had gone on. A completion that
+     threw then failed the replies of whichever group the apply thread held, left its own unanswered, and named the
+     other position. Each group now has a list of its own (sized as the previous one; `completions` is allocated
+     per group already), the handler uses the last position captured before the hand-off, and `fail(...)` runs
+     whatever failing the replies throws, so the node is always told. Test:
+     `ReplicationTest.aCompletionThatFailsFailsItsOwnGroupWhileTheApplyThreadWorksOnTheNext` (red at `b7ce9c8`: with
+     the first group held in the completer by a test hook and a second group applied meanwhile, the node had not
+     stopped 30 s after the completion threw, and the test JVM did not exit by itself afterwards; green: the node
+     stops with the failure, which names the first group's position, and the first write carries it). The hook
+     (`TestHooks.beforeCompletions`) throws before the first completion; a completion that throws half-way through
+     a group is not tested. Still latent: no reachable way for a completion to throw is known. `List.copyOf` per
+     group was the other option (one more copy per group for the same result).
+   - R61-3 / RUN-REQUEST-TIMEOUT-UNVALIDATED and R61-12 / CLI-NONPOSITIVE-VALUES-NOT-REFUSED (low): `NodeConfig`
+     refuses a request timeout and election timeouts that are zero or negative, and ones above
+     `NodeConfig.MAX_TIMEOUT` (1000 days: `30 × requestTimeout` for a session and the nanosecond deadlines stay far
+     from a long's range; `Long.MAX_VALUE` ms overflowed `toNanos()` during the start, outside the block that maps
+     to usage). `PeerConfig` refuses a Raft or API port outside 1 to 65535, for `--peer` and the argument of
+     `add-peer` (any integer parsed, and the node failed at bind with exit 1). `admin` refuses a `--timeout-ms` that
+     is zero or negative (a deadline in the past, or the `ArithmeticException` of R60-6 below about -9.2e12). All
+     are wrong usage, exit 2 with the problem line, which `run` and `admin` already made of what the configuration
+     and the parsers refuse. A node with `--request-timeout-ms 0` did start: the red run of
+     `StartupChecksTest.runRefusesMalformedValuesWithTwo` found it still running after 60 s. Tests:
+     `CommandLineTest.nonPositiveAndOutOfRangeValuesAreUsageErrors` and that method (both red at `b7ce9c8`).
+   - R61-4 / ALERT-TERM-CHURN-FIRES-ON-ADD-PEER (low): `rockserver-term-churn` is the spread of one node's term
+     gauge over 15 minutes, not a count of elections. A node started with `--join` runs a division and reports
+     `raft.term` while it waits (`NodeMonitor.refreshRaft`; `rockserver-node-not-added` relies on its reporting),
+     and its term goes from 0 to the cluster's at `add-peer`: past term 5 the alert fired for every replacement.
+     The rule's query now leaves out samples at term 0 (`"value" > 0`; an elected term is at least 1), and its
+     summary and the alert table say what it measures and that a node back after more than 5 terms away fires it
+     once. A leader-change counter would count elections exactly; none is exported, and the spread is kept. That a
+     fresh `--join` node reports exactly 0 is from Ratis' behaviour as remembered (a new division starts at term 0
+     and takes a term only from an election or a leader's message), not from a run. Not run against
+     Grafana or InfluxDB: needs-user N-R14-3. No test (a rule file).
+   - R61-6 / OVERLOAD-PROPOSER-DISPATCH-THREAD-START-ERROR (low): `Proposer.Lane.dispatch` and the timer that hands
+     a resend over caught only `RejectedExecutionException` around `execute`. When the submit pool cannot start a
+     thread (`OutOfMemoryError: unable to create native thread`, which `-XX:+ExitOnOutOfMemoryError` does not turn
+     into an exit) the batch kept its slot (32 per lane) and its writes stayed unanswered, their bytes admitted;
+     from `dispatch` the error also reached the proposing caller. Both hand-offs now catch `Throwable` and end the
+     batch as the refused hand-off does: at dispatch `SERVER_OVERLOADED` "could not start a thread" (nothing was
+     encoded or sent; not flagged, as the stopping case next to it), at the resend `endUnanswered`. `dispatch` goes
+     on with the queued batches, each answered the same way while no thread starts, rather than leave a commit,
+     which has no expiry timer of its own, in the queue. Tests:
+     `ProposerSubmitThreadsTest.anErrorHandingABatchToASubmitThreadFailsTheBatch` and
+     `anErrorHandingAResendToASubmitThreadEndsTheBatch` (red at `b7ce9c8`), with an executor that throws the error.
+     Not covered: a real thread limit; the hand-off of `attempt` to the submit threads from the sender
+     (`supplyAsync`), whose callers already catch `Throwable`.
+   - R61-8 / R61-METRICS-1 (low): see "Operations" (the alarms the node logs). `NodeMonitor` read the two stall
+     reasons through gauges of the database's composite meter registry, which answer 0 without a backend; it now
+     reads `EmbeddedDB.storagePressureReasons()`, the mask of the signal those gauges are made of. Test:
+     `NodeMonitorTest.theWriteStallAlarmsNeedNoMetricsBackend` (red at `b7ce9c8`, on a database opened with JMX off:
+     the signal set as a poll that read "stopped" would set it, `NodeMonitor.writeStopped` false). It tests the two
+     conditions, not the log lines, and sets the signal through a test hook: no real write stall was produced.
+   - R61-9 / T61-1 (low, test only): three assertions of
+     `CommandLineTest.adminRefusesUnknownOptionsAndMalformedValuesWithTwo` looked for an option's name in an output
+     that always holds it (the usage text). They now look for the problem line: `Error: invalid --timeout-ms
+     9300000000000`, `Error: --allow-skipped is an option of checksum only`, `Error: --unsafe-multi-voter-change is
+     an option of add-peer and remove-peer only`. No code change; the lines pass before and after, so nothing ran
+     red (the exit code already caught the R60-6 regression).
+   - R61-11 / CLI-LEADER-OUTSIDE-PEER (medium): see "Which leader `admin` reads" under "Membership". Tests:
+     `CommandLineTest.addAndRemovePeerFollowTheLeaderThatIsNotInPeer` (red at `b7ce9c8`: `FAILED ... still waiting
+     for a leader (n1 is FOLLOWER, n2 is FOLLOWER)` after the 30 s limit) and three of `LeaderConfigurationTest`
+     (added with the fix). Not covered: a leader outside `--peer` that the `admin` host cannot reach (the message
+     is tested as text only), a real replacement where the added node leads, and two hops (a follower that names a
+     leader which itself follows another: the next round asks again).
    - Review of R46, 1 (low, docs): the R46-2 recipe ran `dependency:build-classpath` on `distributed/server/pom.xml`
      alone, so Maven resolved `rockserver-core:${revision}` and that version's pom from `~/.m2` (or the snapshot
      repository): `grep -v /rockserver-core/` dropped the jar but kept the third-party jars of that pom, from whichever

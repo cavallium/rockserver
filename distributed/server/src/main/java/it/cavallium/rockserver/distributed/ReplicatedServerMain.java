@@ -184,6 +184,11 @@ import org.rocksdb.NativeLibraryLoader;
  * <p>{@code --snapshot-every-bytes}, 4 GiB by default, makes a node also take a snapshot once it applied that many bytes
  * of log entries since its latest one, besides every {@code --snapshot-every} entries.</p>
  *
+ * <p>Values are checked before anything starts, and a wrong one is wrong usage (exit 2): the request timeout, the
+ * election timeouts and {@code admin --timeout-ms} are positive, a port of {@code --peer} is in 1 to 65535 (R61-3,
+ * R61-12). {@code add-peer} and {@code remove-peer} read the leader's configuration also from a leader that is not in
+ * {@code --peer}, which the members listed name (R61-11, {@code leaderConfiguration}).</p>
+ *
  * <p>{@code --parallel-apply-threads}, 0 (off) by default, applies the data entries of each group on that many threads
  * (at least 2), split by key, with the result of the serial apply: see "Partitioned apply" in the design document.</p>
  */
