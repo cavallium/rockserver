@@ -217,7 +217,7 @@ class SessionWritesTest {
 		// A new write is refused as not sent.
 		var later = writes.send(context, put(0));
 		var refused = assertThrows(ExecutionException.class, () -> later.get(5, TimeUnit.SECONDS));
-		assertEquals(RocksDBErrorType.SERVER_OVERLOADED,
+		assertEquals(RocksDBErrorType.CLIENT_CLOSED,
 				((RocksDBException) refused.getCause()).getErrorUniqueId());
 		assertTrue(((RocksDBException) refused.getCause()).isNotApplied(), "not sent: flagged not applied");
 	}
@@ -247,11 +247,11 @@ class SessionWritesTest {
 		writes.close();
 		var error = assertThrows(ExecutionException.class, () -> waiting.get(5, TimeUnit.SECONDS));
 		// R61-7: CLIENT_CLOSED, not SERVER_OVERLOADED, which a caller may wait out for as long as it takes.
-		assertEquals("CLIENT_CLOSED", rocks(error).getErrorUniqueId().name(), rocks(error).getMessage());
+		assertEquals(RocksDBErrorType.CLIENT_CLOSED, rocks(error).getErrorUniqueId(), rocks(error).getMessage());
 		assertTrue(rocks(error).isNotApplied(), "closed between openings, nothing sent: not applied");
 		var later = writes.send(context, put(0));
 		error = assertThrows(ExecutionException.class, () -> later.get(5, TimeUnit.SECONDS));
-		assertEquals("CLIENT_CLOSED", rocks(error).getErrorUniqueId().name());
+		assertEquals(RocksDBErrorType.CLIENT_CLOSED, rocks(error).getErrorUniqueId());
 		assertTrue(rocks(error).isNotApplied(), "sent on a closed connection, nothing sent: not applied");
 		assertEquals(0, sent.get());
 		executor.shutdownNow();

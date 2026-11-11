@@ -76,7 +76,14 @@ public class RocksDBException extends RuntimeException {
 		 * not applied. A write sent for the first time can be sent again under a new session; for a resent write,
 		 * whose earlier copy may have been applied, the outcome is unknown.
 		 */
-		SESSION_EXPIRED
+		SESSION_EXPIRED,
+		/**
+		 * The client was closed before it sent the call: a failure of the client library itself, flagged
+		 * {@link #isNotApplied() not applied}. It is permanent for that client, so it has a type of its own:
+		 * {@link #SERVER_OVERLOADED}, which it was before, is a state of the server that callers wait out, for as long
+		 * as it takes (R61-7). A new client can send the call.
+		 */
+		CLIENT_CLOSED
 	}
 
 	public static RocksDBException of(RocksDBErrorType errorUniqueId, String message) {

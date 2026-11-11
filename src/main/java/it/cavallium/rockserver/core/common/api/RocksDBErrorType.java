@@ -53,7 +53,8 @@ public enum RocksDBErrorType implements org.apache.thrift.TEnum {
   INVALID_REQUEST(46),
   MERGE_OPERATOR_FAILED(47),
   OUTCOME_UNKNOWN(48),
-  SESSION_EXPIRED(49);
+  SESSION_EXPIRED(49),
+  CLIENT_CLOSED(50);
 
   private final int value;
 
@@ -168,6 +169,8 @@ public enum RocksDBErrorType implements org.apache.thrift.TEnum {
         return OUTCOME_UNKNOWN;
       case 49:
         return SESSION_EXPIRED;
+      case 50:
+        return CLIENT_CLOSED;
       default:
         return null;
     }

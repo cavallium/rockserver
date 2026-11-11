@@ -90,7 +90,7 @@ class GrpcConnectionCloseNumberedWriteTest {
 			var error = assertThrows(ExecutionException.class, () -> late.get(15, TimeUnit.SECONDS));
 			var rocks = rocks(error);
 			// R61-7: a type of its own, not an overload that a caller would wait out for ever.
-			assertEquals("CLIENT_CLOSED", rocks.getErrorUniqueId().name(), rocks::toString);
+			assertEquals(RocksDBErrorType.CLIENT_CLOSED, rocks.getErrorUniqueId(), rocks::toString);
 			assertTrue(rocks.isNotApplied(), () -> "not flagged not applied: " + rocks);
 			assertEquals(1, puts.get(), "the late write reached the server");
 

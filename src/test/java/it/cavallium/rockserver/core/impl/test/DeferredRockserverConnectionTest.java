@@ -424,7 +424,7 @@ class DeferredRockserverConnectionTest {
 	 */
 	private static void assertClosedNotSent(Throwable failure) {
 		var rocks = rocks(failure);
-		assertEquals("CLIENT_CLOSED", rocks.getErrorUniqueId().name(), rocks.toString());
+		assertEquals(RocksDBErrorType.CLIENT_CLOSED, rocks.getErrorUniqueId(), rocks.toString());
 		assertTrue(rocks.isNotApplied(), "flagged not applied: " + rocks);
 	}
 

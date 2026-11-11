@@ -286,9 +286,12 @@ final class SessionWrites {
 		}
 	}
 
-	/** Flagged not applied (R26-3 review, as the Rust client's {@code not_sent}): the write was never sent. */
+	/**
+	 * Flagged not applied (R26-3 review, as the Rust client's {@code not_sent}): the write was never sent.
+	 * {@code CLIENT_CLOSED}, not an overload that a caller would wait out without bound (R61-7).
+	 */
 	private static RocksDBException closedBeforeSent() {
-		return RocksDBException.notApplied(RocksDBErrorType.SERVER_OVERLOADED,
+		return RocksDBException.notApplied(RocksDBErrorType.CLIENT_CLOSED,
 				"The connection is closed; the write was not sent");
 	}
 
