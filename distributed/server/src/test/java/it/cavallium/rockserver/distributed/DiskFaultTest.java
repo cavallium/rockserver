@@ -44,11 +44,12 @@ class DiskFaultTest {
 
 	private static final Duration EXIT_TIMEOUT = Duration.ofSeconds(60);
 	/**
-	 * Lines a node's log shows once a disk failure made it a failed node: Ratis' log worker closing the division, the
-	 * replica, the Raft close. Not the bare errno text: a graceful stop that flushes onto the failed disk prints it too,
-	 * and that stop exits 0 (see DD-7h in the design document).
+	 * Lines a node's log shows once a disk failure made it a failed node: the replica, the Raft log (R62-2), the Raft
+	 * close, Ratis' log worker closing the division. Not the bare errno text: a graceful stop that flushes onto the
+	 * failed disk prints it too, and that stop exits 0 (see DD-7h in the design document).
 	 */
-	private static final List<String> FAILURE_MARKERS = List.of("replica failed to", "Raft closed", "hit exception");
+	private static final List<String> FAILURE_MARKERS = List.of("replica failed to", "the Raft log failed",
+			"Raft closed", "hit exception");
 	private static final int SIGNAL_ROUNDS = Integer.getInteger("rockserver.test.diskFaultSignalRounds", 6);
 
 	@TempDir

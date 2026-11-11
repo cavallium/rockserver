@@ -145,6 +145,11 @@ public final class ReplicatedNode implements AutoCloseable {
 	private boolean diskHung;
 	/** Only used on the Raft watch thread. */
 	private final LeaderStall leaderStall;
+	private final LogWriterWatch logWriterWatch = new LogWriterWatch(LogWriterWatch.AFTER);
+	/** The thread that writes the Raft log, once the Raft watch looked for it; only that thread uses it. */
+	private @Nullable Thread logWriter;
+	/** Why the Raft log failed, once the Raft watch found that it did ({@link #stopAfterRaftLogFailed}). */
+	private volatile @Nullable IOException raftLogFailure;
 	private final NodeMetrics.Series leaderStallStepDowns;
 	private final NodeMetrics.Series leaderLogStepDowns;
 	private final AtomicBoolean closed = new AtomicBoolean();
@@ -623,7 +628,10 @@ public final class ReplicatedNode implements AutoCloseable {
 		return leader != null && (info.isLeader() || !leader.toString().equals(config.nodeId()));
 	}
 
-	/** Stops the node if Raft closed, and starts a new election if this leader is stalled (see {@link LeaderStall}). */
+	/**
+	 * Stops the node if Raft closed or its log failed ({@link LogWriterWatch}), and starts a new election if this leader
+	 * is stalled (see {@link LeaderStall}).
+	 */
 	private void watchRaft() {
 		try {
 			errorForTesting("raft-watch");
@@ -635,10 +643,15 @@ public final class ReplicatedNode implements AutoCloseable {
 				stopAfterRaftClosed();
 				return;
 			}
+			var log = division.getRaftLog();
+			if (!log.isOpened()) {
+				// Before anything reads the log: a closed log throws.
+				stopAfterRaftLogFailed(LOG_CLOSED);
+				return;
+			}
 			checkWhileDetached(division);
 			warnAbovePendingLimit(division);
 			dropChannelsOfFormerMembers(division);
-			var log = division.getRaftLog();
 			long commitIndex = log.getLastCommittedIndex();
 			long term = division.getInfo().getCurrentTerm();
 			long now = System.nanoTime();
@@ -658,6 +671,13 @@ public final class ReplicatedNode implements AutoCloseable {
 						+ " leader commits only what it flushed: stepping down", config.nodeId(), term, log.getFlushIndex(),
 						log.getNextIndex() - 1);
 				startStepDown(true, leaderLogStepDowns);
+			}
+			long flushIndex = log.getFlushIndex();
+			long lastIndex = log.getNextIndex() - 1;
+			if (logWriterWatch.failed(flushIndex, lastIndex, now, () -> logWriterIdle(division))) {
+				stopAfterRaftLogFailed("it flushed nothing past " + flushIndex + " with entries up to " + lastIndex
+						+ " waiting, for " + LogWriterWatch.AFTER.toSeconds() + " s in which its writer was idle: a write to it"
+						+ " failed, and Ratis writes nothing more to a log after that");
 			}
 		} catch (RuntimeException ex) {
 			LOG.warn("{}: failed to check Raft, retrying", config.nodeId(), ex);
@@ -1078,7 +1098,59 @@ public final class ReplicatedNode implements AutoCloseable {
 	}
 
 	private IOException raftClosedFailure() {
+		var logFailure = raftLogFailure;
+		if (logFailure != null) {
+			return logFailure;
+		}
+		var division = stateMachine.division();
+		if (division != null && division.getInfo().isAlive() && raftLogClosed()) {
+			// A division that closed has closed its log too: that is Raft closed, below.
+			return raftLogFailure(LOG_CLOSED);
+		}
 		return new IOException("Raft closed on node " + config.nodeId() + " while the node was running");
+	}
+
+	private static final String LOG_CLOSED = "Ratis closed it, as it does when a leader's write to it fails";
+
+	private IOException raftLogFailure(String detail) {
+		return new IOException("The Raft log of node " + config.nodeId() + " failed while the node was running: "
+				+ detail);
+	}
+
+	/**
+	 * A write to this node's Raft log failed (a full disk, an I/O error), which Ratis 3.3.1 answers by writing nothing
+	 * more to it while the division stays alive (R62-2, see {@link LogWriterWatch}): a leader with a closed log, or a
+	 * follower that fails every request with entries. Stop like a failed replica, so that a supervisor restarts the
+	 * node; it comes back from what its disk holds. Only the Raft watch thread calls this; the failure is kept so that
+	 * a stop that comes first (a SIGTERM) still ends as the failure's stop.
+	 */
+	private void stopAfterRaftLogFailed(String detail) {
+		if (raftLogFailure != null) {
+			return;
+		}
+		var failure = raftLogFailure(detail);
+		raftLogFailure = failure;
+		LOG.error("{}: the Raft log failed: {}; the node stops and must be restarted", config.nodeId(), detail);
+		onReplicaFailure(failure);
+	}
+
+	private boolean raftLogClosed() {
+		var division = stateMachine.division();
+		try {
+			return division != null && !division.getRaftLog().isOpened();
+		} catch (RuntimeException ex) {
+			return false;
+		}
+	}
+
+	/** Whether the thread that writes this node's Raft log waits for work; false if it is not found. */
+	private boolean logWriterIdle(RaftServer.Division division) {
+		var writer = logWriter;
+		if (writer == null || !writer.isAlive()) {
+			writer = LogWriterWatch.findThread(division.getMemberId() + LogWriterWatch.WRITER_THREAD_SUFFIX);
+			logWriter = writer;
+		}
+		return writer != null && LogWriterWatch.idle(writer);
 	}
 
 	/**
@@ -1391,13 +1463,13 @@ public final class ReplicatedNode implements AutoCloseable {
 		shutdown(false, null);
 	}
 
-	/** Whether this node's Raft server closed while nothing here closed it. */
+	/** Whether this node's Raft server closed, or its log failed, while nothing here closed it. */
 	private boolean raftClosedByItself() {
 		if (closed.get()) {
 			return false;
 		}
 		var division = stateMachine.division();
-		return division == null || !division.getInfo().isAlive();
+		return division == null || !division.getInfo().isAlive() || raftLogFailure != null || raftLogClosed();
 	}
 
 	/**
