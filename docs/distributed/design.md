@@ -5849,7 +5849,9 @@ install it (`apt-get install gcc libc6-dev`) and run with `-Drockserver.test.req
      `LogWriterWatchTest`; the follower of `RaftLogFailureTest` still stops 3.1 to 3.3 s after its log failed.
    - Review of R62, 4 (low, verification): `HungDiskTest` had never run, and R62-2 added a stop that depends on the
      writer's stack during a hang. Run now, with the row rule of the review in: 2 of 2 in each of three runs, see its row. Its condition is removed and
-     the CI comment with it. Still not done: a full sequential pass of the distributed suite on this branch.
+     the CI comment with it. After it, one class at a time at `495abf7`: the 23 process suites of the CI list and the in-process
+     classes this review touched or that watch the log (34 runs, 234 tests, no failure). Not run again: the other
+     in-process classes of the distributed suite.
    - Review of R62, 5 (low, tests): R62-5 sent the upload test's last check around the test's client. The cause is
      in that client (`ClusterClient`, test code): it keeps one connection per node and moved on from a dead node
      because the refused connection surfaced as one; with sessions the core client sends a numbered write again on
