@@ -621,7 +621,11 @@ sessions, as in the Raft dissertation (section 6.3), the way etcd and TiKV dedup
   together) ends as a cancel does, gives its bytes back, and the call fails `READ_DEADLINE_EXCEEDED` flagged not
   applied, since nothing of a collected write is applied before its last item (R61-5; one periodic check per
   collection at a quarter of the limit, so it ends between the limit and 1.25 times it;
-  `NumberedCollectIdleTest`). A replicated node exports the bytes taken as the gauge `api.multi_collect.bytes`.
+  `NumberedCollectIdleTest`). The limit is between whole gRPC messages, counted from the start of the collection:
+  the bytes of an item still in transfer do not reset it, so a healthy client whose single item takes longer than
+  the limit to arrive is ended too, at every resend (review of R61, 1: 4 MiB, the most a client numbers, in 30 s is
+  about 1.1 Mbit/s); the operator raises the property for such links (runbooks, "Numbered multi writes refused as
+  overloaded"). A replicated node exports the bytes taken as the gauge `api.multi_collect.bytes`.
   The server can also ping its client connections
   (`it.cavallium.rockserver.grpc.server.keep-alive-time-ms`, with `keep-alive-timeout-ms`, 20 s by default), which
   ends every call of a vanished client and not only its collections; it is off by default (gRPC's own server
@@ -641,7 +645,11 @@ sessions, as in the Raft dissertation (section 6.3), the way etcd and TiKV dedup
   `putMulti`, `putMultiEnsure` in groups of 4096, the `putMulti` variants with results, `deleteMulti` with and
   without results, `mergeMulti`, `mergeMultiGetMerged`). Before, it ended with `rockserver-applied: no`, which told
   the caller that the whole stream could be sent again. A failure before any item was applied keeps its type and
-  its flag, and a failure that is not flagged passes unchanged (it already reads as "maybe"). It used to number every one, so a BATCH or INGEST call over 16 MiB counted (or
+  its flag. A failure that is not flagged already reads as "maybe" and passes unchanged, except
+  `SERVER_OVERLOADED` (a stopping node, a batch that could not be handed to a thread): callers that classify by
+  type alone, as Yotsuba's `ReactiveGuard.overloaded` does, wait an overload out and send the call again, so after
+  an applied item it ends "partly applied" too, with "at least" the count, since the item that failed may have been
+  applied (review of R61, 2). It used to number every one, so a BATCH or INGEST call over 16 MiB counted (or
   about 150 000 items) that was applied before numbering was refused as invalid with nothing applied (R6-3). A
   `putMulti` without results that goes as one unary `putMultiList` (at most 65 536 items and 8 MiB) is not collected
   by the server and stays numbered. Splitting a large call into numbered chunks was not done, for the reasons given
@@ -1917,7 +1925,9 @@ So the per-key lock stays, with pipelined updates as the measured option to shor
   leader), through a client of its own for that one peer (Ratis' client throws for an id outside its group, R58-2).
   The answer is settled with the others' by the same rule, so a leader named by a stale follower is taken only if
   it answers LEADER and no member shows a later term. A `NOTE:` line says that the leader was asked outside `--peer`
-  and that a change built from this `--peer` would remove it. If it does not answer there, the wait names it, its
+  and that a change built from this `--peer` would remove it, once per command and leader address (a command reads
+  the configuration at its check and again in each round of its change; review of R61, 7). The question to that
+  leader waits no longer than what is left of `--timeout-ms`, and is not asked after it. If it does not answer there, the wait names it, its
   address and the `--peer` to add (`notInPeer`), and the command still ends at `--timeout-ms`: an address that the
   `admin` host cannot reach is not told apart from a leader that is down, and a member of `--peer` may be elected
   meanwhile. Following was chosen over failing fast with the leader's name because the runbook's lists then work as
@@ -3122,12 +3132,12 @@ failover" below).
 | `ApplierTest` | At-most-once retries, including after a restart; deletion of records, by count, by bytes and at start; results too large for a reply; rejections; atomic commits; detection of column id divergence; batches with duplicates and rejections; groups of entries, with copies and rejections in them; crash consistency of applies without the WAL, and of groups; a logged raise of the cluster version to a capability the node lacks stops the replica (`NewerVersionException` in the failure) and leaves the version and the position; genesis makes the version known before the cluster id (R16b-1); genesis writes the frozen version 0x1F and not what the applying node supports (R17-1; it pins the literal and does not reproduce a newer node, since the old code never asked `supported()`: it passes at `b3df680`, and fails there only with one more bit in `SUPPORTED`, 31 expected, 63 written; R17 review, finding 3). |
 | `SessionApplierTest` | Client sessions at apply: a write resent through other proposers, alone or in an entry with other sessions' writes, takes effect once, also after a restart; the session's floor refuses late copies; unknown and expired sessions are rejected and not recorded, a leader clock behind does not revive them, and expired sessions are deleted; a leader whose wall clock is a year ahead, or jumps within its term, expires nothing (`LeaderClock`); two replicas, one restarting midway, give the same results. |
 | `SessionWritesTest` (core) | The client's numbering: which writes are numbered (staged writes not, schema changes, `deleteRange` and batches yes, multi writes over 4 MiB counted not), update ids forgotten once the update ended, also by an unnumbered multi write that ends one; a first copy refused by an expired session re-issued under a new one, a later copy so refused ending unknown (also when that copy is flagged not applied), sessions that keep expiring ending at the deadline, flagged not applied; opening retried after an unknown outcome, and again by a write that waited on another write's opening, also when that opening ended "not applied" at the opener's deadline or overloaded; batches unnumbered when the server does not advertise `numberedBatches`; batches sent as numbered chunks in order, a chunk resent with its number, a later chunk's failure reported as partly applied; closing ends waiting writes; each answer of a copy (value, recorded failure, overload, flagged deadline: ends; unknown, then "not applied": same number again; a sender that throws: lost copy); a deadline without the "not applied" flag, gRPC's own included, on a first or a resent copy, ends unknown, whatever its message; a cancel after a copy was sent ends unknown and stops the resends and the copy in flight, before one was sent cancels it unsent, also for a batch (a batch whose chunk only waits for its session counts as unsent); a synchronous wait is bounded, unbounded without a deadline, and never overflows; the client's own expired-deadline check on a first copy ends "not applied"; past 65,536 open updates the oldest is forgotten and counted; a Reactor caller (`Mono.fromFuture`) that disposes its subscription or times out stops the resends and cancels the copy in flight. R26-3: a write that got no session (gRPC's deadline on every opening, a refusal, an opening of unknown outcome) ends flagged not applied, and nothing is sent (`aWriteThatGotNoSessionEndsNotApplied`, unflagged at `31e06ad`). R26-4: for a caller without a deadline, a session that opens after the window sends no copy and the write ends flagged not applied, `SERVER_OVERLOADED` at the window since R27-3 (`READ_DEADLINE_EXCEEDED` before) (`aSessionOpenedAfterTheWindowSendsNoCopyForACallerWithoutDeadline`, the copy was sent at `31e06ad`; since the R26 review the late session is opened by a caller with a deadline, which the window's timer on an opening does not end). R26 review: a write ended by close before it was sent, waiting between openings or sent on a closed connection, is flagged not applied (`aWriteEndedByCloseBeforeItWasSentIsNotApplied`); no session is opened after the deadline (`noSessionIsOpenedOnceTheDeadlineHasPassed`); an opening that never answers ends a caller without a deadline, and one waiting for the same opening, `SERVER_OVERLOADED` flagged at the window (`anOpeningThatNeverAnswersEndsACallerWithoutDeadlineUnsentAtTheWindow`). R27-3: a write joined to another write's opening ends at its own deadline, `SERVER_OVERLOADED` flagged, while the opener goes on (`aWriteJoiningAnOpeningEndsAtItsOwnDeadlineNotApplied`), also when it is re-issued after `SESSION_EXPIRED` (`aWriteReissuedAfterAnExpiredSessionThatJoinsAnOpeningEndsAtItsOwnDeadlineNotApplied`); a synchronous wait that cancels a numbered write before a copy was sent throws `READ_DEADLINE_EXCEEDED` flagged not applied, a plain future stays unflagged (`aSynchronousWaitThatEndsBeforeACopyWasSentIsNotApplied`). R28-6: a write cancelled while the opening it waits for completes, at the moment it is numbered, leaves no number behind: the write still in flight keeps `completedBelow` at its number, and once every write ended `completedBelow` reaches the next sequence (`aWriteCancelledWhileItIsNumberedLeavesNoNumberBehind`, the test holds the session's lock; at `f00426b` `completedBelow` was 1 with number 0 in flight). R28-7: a write that waited for an opening is collectable once it ended, not held by its deadline timer (`aWriteThatWaitedForAnOpeningIsNotHeldUntilItsDeadline`, held at `f00426b`). R58-1: a write whose context carries a request id is not numbered again (`aWriteWhoseContextCarriesARequestIdIsNotNumberedAgain`). |
-| `StreamedMultiPartlyAppliedTest` (core) | R61-1, over a real gRPC server with a backend that applies the first write and refuses the next ones flagged not applied (as a replicated node's proposer does): each of the seven item-by-item streamed multi paths (`putMultiEnsure` with a second group of 4096) ends `INVALID_ARGUMENT` "partly applied" with `rockserver-applied: maybe` and one write applied (red at `eee0dff`: `RESOURCE_EXHAUSTED` with `no`); a refusal of the first item keeps `RESOURCE_EXHAUSTED` and `no`; a deadline that passes while the first item is applied is not flagged (the streaming scheduler ends it first, unflagged, before and after the fix). |
+| `StreamedMultiPartlyAppliedTest` (core) | R61-1, over a real gRPC server with a backend that applies the first write and refuses the next ones flagged not applied (as a replicated node's proposer does): each of the seven item-by-item streamed multi paths (`putMultiEnsure` with a second group of 4096) ends `INVALID_ARGUMENT` "partly applied" with `rockserver-applied: maybe` and one write applied (red at `eee0dff`: `RESOURCE_EXHAUSTED` with `no`); a refusal of the first item keeps `RESOURCE_EXHAUSTED` and `no`; a deadline that passes while the first item is applied is not flagged (the streaming scheduler ends it first, unflagged, before and after the fix). Review of R61, 2: an unflagged `SERVER_OVERLOADED` of the second item ends "partly applied: at least 1" on the six paths (red at `4f8e9c2`), and one of the first item keeps `RESOURCE_EXHAUSTED` with `maybe`. |
 | `NumberedCollectIdleTest` (core) | R61-5, over a real gRPC server: a numbered `putMulti` that sends two items and goes silent holds bytes of the collect budget (`GrpcServer.numberedMultiCollectBytes`), ends `DEADLINE_EXCEEDED` with `rockserver-applied: no` once the idle limit (400 ms here) passed, gives its bytes back and applies nothing; a stream whose items arrive 150 ms apart for over a second is collected and applied (red at `3f9382d`: the accessor did not exist, and nothing ended the collection). With the server keepalive set to 300 ms, a live client keeps a stream open across several pings. `CollectHoldTest` passes the new idle argument. `NumberedWritesTest.numberedStreamedMultiWritesTakeTheServersCollectBudget` also reads the exported `api.multi_collect.bytes` of every node (0 once the collections ended; added with the fix). |
 | `DeferredRockserverConnectionTest`, `SessionWritesTest`, `GrpcConnectionCloseNumberedWriteTest` (core) | R61-7: a call on a closed deferred client (a single call, a stream, a WAL flush, a session opening, the synchronous API, and a call pending when the client closes), a numbered write ended by the close before it was sent, one sent on a closed `SessionWrites`, and one started while `GrpcConnection.close()` waits, all end `CLIENT_CLOSED` flagged not applied (red at `375bbbd`: `SERVER_OVERLOADED`). |
 | Rust unit tests (`cargo test`), `tests/live_server.rs` | R61-10: against an in-process tonic server that answers `putMultiGetPrevious` with one result of 5 MiB, a numbered and an unnumbered call both read it (`an_answer_over_tonics_four_mebibytes_is_read`; red at `f0017fc`: `OUT_OF_RANGE ... the limit is: 4194304 bytes`); an untyped `OUT_OF_RANGE` is an unknown outcome and ends `SessionWrites::run` as `OUTCOME_UNKNOWN` after one copy, while a typed failure with that code is not (`an_answer_the_decoder_refuses_ends_the_write_as_outcome_unknown`). Live (`RustClientLiveTest`): a `get` of a 5 MiB value and the 5 MiB previous value of a numbered `put_get_previous` (fails with the limit set back to 4 MiB). |
-| `CommandLineTest`, `StartupChecksTest`, `LeaderConfigurationTest` (R61) | R61-11: on a three-node cluster, `remove-peer n9`, `add-peer` of the leader and `remove-peer` of the leader, each with `--peer` listing only the two followers, answer from the leader's configuration within seconds, print the `NOTE:` line, and the last one removes the leader (`addAndRemovePeerFollowTheLeaderThatIsNotInPeer`; red at `b7ce9c8`, 30 s then `still waiting for a leader`); `leadersOutside`, `MemberAnswer.namedLeader` and `notInPeer` on built answers. R61-3, R61-12: `admin --timeout-ms` 0, -5 and -9300000000000, `--peer` and `add-peer` ports 0, -1, 65536 and 99999 end with exit 2 and the problem line, and `NodeConfig` refuses zero, negative and overlong request and election timeouts (`nonPositiveAndOutOfRangeValuesAreUsageErrors`); the same values through `run` in short JVMs (`runRefusesMalformedValuesWithTwo`). R61-9: the refusals of `adminRefusesUnknownOptionsAndMalformedValuesWithTwo` are asserted on their `Error:` line. |
-| `ReplicationTest` (R61-2), `ProposerSubmitThreadsTest` (R61-6), `NodeMonitorTest` (R61-8) | R61-2: a completion that throws while the apply thread has applied a later group stops the node with that failure, names its own group's position and fails its own write (`aCompletionThatFailsFailsItsOwnGroupWhileTheApplyThreadWorksOnTheNext`). R61-6: an `OutOfMemoryError` thrown by the submit executor at the hand-off of a batch, and at the hand-off of a resend after a refusal for Ratis' pending limit, answers the write, frees the slot and the admitted bytes, and the next write is applied. R61-8: on a database with JMX off, `NodeMonitor.writeStopped` and `writeDelayed` follow the storage pressure signal. All red at `b7ce9c8`. |
+| `CommandLineTest`, `StartupChecksTest`, `LeaderConfigurationTest` (R61) | R61-11: on a three-node cluster, `remove-peer n9`, `add-peer` of the leader and `remove-peer` of the leader, each with `--peer` listing only the two followers, answer from the leader's configuration within seconds, print the `NOTE:` line, once per command (review of R61, 7; red at `4f8e9c2`), and the last one removes the leader (`addAndRemovePeerFollowTheLeaderThatIsNotInPeer`; red at `b7ce9c8`, 30 s then `still waiting for a leader`); `leadersOutside`, `MemberAnswer.namedLeader` and `notInPeer` on built answers. R61-3, R61-12: `admin --timeout-ms` 0, -5 and -9300000000000, `--peer` and `add-peer` ports 0, -1, 65536 and 99999 end with exit 2 and the problem line, and `NodeConfig` refuses zero, negative and overlong request and election timeouts (`nonPositiveAndOutOfRangeValuesAreUsageErrors`); the same values through `run` in short JVMs (`runRefusesMalformedValuesWithTwo`). R61-9: the refusals of `adminRefusesUnknownOptionsAndMalformedValuesWithTwo` are asserted on their `Error:` line. |
+| `ReplicationTest` (R61-2), `ProposerSubmitThreadsTest` (R61-6), `NodeMonitorTest` (R61-8) | R61-2: a completion that throws while the apply thread has applied a later group stops the node with that failure, names its own group's position and fails its own write (`aCompletionThatFailsFailsItsOwnGroupWhileTheApplyThreadWorksOnTheNext`). R61-6: an `OutOfMemoryError` thrown by the submit executor at the hand-off of a batch, and at the hand-off of a resend after a refusal for Ratis' pending limit, answers the write, frees the slot and the admitted bytes, and the next write is applied; the resend case also finds the error in the log (review of R61, 6; red at `4f8e9c2`). R61-8: on a database with JMX off, `NodeMonitor.writeStopped` and `writeDelayed` follow the storage pressure signal. All red at `b7ce9c8`. |
 | `ConfigPrinterSecretsTest` (core) | R60-1: the configuration each database open logs prints the InfluxDB token and user and the user info of its URL as `<redacted>`, the URL's host, port and path, the bucket and the org as they are; empty values print as they are (`theInfluxCredentialsAreNotPrinted`, red before: all three printed; `emptyCredentialsPrintAsTheyAre`). |
 | `GrpcProxyCallerRequestIdTest` (core) | R58-1: a `GrpcServer` over a `GrpcConnection` to a fake upstream that offers sessions and applies each request id once forwards two copies of a merge numbered (42, 7) by the downstream client with that id, applied once, and still numbers an unnumbered merge in its own session (red at `7dda2ad`: (5, 0) and (5, 1), applied twice). Review of R58, 2: the same with INGEST, no timeout and no stub deadline (`aProxyPassesTheRequestIdOfACallerWithNoTimeoutThrough`, red at `91677ce`: (5, 0) and (5, 1)). |
 | `ClientSessionTest` (in-process) | A merge and a transaction commit whose leader dies after its followers applied them and before it answered: the client sends them again with their request ids through the next node, the merge applies once and the commit answers `true` from its record. Copies of a commit and of the write that ends an update answer "unknown" while the first is in flight, then from the record. Copies of a numbered `mergeBatch` chunk, `deleteColumnIfExists`, `deleteColumn` and `deleteRange` take effect once; a numbered batch of two chunks is refused with nothing applied; the client library sends batches as numbered chunks over gRPC, a three-chunk batch of items that fill a chunk to the byte taking exactly one number per chunk (the client's and the server's split agree after encoding); a client batch whose leader dies after committing its first chunk, unanswered, resends that chunk with its number and every key is merged exactly once. |
@@ -5476,8 +5486,8 @@ install it (`apt-get install gcc libc6-dev`) and run with `-Drockserver.test.req
      `rockserver-applied: no` trailer when an item after the first was refused flagged not applied, although the
      earlier items were applied. `GrpcServerImpl.AppliedItems` counts the items applied on each of the seven paths
      and maps such a failure to `INVALID_REQUEST` "partly applied", not flagged, as `ReplicatedWrites.batch` and the
-     client's numbered batches do. Only flagged failures are mapped: an unflagged one already reads as "maybe", and
-     keeps its type. The new message names the type of the item's failure and not its text, because that text says
+     client's numbered batches do. Flagged failures are mapped, and an unflagged `SERVER_OVERLOADED` (review of
+     R61, 2, below); any other unflagged one already reads as "maybe", and keeps its type. The new message names the type of the item's failure and not its text, because that text says
      "not applied" and a client older than the trailer reads the flag from the text. Of the two routes in the
      finding, the refusal of one item's proposal on a replicated node is the one a test reaches; the deadline route
      (`GrpcRequestContexts.remainingContext`) needs the deadline to pass between the streaming scheduler's own
@@ -5568,7 +5578,7 @@ install it (`apt-get install gcc libc6-dev`) and run with `-Drockserver.test.req
      `ProposerSubmitThreadsTest.anErrorHandingABatchToASubmitThreadFailsTheBatch` and
      `anErrorHandingAResendToASubmitThreadEndsTheBatch` (red at `b7ce9c8`), with an executor that throws the error.
      Not covered: a real thread limit; the hand-off of `attempt` to the submit threads from the sender
-     (`supplyAsync`), whose callers already catch `Throwable`.
+     (`supplyAsync`), whose callers already catch `Throwable`. Both hand-offs log the error (review of R61, 6, below).
    - R61-8 / R61-METRICS-1 (low): see "Operations" (the alarms the node logs). `NodeMonitor` read the two stall
      reasons through gauges of the database's composite meter registry, which answer 0 without a backend; it now
      reads `EmbeddedDB.storagePressureReasons()`, the mask of the signal those gauges are made of. Test:
@@ -5587,6 +5597,71 @@ install it (`apt-get install gcc libc6-dev`) and run with `-Drockserver.test.req
      (added with the fix). Not covered: a leader outside `--peer` that the `admin` host cannot reach (the message
      is tested as text only), a real replacement where the added node leads, and two hops (a follower that names a
      leader which itself follows another: the next round asks again).
+   - Review of R61, 1 (low, docs): the R61-5 idle limit measures the time between whole gRPC messages, from the
+     start of the collection, so it also ends a healthy client whose one item takes longer than the limit to arrive
+     (a 4 MiB item below about 1.1 Mbit/s, or a link that stalls that long), flagged not applied, and every resend
+     of that numbered write meets it again. The R61-5 text argued only that the clients read their input whole
+     before sending, which is about the gaps between items and not about the transfer of one. Not changed in code:
+     the server sees a message only once it is complete (gRPC hands over whole messages; a limit on bytes in
+     transfer would need a transport-level hook), and the flag stays true, since the idle failure and the end of
+     the collection are settled by `firstWithSignal` and nothing is applied before the collection ends. The case
+     and what to do (raise `rockserver.grpc.numbered-multi-collect-idle-ms`, or smaller values per call) are now in
+     the main text, the README and the runbooks ("Numbered multi writes refused as overloaded"). A larger default
+     was considered and left: 30 s bounds how long 16 silent streams can hold the 64 MiB budget, and no deployment
+     known here has such a link. Docs only.
+   - Review of R61, 2 (low): `AppliedItems` mapped only failures flagged not applied. An unflagged
+     `SERVER_OVERLOADED` of a later item (`Proposer.stopping()`, and `notHandedOver()` of R61-6) left the call as
+     `RESOURCE_EXHAUSTED` with `maybe`. A caller that reads the flag does not resend it, but Yotsuba's
+     `ReactiveGuard.overloaded` and `isRetryableUpdateFailure` classify `SERVER_OVERLOADED` by type alone and send
+     again, which would apply the earlier items of the stream twice (merges). `AppliedItems.failure` now maps an
+     unflagged `SERVER_OVERLOADED` after an applied item to `INVALID_REQUEST` "partly applied: at least N items",
+     and says that the failing item may have been applied too. Other unflagged types still pass unchanged: an
+     unflagged deadline is an unknown outcome to the clients (README, "A deadline error counts as an unknown
+     outcome"), the other types are not ones a caller waits out, and mapping every failure would hide the type of
+     a real fault (`INTERNAL_ERROR`, a storage error) behind `INVALID_REQUEST`. A failure of the first item keeps
+     `SERVER_OVERLOADED`: no earlier item of the call was applied, so it is the case of a single write that ends
+     that way. Tests:
+     `StreamedMultiPartlyAppliedTest.anUnflaggedOverloadAfterAnAppliedItemIsPartlyApplied` (red at `4f8e9c2`:
+     `RESOURCE_EXHAUSTED`) and `anUnflaggedOverloadOfTheFirstItemPassesUnchanged`. Not covered: a real stopping
+     node; Yotsuba was read, not built or run.
+   - Review of R61, 3 (low, docs): the class javadoc of `SessionWrites` still said that a write whose connection
+     closed first ends `SERVER_OVERLOADED`; since R61-7 those paths end `CLIENT_CLOSED`. Corrected.
+   - Review of R61, 4 (low, docs): the README said that every call on a closed client fails `CLIENT_CLOSED` flagged
+     not applied. That is so for the deferred client (every call) and for the numbered writes of `GrpcConnection`
+     (through `SessionWrites`); its other calls (reads, unnumbered writes, all calls with sessions off) have no
+     closed check and fail with the shut-down channel's own status. The README now says which. A closed check on
+     every `GrpcConnection` call was not added: Yotsuba uses the deferred client, which closes the R61-7 loop, and
+     a call on a shut-down channel fails at once with the channel's status, which is not `SERVER_OVERLOADED`.
+   - Review of R61, 5 (low, docs): a compatibility gap of R61-7. `CLIENT_CLOSED` is made by the client, but a proxy
+     server whose backend client is closed puts it on the wire (`INTERNAL`, `RocksDBError: [uid:CLIENT_CLOSED]`,
+     trailer `no`). A Java client built before R61-7 does not know the name: `RocksDBErrorType.valueOf` fails in
+     `GrpcConnection`'s `mapGrpcStatusError`, which then returns the transport error as it is, a raw
+     `StatusRuntimeException` with code `INTERNAL`, and the not-applied trailer is not read. Such a caller sees
+     an unknown failure, not "not applied": conservative, never a wrong not-applied claim. Reachable only
+     while a proxy's backend client is closed (the proxy shutting down). Upgrade the clients of a proxy before or
+     with the proxy if that window matters. No code change: an old client cannot be taught a new name, and
+     answering with `SERVER_OVERLOADED` would bring back the retry loop that R61-7 removed.
+   - Review of R61, 6 (low): the resend hand-off of R61-6 caught the `Error` and ended the batch without recording
+     it, so the operator saw only writes ending unanswered. Both hand-offs now log it at ERROR ("A batch" / "A
+     resend could not be handed to a thread", with the throwable), at most one line per 10 s per proposer with the
+     count of those left out, since every batch meets the same error while no thread can start; a
+     `RejectedExecutionException` (the node stopping) is not logged. A failure of the logging itself (out of
+     memory) is ignored so that the batch still ends. The write's own failure at the resend is unchanged
+     (`endUnanswered`, which describes what happened to the copies sent). Test:
+     `ProposerSubmitThreadsTest.anErrorHandingAResendToASubmitThreadEndsTheBatch` reads the line and the error's
+     text from the log (red at `4f8e9c2`). The line at dispatch and the 10 s limit are not tested.
+   - Review of R61, 7 (low): two side effects of R61-11. The `NOTE: the leader nX is not in --peer` line was
+     printed by every read of the leader's configuration that settled, so twice or more per `add-peer` or
+     `remove-peer` (the check, then each round of `changeVoters`); it is now printed once per command and leader
+     address (`NOTED_LEADERS`, per thread, cleared when `admin` starts). `askOutside` waited the client's request
+     timeout (2 s) for a silent leader before the deadline was looked at, so each silent hint could overrun
+     `--timeout-ms` by that much; its client now waits at most what is left until the deadline
+     (`RaftSettings.adminClient`), and no question is asked after it. Left as it is: a new `RaftClient` per hint and
+     round (the address comes from an answer and can change; rounds are a poll interval apart), and the members of
+     `--peer` themselves, which are asked with the 2 s timeout in the last round as before R61-11. Test:
+     `CommandLineTest.addAndRemovePeerFollowTheLeaderThatIsNotInPeer` counts the line in each of its three
+     commands (red at `4f8e9c2`: twice in the removal). Not covered: the shorter wait (it needs a leader named at
+     an address that accepts and never answers).
    - Review of R46, 1 (low, docs): the R46-2 recipe ran `dependency:build-classpath` on `distributed/server/pom.xml`
      alone, so Maven resolved `rockserver-core:${revision}` and that version's pom from `~/.m2` (or the snapshot
      repository): `grep -v /rockserver-core/` dropped the jar but kept the third-party jars of that pom, from whichever

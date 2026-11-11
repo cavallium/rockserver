@@ -200,8 +200,12 @@ write's future stops the resends: the future ends with `OUTCOME_UNKNOWN` if a co
 none was. A write that could not get a session was never sent: it ends with the failure flagged "not applied"
 (`SERVER_OVERLOADED` when the opening's own outcome was unknown), also when its own deadline came while it waited
 for a session another write was opening, including after its only copy was refused because its session had expired
-(`SESSION_EXPIRED`: that copy did not run). A call on a closed client was never sent either: it fails with
-`CLIENT_CLOSED` flagged "not applied" (not `SERVER_OVERLOADED`: do not wait it out, the client will never send it). A synchronous call waits at most its deadline plus 5 s; if that cancels a
+(`SESSION_EXPIRED`: that copy did not run). A call that a closed client never sent says so:
+it fails with `CLIENT_CLOSED` flagged "not applied" (not `SERVER_OVERLOADED`: do not wait it out, the client will
+never send it). That holds for every call of the deferred client (`ClientBuilder.setDeferred(true)`) and for the
+numbered writes of a direct gRPC connection; its other calls (reads, unnumbered writes, every call with sessions
+off) are handed to the closed channel and fail with gRPC's own shutdown status, not flagged. A Java client built
+before this type cannot read it when a proxy server passes it on (`docs/distributed/design.md`, review of R61, 5). A synchronous call waits at most its deadline plus 5 s; if that cancels a
 write of which no copy was sent, it throws `READ_DEADLINE_EXCEEDED` flagged "not applied". A write staged in a transaction is sent once, as
 before: if its outcome is unknown, roll the transaction back and run it again, never send the staged write again.
 The connection decides whether it uses sessions once, at its handshake, and logs it: recreate it after upgrading
@@ -228,7 +232,9 @@ collected share a heap budget (`-Drockserver.grpc.numbered-multi-collect-bytes`,
 not fit is refused as `SERVER_OVERLOADED` with the not-applied flag: safe to send again. A collection that gets no
 item for `-Drockserver.grpc.numbered-multi-collect-idle-ms` (30 s by default, 0 for no limit) ends
 `READ_DEADLINE_EXCEEDED` with the not-applied flag and gives its share back, so a client that vanished mid-stream
-does not keep it. The Rust client reads answers of up to 64 MiB (`MAX_DECODING_MESSAGE_SIZE`, as the Java client;
+does not keep it. The limit is between whole items: one large item (up to 4 MiB) that takes longer than the limit
+to arrive, on a link slower than about 1.1 Mbit/s, ends the same way at every resend, so raise the property on
+nodes that serve such clients. The Rust client reads answers of up to 64 MiB (`MAX_DECODING_MESSAGE_SIZE`, as the Java client;
 `with_max_decoding_message_size` changes it); a larger answer to a numbered write ends `OUTCOME_UNKNOWN`.
 `client_sessions()` tells whether a view numbers; `without_client_sessions()` gives one that sends every write once.
 

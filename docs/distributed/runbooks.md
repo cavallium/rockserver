@@ -350,7 +350,7 @@ to write it.
 `admin` asks every `--peer` at once (a down member delays each round by one request timeout, not one each) and takes the configuration of the leader of the highest term; it waits while a member
 shows a later term than the leader that answered. The leader need not be in `--peer` for `add-peer` and `remove-peer`
 (R61-11): when the members of `--peer` follow a leader that is not listed, the command asks that leader too, at its
-Raft address in their configuration, and prints `NOTE: the leader n4 is not in --peer: asked at ...` before the
+Raft address in their configuration, and prints `NOTE: the leader n4 is not in --peer: asked at ...` (once per command) before the
 voters. If that leader does not answer at that address from the host that runs `admin`, the command waits until
 `--timeout-ms` and fails with `still waiting for a leader (n2 is FOLLOWER, n3 is FOLLOWER); n2 names n4 as the leader,
 which is not in --peer and did not answer at ...: add it with --peer ID=RAFTHOST:PORT/APIHOST:PORT`: run it again with
@@ -649,6 +649,14 @@ not applied. The gauge `rockserver.replication.api.multi_collect.bytes` (per nod
 - A gauge that stays up without traffic means streams whose client went silent. Each is ended once it got no item
   for 30 s (`-Drockserver.grpc.numbered-multi-collect-idle-ms`, 0 turns that off) and answered
   `READ_DEADLINE_EXCEEDED` flagged not applied, so it should fall by itself; if it does not, check that property.
+- A healthy client on a slow link can meet the same limit. The limit counts the time between whole items as the
+  node receives them, from the start of the call, and an item still in transfer does not count: one item of 4 MiB
+  (the most a client numbers) needs more than 30 s below about 1.1 Mbit/s, and a stalled link the same. Such a call
+  ends `READ_DEADLINE_EXCEEDED` "no item arrived for 30000 ms while the server was collecting the write", flagged
+  not applied, and every resend of it ends the same way. If clients report that text while they are alive and
+  sending, raise `-Drockserver.grpc.numbered-multi-collect-idle-ms` on every node to above the time their largest
+  item takes (a rolling restart; a silent client then holds its share that much longer), or have them send smaller
+  values per call.
 - Client hosts that vanish without closing their connections (power loss, a cut link) also keep their other calls
   open until TCP gives up. `-Dit.cavallium.rockserver.grpc.server.keep-alive-time-ms=60000` (off by default; the
   wait for a ping's answer is `...keep-alive-timeout-ms`, 20 s) makes the node ping silent connections and close

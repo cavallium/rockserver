@@ -992,9 +992,16 @@ final class GrpcServerImpl extends ReactorRocksDBServiceGrpc.RocksDBServiceImplB
 	 * write of its own, so once one was applied, a later item's failure flagged "not applied"
 	 * ({@link RocksDBException#isNotApplied()}: a deadline that came before its dispatch, a replicated node that refused
 	 * its proposal) is true for that item only. The call then fails with {@code INVALID_REQUEST}, not flagged, which
-	 * clients do not resend, and says how much was applied, as a partly applied batch does. A failure before any item
-	 * was applied, and one that is not flagged, pass unchanged. The new message names the type of the item's failure
-	 * but not its text, which says "not applied": a client older than the trailer reads that from the text.
+	 * clients do not resend, and says how much was applied, as a partly applied batch does. The new message names the
+	 * type of the item's failure but not its text, which says "not applied": a client older than the trailer reads that
+	 * from the text.
+	 *
+	 * <p>A later item's {@code SERVER_OVERLOADED} that is not flagged (a stopping node, a batch that could not be handed
+	 * to a thread) is mapped the same way (review of R61, 2): callers that classify by type alone wait an overload out
+	 * and send the call again, which would apply the earlier items twice. That item itself may have been applied, so
+	 * the count is "at least".</p>
+	 *
+	 * <p>A failure before any item was applied, and an unflagged one of another type, pass unchanged.</p>
 	 */
 	static final class AppliedItems {
 
@@ -1013,13 +1020,22 @@ final class GrpcServerImpl extends ReactorRocksDBServiceGrpc.RocksDBServiceImplB
 		Throwable failure(Throwable error) {
 			long applied = this.applied;
 			var rocksError = findRocksDBException(error);
-			if (applied == 0 || rocksError == null || !rocksError.isNotApplied()) {
+			if (applied == 0 || rocksError == null) {
 				return error;
 			}
-			return RocksDBException.of(RocksDBErrorType.INVALID_REQUEST,
-					requestName + " was partly applied: " + applied + " items were applied one by one before it failed, so"
-							+ " it is not safe to resend as a whole; the item that failed was refused with "
-							+ rocksError.getErrorUniqueId());
+			if (rocksError.isNotApplied()) {
+				return RocksDBException.of(RocksDBErrorType.INVALID_REQUEST,
+						requestName + " was partly applied: " + applied + " items were applied one by one before it failed,"
+								+ " so it is not safe to resend as a whole; the item that failed was refused with "
+								+ rocksError.getErrorUniqueId());
+			}
+			if (rocksError.getErrorUniqueId() == RocksDBErrorType.SERVER_OVERLOADED) {
+				return RocksDBException.of(RocksDBErrorType.INVALID_REQUEST,
+						requestName + " was partly applied: at least " + applied + " items were applied one by one before"
+								+ " it failed, so it is not safe to resend as a whole; the item that failed ended with "
+								+ rocksError.getErrorUniqueId() + " and may have been applied too");
+			}
+			return error;
 		}
 	}
 

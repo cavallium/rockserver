@@ -10,10 +10,12 @@ import java.security.SecureRandom;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.TreeMap;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
@@ -693,6 +695,7 @@ public final class ReplicatedServerMain {
 	}
 
 	private static void admin(Options options) throws IOException, InterruptedException {
+		NOTED_LEADERS.get().clear();
 		var peers = options.peers();
 		var groupId = RaftGroupId.valueOf(options.uuid("--group-id", NodeConfig.DEFAULT_GROUP_ID));
 		var timeout = Duration.ofMillis(options.longValue("--timeout-ms", DEFAULT_ADMIN_TIMEOUT.toMillis()));
@@ -1492,6 +1495,13 @@ public final class ReplicatedServerMain {
 	}
 
 	/**
+	 * The leaders outside {@code --peer} (id and address) that this thread's {@code admin} command has printed its
+	 * {@code NOTE:} line for: a command reads the leader's configuration several times (the check, then each round of
+	 * the change), and says it once (review of R61, 7). Cleared when a command starts.
+	 */
+	private static final ThreadLocal<Set<String>> NOTED_LEADERS = ThreadLocal.withInitial(HashSet::new);
+
+	/**
 	 * Asks the members of {@code --peer} until their answers settle on a leader with a settled (not joint)
 	 * configuration ({@link #settle}): a joint one means a change is under way, which it waits for. Fails at the deadline.
 	 *
@@ -1519,7 +1529,7 @@ public final class ReplicatedServerMain {
 				var outside = leadersOutside(answers, given);
 				var silent = new ArrayList<LeaderHint>();
 				for (var hint : outside) {
-					MemberAnswer answer = hint.address().isEmpty() ? null : askOutside(hint, peers, groupId);
+					MemberAnswer answer = hint.address().isEmpty() ? null : askOutside(hint, peers, groupId, deadlineNanos);
 					if (answer != null) {
 						answers.add(answer);
 					} else {
@@ -1529,7 +1539,8 @@ public final class ReplicatedServerMain {
 				var settled = settle(answers);
 				var membership = settled.membership();
 				if (membership != null) {
-					outside.stream().filter(hint -> hint.id().equals(membership.leader())).findFirst().ifPresent(hint ->
+					outside.stream().filter(hint -> hint.id().equals(membership.leader())).findFirst()
+							.filter(hint -> NOTED_LEADERS.get().add(hint.id() + "@" + hint.address())).ifPresent(hint ->
 							System.out.println("NOTE: the leader " + hint.id() + " is not in --peer: asked at " + hint.address()
 									+ ", its Raft address in the configuration of " + hint.namedBy() + ". A change proposed with"
 									+ " this --peer would also remove " + hint.id() + ", like every voter that --peer lacks (a"
@@ -1580,14 +1591,26 @@ public final class ReplicatedServerMain {
 				.collect(java.util.stream.Collectors.joining("; ")) + ": add it with --peer ID=RAFTHOST:PORT/APIHOST:PORT";
 	}
 
-	/** Asks the leader {@code hint}, which is not in {@code --peer}, once; null if it does not answer. */
-	private static @Nullable MemberAnswer askOutside(LeaderHint hint, List<PeerConfig> peers, RaftGroupId groupId) {
+	/**
+	 * Asks the leader {@code hint}, which is not in {@code --peer}, once; null if it does not answer. It waits for the
+	 * answer no longer than the nodes' clients do (the default maximum election timeout) and no longer than what is left
+	 * until {@code deadlineNanos}, and does not ask once that has passed (review of R61, 7: a silent leader made each
+	 * round overrun {@code --timeout-ms} by the whole client timeout). A client per question: the address comes from
+	 * an answer and can change between rounds, and the rounds are {@link #SEED_SNAPSHOT_POLL_MS} apart.
+	 */
+	private static @Nullable MemberAnswer askOutside(LeaderHint hint, List<PeerConfig> peers, RaftGroupId groupId,
+			long deadlineNanos) {
+		long leftNanos = deadlineNanos - System.nanoTime();
+		if (leftNanos <= 0) {
+			return null;
+		}
 		var anyConfig = NodeConfig.defaults(peers.getFirst().id(), peers, Path.of("."));
+		var question = min(anyConfig.electionTimeoutMax(), Duration.ofMillis(Math.max(1, leftNanos / 1_000_000)));
 		var peer = RaftPeer.newBuilder().setId(hint.id()).setAddress(hint.address()).build();
 		try (var client = RaftClient.newBuilder()
 				.setClientId(ClientId.randomId())
 				.setRaftGroup(RaftGroup.valueOf(groupId, peer))
-				.setProperties(RaftSettings.client(anyConfig))
+				.setProperties(RaftSettings.adminClient(anyConfig, question))
 				.setRetryPolicy(RetryPolicies.noRetry())
 				.build()) {
 			return MemberAnswer.of(hint.id(), client.getGroupManagementApi(peer.getId()).info(groupId));

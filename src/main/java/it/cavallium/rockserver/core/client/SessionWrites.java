@@ -60,7 +60,9 @@ import reactor.core.publisher.Mono;
  * ends flagged not applied too: with the opening's own error, or {@code SERVER_OVERLOADED} if the opening's outcome
  * was unknown, if the deadline passed before an opening was sent, if a caller without a deadline got no answer to its
  * opening within the window, if its own deadline came while it waited for an opening another write started (that
- * opening goes on for the other write), or if the connection closed first.</p>
+ * opening goes on for the other write); or with {@code CLIENT_CLOSED} if the connection closed first (R61-7:
+ * closed while the write waited for its session or for a resend with no copy sent, or already closed when the write
+ * was started), which is not an overload to wait out: this client will never send it.</p>
  *
  * <p>Numbered: writes outside transactions, transaction commits, the write that ends an update opened through
  * this connection (whose id this class remembers from the {@code getForUpdate} answer), schema changes (column
