@@ -303,6 +303,82 @@ class ProposerSubmitThreadsTest {
 	}
 
 	/**
+	 * R61-6: an {@link Error} of the hand-off itself (the submit pool cannot start a thread:
+	 * {@code OutOfMemoryError: unable to create native thread}, which {@code -XX:+ExitOnOutOfMemoryError} does not turn
+	 * into an exit) ends the batch as a refused hand-off does: its writes are answered, its slot and its bytes given
+	 * back. Only {@code RejectedExecutionException} was caught: the error went up to the proposing caller, the batch
+	 * stayed counted in flight (32 per lane) and its writes stayed sent, unanswered.
+	 */
+	@Test
+	void anErrorHandingABatchToASubmitThreadFailsTheBatch() throws Exception {
+		proposer.close();
+		var submit = threads.submit();
+		var failing = new AtomicBoolean(true);
+		proposer = newProposer(Duration.ofSeconds(10), task -> {
+			if (failing.get()) {
+				throw new OutOfMemoryError("unable to create native thread (thrown by the test)");
+			}
+			submit.execute(task);
+		});
+		raft.submit = request -> CompletableFuture.completedFuture(applied(request));
+		CompletableFuture<Object> write;
+		try {
+			write = proposer.propose(put(1));
+		} catch (OutOfMemoryError leaked) {
+			throw new AssertionError("the hand-off's error reached the proposing caller", leaked);
+		}
+		var error = assertThrows(ExecutionException.class, () -> write.get(2, TimeUnit.SECONDS),
+				"the write was not answered after the hand-off failed");
+		assertInstanceOf(RocksDBException.class, error.getCause());
+		assertEquals(0, proposer.batchesInFlight(), "the batch kept its slot");
+		failing.set(false);
+		assertEquals(true, proposer.propose(put(2)).get(2, TimeUnit.SECONDS));
+		long until = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(500);
+		while (proposer.admittedBytes() != 0 && System.nanoTime() - until < 0) {
+			Thread.sleep(10);
+		}
+		assertEquals(0, proposer.admittedBytes(), "bytes left counted in the write admission");
+	}
+
+	/**
+	 * R61-6, the resend: a batch refused before the append (Ratis' pending limit) is handed to a submit thread again by
+	 * a timer on the control plane. An {@link Error} of that hand-off ended the timer's task without a trace: the batch
+	 * kept its slot and its writes stayed unanswered. It ends as when the hand-off is refused.
+	 */
+	@Test
+	void anErrorHandingAResendToASubmitThreadEndsTheBatch() throws Exception {
+		proposer.close();
+		var submit = threads.submit();
+		var failing = new AtomicBoolean();
+		var failed = new AtomicInteger();
+		proposer = newProposer(Duration.ofSeconds(10), task -> {
+			if (failing.get()) {
+				failed.incrementAndGet();
+				throw new OutOfMemoryError("unable to create native thread (thrown by the test)");
+			}
+			submit.execute(task);
+		});
+		raft.submit = request -> {
+			// Refused before the append: the batch is resent, through a hand-off that now fails.
+			failing.set(true);
+			return pendingLimitFull();
+		};
+		var write = proposer.propose(put(1));
+		var error = assertThrows(ExecutionException.class, () -> write.get(5, TimeUnit.SECONDS),
+				"the write was not answered after the resend's hand-off failed");
+		assertInstanceOf(RocksDBException.class, error.getCause());
+		assertTrue(failed.get() >= 1, "precondition: the resend's hand-off never failed");
+		long until = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+		while (proposer.batchesInFlight() != 0 && System.nanoTime() - until < 0) {
+			Thread.sleep(10);
+		}
+		assertEquals(0, proposer.batchesInFlight(), "the batch kept its slot");
+		failing.set(false);
+		raft.submit = request -> CompletableFuture.completedFuture(applied(request));
+		assertEquals(true, proposer.propose(put(2)).get(2, TimeUnit.SECONDS));
+	}
+
+	/**
 	 * R23-A: two writes proposed by one thread without awaiting the first have no submission order. Batch A, taken
 	 * first, is held while it encodes; batch B, taken after it, reaches Ratis and is answered first. A is still applied,
 	 * not refused as a late copy: B carries a {@code completedBelow} computed when B encoded, which never passes A's

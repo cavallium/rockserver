@@ -1022,7 +1022,13 @@ class StartupChecksTest {
 		for (var bad : List.of(List.of("--snapshot-every", "often"), List.of("--election-timeout-ms", "1000"),
 				List.of("--parallel-apply-threads", "1"), List.of("--peer", "b=nowhere"),
 				// R29-4: a flag given a value turned the flag on, and the value was ignored; so was any stray word.
-				List.of("--join", "false"), List.of("--pipelined-updates", "false"), List.of("extra"))) {
+				List.of("--join", "false"), List.of("--pipelined-updates", "false"), List.of("extra"),
+				// R61-3, R61-12: a request or election timeout that is zero, negative or past the nanoseconds of a
+				// long, and a port outside 1 to 65535, started the node (or failed it later with exit 1).
+				List.of("--request-timeout-ms", "0"), List.of("--request-timeout-ms", "-5"),
+				List.of("--request-timeout-ms", "9223372036854775807"), List.of("--election-timeout-ms", "0:2000"),
+				List.of("--election-timeout-ms", "1000:9223372036854775807"),
+				List.of("--peer", "b=127.0.0.1:0/127.0.0.1:3"), List.of("--peer", "b=127.0.0.1:3/127.0.0.1:70000"))) {
 			var command = new java.util.ArrayList<>(List.of(Path.of(System.getProperty("java.home"), "bin", "java").toString(),
 					"-cp", System.getProperty("java.class.path"),
 					"-Djava.io.tmpdir=" + tempDir, "-XX:+ExitOnOutOfMemoryError",

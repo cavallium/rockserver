@@ -1525,6 +1525,15 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		storageMetrics.refreshStoragePressure();
 	}
 
+	/**
+	 * Tests only: sets the storage pressure signal as a poll that read these two RocksDB properties would, until the
+	 * next poll (one a second) reads them again.
+	 */
+	@VisibleForTesting
+	public void setStoragePressureForTesting(long writeStopped, long actualDelayedWriteRate) {
+		storagePressureSignal.reset(writeStopped, actualDelayedWriteRate);
+	}
+
 	@VisibleForTesting
 	public void failStoragePressureRefreshForTesting(Throwable failure) {
 		storageMetrics.handleStoragePressureRefreshFailure(failure);

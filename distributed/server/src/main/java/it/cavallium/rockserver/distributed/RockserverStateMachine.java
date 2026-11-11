@@ -942,6 +942,8 @@ final class RockserverStateMachine extends BaseStateMachine {
 		volatile java.util.concurrent.@Nullable CountDownLatch applyGate;
 		/** While set, applying a group throws it, as a failing apply would. */
 		volatile @Nullable RuntimeException applyFailure;
+		/** While set, the completer runs it before the completions of each group; what it throws fails that group. */
+		volatile @Nullable Runnable beforeCompletions;
 		/** Added to this node's wall clock where it stamps entries as leader, like {@link #CLOCK_SKEW_PROPERTY}. */
 		volatile long clockSkewMillis;
 
@@ -983,6 +985,14 @@ final class RockserverStateMachine extends BaseStateMachine {
 	/** Tests only: the KiB of {@link #queuedKiB} that no queued entry holds. */
 	int freeQueuedKiBForTesting() {
 		return queuedKiB.availablePermits();
+	}
+
+	/** The position that the completer's failure named, if a completion failed: see {@link #completionFailureForTesting}. */
+	private volatile @Nullable TermIndex completionFailurePosition;
+
+	/** Tests only: the last position of the group whose completion failed, as the failure named it; null if none did. */
+	@Nullable TermIndex completionFailureForTesting() {
+		return completionFailurePosition;
 	}
 
 	/** Tests only: the highest log index handed to the apply thread. */
@@ -1071,6 +1081,10 @@ final class RockserverStateMachine extends BaseStateMachine {
 		long appliedBytes = groupBytes;
 		completer.execute(() -> {
 			try {
+				var beforeCompletions = hooks != null ? hooks.beforeCompletions : null;
+				if (beforeCompletions != null) {
+					beforeCompletions.run();
+				}
 				for (var completion : completions) {
 					completion.run();
 				}
@@ -1081,7 +1095,9 @@ final class RockserverStateMachine extends BaseStateMachine {
 				failed = true;
 				failAll(group, error);
 				try {
-					fail("complete entries up to " + positionOf(group.getLast()), error);
+					var position = positionOf(group.getLast());
+					completionFailurePosition = position;
+					fail("complete entries up to " + position, error);
 				} catch (Throwable secondary) {
 					error.addSuppressed(secondary);
 				}
