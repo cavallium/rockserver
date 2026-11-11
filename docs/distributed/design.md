@@ -5926,13 +5926,14 @@ install it (`apt-get install gcc libc6-dev`) and run with `-Drockserver.test.req
    - R61-14 / METRICS-INIT-FAILURE-NOT-LOGGED (diagnostics; low): `MetricsManager` caught `Throwable` while building the JMX
      and the InfluxDB registries and logged a fixed line, so a node that ran without a backend gave the operator no cause.
      The exception is now logged with both lines. The InfluxDB one is logged as a copy of the failure (same class name,
-     stack and cause chain) whose messages have the token, the user and the user info of the `url` (whole and in parts)
-     masked as `<redacted>`, since a configuration error can echo a value it read (R60-1). `MetricsManager(config, logger)`
+     stack and cause chain) whose messages have the token, the user and the user info of the `url` (whole and in parts,
+     as written and percent-decoded) masked as `<redacted>`, since a configuration error can echo a value it read (R60-1). `MetricsManager(config, logger)`
      is the seam of `MetricsManagerTest.aFailedInfluxInitialisationLogsItsCauseWithoutTheCredentials`, red before.
    - R61-15 / PEER-ADDRESS-DUPLICATE-UNCHECKED (validation; low): two different members could share a Raft or an API
      address (a copy-paste typo in `--peer`): `run`, `admin add-peer` and `admin remove-peer` accepted it, the first leader
      wrote it into the genesis configuration and the member never got an append. `PeerConfig.sharedAddress` finds the
-     first such pair (host compared case-insensitively, port as a number, no DNS: two names of one machine pass; a
+     first such pair (host compared case-insensitively, an IP address in any of its spellings as one host, port as a
+     number, no DNS: two names of one machine pass; a
      member's own Raft and API address, or one member's Raft with another's API, are not compared). `NodeConfig`
      refuses it (`Duplicate peer addresses: members n1 and n2 share the Raft address h:p`), which `run` maps to exit 2;
      `admin add-peer` and `remove-peer` check the group the change leaves, without the member of the same id that
@@ -5995,6 +5996,34 @@ install it (`apt-get install gcc libc6-dev`) and run with `-Drockserver.test.req
      `RockserverStateMachine.initializedForTesting`, after the store is open) and asserts that no thread with the node id
      in its name is left (`rockserver-metrics-<id>`, `<id>-apply`, Ratis'), that the Raft port is free, and that the
      next start of the same directory works. It passed on the code as it was: no leak found, no production change.
+   - Review of R65 (4 findings, all in tests or low):
+     1. (medium, tests) R61-15 broke three tests that the round did not run: `RatisContractTest`'s heartbeat cluster gave
+        its three members the API address `127.0.0.1:1`, and `aCommitHeartbeatSendsTheCommitIndexAtOnce`,
+        `aCommitHeartbeatLostWithItsStreamIsSentAgain` and `aCommitHeartbeatAskedForJustBeforeTheAppenderWaitsIsNotLost`
+        failed with `Duplicate peer addresses: members h0 and h1 share the API address 127.0.0.1:1`. Each member now has
+        an API port of its own. The other test peer lists were searched for a shared address (literal and computed
+        ones); the full suite was not run.
+     2. (low) R61-15 compared hosts as text, so two spellings of one IPv6 address (`[::1]` and `[0:0:0:0:0:0:0:1]`,
+        upper and lower case aside) passed as two addresses. `PeerConfig.comparableHost` reads an IP address from the
+        text (`InetAddress.ofLiteral`, no lookup) and compares the JDK's one spelling of it; a name stays as written.
+        Pinned by `PeerConfigAddressTest.spellingsOfOneIpAddressAreOneAddress` (red before).
+     3. (low) R61-14 masked the user info of the `url` as written. A password with a reserved character is
+        percent-encoded there (`p%40ss`), and a failure that echoes it decoded (`p@ss`) was logged in clear. The
+        decoded forms are masked too: `MetricsManagerTest.aFailedInfluxInitialisationMasksTheDecodedUserInfoOfTheUrl`
+        (red before). Not masked, as before: a credential in the query of the `url`, which this configuration has a
+        `token` and a `user` for instead.
+     4. (verification) The two claims the round left unrun. A Raft bind host that is no address of the machine ends
+        `run` with 1 through the same exit of Ratis: `PortInUseProcessTest.aRaftBindHostTheMachineLacksEndsRunWithOne`
+        (192.0.2.1; passes on the R61-13 code). The R63-3 test fails without the code it is for: with the
+        `server.close()` of `closeFailedStart` taken out, `still running after the refused start of r65a:
+        [r65a-groupManagement, r65a-impl-thread1]`.
+     - Read and left as they are: in R61-13, a signal's wait for the start has no limit also when another thread is
+       inside `System.exit` behind it and the start waits for that thread (no caller known; a SIGKILL ends it, as
+       before the round), and a `System.exit` on another thread during a start of more than 30 s halts a node that
+       would have started (a crash before it serves, for which the wait before the round had no limit). In R61-15, a
+       node whose `--peer` list gives two members one placeholder API address no longer starts (exit 2, which a
+       supervisor does not restart): check `PEERS` before the upgrade. The core server's `Main` has a shutdown hook of
+       the shape R61-13 fixed here (it waits for a latch that only the main thread releases) and was not changed.
    - Review of R46, 1 (low, docs): the R46-2 recipe ran `dependency:build-classpath` on `distributed/server/pom.xml`
      alone, so Maven resolved `rockserver-core:${revision}` and that version's pom from `~/.m2` (or the snapshot
      repository): `grep -v /rockserver-core/` dropped the jar but kept the third-party jars of that pom, from whichever

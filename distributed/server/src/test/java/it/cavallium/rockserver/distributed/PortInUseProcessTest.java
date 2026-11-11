@@ -68,6 +68,7 @@ class PortInUseProcessTest {
 		var output = runExpectingExit(command);
 		assertTrue(output.contains("Failed to start Grpc server"), output);
 		assertTrue(output.contains("Failed to bind to address /192.0.2.1:" + ports.get(0)), output);
+		assertTrue(output.contains("Cannot assign requested address"), output);
 		assertTrue(output.contains("Node a does not start: its start called System.exit"), output);
 		assertFalse(output.contains("READY"), output);
 	}
