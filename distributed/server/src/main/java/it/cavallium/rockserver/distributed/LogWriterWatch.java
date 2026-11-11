@@ -13,8 +13,9 @@ import org.jetbrains.annotations.Nullable;
  * leader the next append then closes the log, which {@code ReplicatedNode} sees ({@code RaftLog.isOpened}). On a
  * follower nothing else happens: the division stays alive, every request with entries fails, and the node is a member
  * that can store nothing until it is restarted. Ratis tells nobody: the state machine is only told of a failed read.
- * Worse, the entries of the failed request stay in the log's memory, so the same entries sent again find nothing to
- * write and are answered as stored.</p>
+ * The entries of the failed request also stay in the log's memory, and a follower's answer names its log's next
+ * index, not its flush index, so the same entries sent again may be answered as stored (read in the bytecode, not
+ * reproduced).</p>
  *
  * <p>What shows it from outside: the log holds entries past its flush index, the flush index stands still, and the
  * writer thread waits for work instead of writing. A healthy writer with entries to flush is writing or syncing; a

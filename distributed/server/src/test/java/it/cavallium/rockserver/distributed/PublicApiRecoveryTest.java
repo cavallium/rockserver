@@ -28,6 +28,7 @@ import java.nio.file.Path;
 import java.security.MessageDigest;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
@@ -191,8 +192,16 @@ class PublicApiRecoveryTest {
 		for (var id : cluster.members()) {
 			assertFalse(cluster.output(id).contains(reapplied), () -> "node " + id + " applied the upload again");
 		}
-		assertEquals(later, client.write(BATCH_CONTEXT, other -> other.uploadMergeOperator("op", OPERATOR_CLASS,
-				second)).valueOrThrow(), "the same content keeps its version");
+		// Through the nodes that run (R62-5). The test's client starts at the node that answered it last, which is the
+		// killed leader whenever that was its first node: an upload is a numbered write, which the client library sends
+		// again on that one refused address until the call's deadline and then reports as of unknown outcome, and this
+		// client does not carry such a write to another node.
+		var running = new LinkedHashMap<String, HostAndPort>();
+		cluster.members().stream().filter(cluster::isRunning).forEach(id -> running.put(id, cluster.apiAddress(id)));
+		try (var alive = new ClusterClient(running, CLIENT_RETRY_TIMEOUT, false)) {
+			assertEquals(later, alive.write(BATCH_CONTEXT, other -> other.uploadMergeOperator("op", OPERATOR_CLASS,
+					second)).valueOrThrow(), "the same content keeps its version");
+		}
 	}
 
 	/**

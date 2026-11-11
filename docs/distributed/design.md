@@ -5753,7 +5753,12 @@ install it (`apt-get install gcc libc6-dev`) and run with `-Drockserver.test.req
      never proposed. The rule is the intended behaviour: a change is not started on a cluster whose majority cannot be
      asked. The test now cuts the followers off from the leader and node 4 (`Network.partition`), which the command's
      own connections do not use, and heals the links where it resumed the followers; it also checks that no old
-     follower received the joint configuration.
+     follower received the joint configuration. With the 15 to 20 s election timeouts of these two cases the start
+     itself failed about every second run, 17 s in: the test's client created its column while the cluster had no
+     leader yet, and an attempt whose 5 s ran out while the new leader was not ready (elected, the cluster not
+     initialized: `NotReadyException`, which the proposer resends until the deadline) was answered `UPDATE_RETRY`,
+     which that client does not send again once a node took the request. The test now waits for the leader and
+     creates the column again on a retryable answer (an existing column with the same schema answers its id).
    - R62-5 / TEST-LOST-REPLY-WAS-THE-SESSION-OPEN (test only): `PublicApiRecoveryTest`'s lost-reply tests predate
      client sessions (a1120d2): the first numbered write opens the session, so the first message through the lossy
      link was `openClientSession`. Its reply was lost, the call ended at its 10 s deadline, the channel moved to a
@@ -5761,7 +5766,13 @@ install it (`apt-get install gcc libc6-dev`) and run with `-Drockserver.test.req
      intended behaviour ("Client sessions"). The tests now open the session first with a deletion of a name that
      does not exist, wait up to 10 s for the link to drop reply bytes (the other client sees the write applied a
      moment before the leader's reply reaches the link), and require the call to be unanswered then; the upload
-     test, which asserted no lost reply at all, does the same.
+     test, which asserted no lost reply at all, does the same. The upload test's last check (the same content keeps
+     its version) failed about one run in three after the leader's kill, also before these changes: the test's own
+     client starts at the node that answered it last, the killed leader whenever that was its first node, and an
+     upload is a numbered write, which the client library sends again on that one refused address until the call's
+     deadline (30 s) and then ends as `OUTCOME_UNKNOWN`, which that client does not carry to another node. The check
+     now goes through the nodes that run. Seen on the way and not changed: a numbered write whose every attempt was
+     refused at the connection ends `OUTCOME_UNKNOWN`, not flagged not applied, although no copy left the client.
    - R62-6 / TEST-NO-CLOSED-SEGMENT-TO-PURGE (test only): `LaggingInstallTest` waited 3 minutes for the leader's log
      to start past the lagging node's last entry, with the default segment size of 64 MiB: Ratis purges whole closed
      segments, and the workload needs longer than that to fill one. The snapshots advanced meanwhile, so the purge
