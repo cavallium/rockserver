@@ -771,6 +771,12 @@ final class Proposer implements Closeable {
 		return RocksDBException.of(RocksDBErrorType.SERVER_OVERLOADED, "The node is stopping");
 	}
 
+	/** The failure of a batch that could not be handed to a thread ({@code error}, R61-6): it was not encoded or sent. */
+	private static RocksDBException notHandedOver(Throwable error) {
+		return RocksDBException.of(RocksDBErrorType.SERVER_OVERLOADED,
+				"The node could not start a thread to send the write: " + error);
+	}
+
 	private static RocksDBException callerDeadlinePassed() {
 		return RocksDBException.notApplied(RocksDBErrorType.READ_DEADLINE_EXCEEDED,
 				"The request deadline came before the write was sent; it was not applied");
@@ -887,10 +893,12 @@ final class Proposer implements Closeable {
 				boolean viaSender = !commits && !leaderHint;
 				try {
 					(viaSender ? sender : submitter).execute(() -> sendTaken(batch, viaSender));
-				} catch (RejectedExecutionException ex) {
-					// The node is stopping: nothing of this batch was encoded or sent.
+				} catch (Throwable ex) {
+					// The node is stopping (RejectedExecutionException), or the pool could not start a thread (R61-6: an
+					// OutOfMemoryError "unable to create native thread", which does not end the JVM): nothing of this
+					// batch was encoded or sent. Left as it was, the batch kept its slot and its writes stayed unanswered.
 					encodingEnded(batch);
-					fail(batch, stopping());
+					fail(batch, ex instanceof RejectedExecutionException ? stopping() : notHandedOver(ex));
 					synchronized (this) {
 						batchesInFlight--;
 					}
@@ -1223,7 +1231,9 @@ final class Proposer implements Closeable {
 								boolean viaSender = !leaderHint;
 								try {
 									(viaSender ? sender : submitter).execute(() -> resend.accept(viaSender));
-								} catch (RejectedExecutionException stopping) {
+								} catch (Throwable notHandedOver) {
+									// Stopping, or no thread could start (R61-6): the timer's task would keep an Error to
+									// itself, and the batch its slot.
 									end.run();
 								}
 							}, delay, TimeUnit.MILLISECONDS);

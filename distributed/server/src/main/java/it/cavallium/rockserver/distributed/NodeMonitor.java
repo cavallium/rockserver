@@ -1,8 +1,7 @@
 package it.cavallium.rockserver.distributed;
 
-import io.micrometer.core.instrument.Gauge;
-import io.micrometer.core.instrument.MeterRegistry;
 import it.cavallium.rockserver.core.impl.EmbeddedDB;
+import it.cavallium.rockserver.core.impl.StoragePressureSignal;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -335,7 +334,7 @@ final class NodeMonitor {
 		}
 	}
 
-	/** RocksDB's own stall state, from the gauges of the core server's storage pressure signal. */
+	/** RocksDB's own stall state, from the core server's storage pressure signal. */
 	private void checkWriteStall(long now) {
 		EmbeddedDB db;
 		try {
@@ -366,19 +365,18 @@ final class NodeMonitor {
 		}
 	}
 
-	/** Whether RocksDB stopped the writes of {@code db} (the {@code write-stopped} alarm). */
+	/**
+	 * Whether RocksDB stopped the writes of {@code db} (the {@code write-stopped} alarm). From the database's storage
+	 * pressure signal itself (R61-8), not its gauge: a gauge of the database's registry answers 0 while that registry
+	 * has no backend (JMX and InfluxDB both off or failed), and the alarm was never raised there.
+	 */
 	static boolean writeStopped(EmbeddedDB db) {
-		return pressure(db.getMetricsRegistry(), "write_stopped");
+		return (db.storagePressureReasons() & StoragePressureSignal.REASON_WRITE_STOPPED) != 0;
 	}
 
-	/** Whether RocksDB slows the writes of {@code db} down (the {@code write-delayed} alarm). */
+	/** Whether RocksDB slows the writes of {@code db} down (the {@code write-delayed} alarm); see {@link #writeStopped}. */
 	static boolean writeDelayed(EmbeddedDB db) {
-		return pressure(db.getMetricsRegistry(), "delayed_write");
-	}
-
-	private static boolean pressure(MeterRegistry registry, String reason) {
-		Gauge gauge = registry.find("rockserver.workload.storage.pressure.reason").tag("reason", reason).gauge();
-		return gauge != null && gauge.value() > 0;
+		return (db.storagePressureReasons() & StoragePressureSignal.REASON_DELAYED_WRITE) != 0;
 	}
 
 	private static String bytes(double bytes) {

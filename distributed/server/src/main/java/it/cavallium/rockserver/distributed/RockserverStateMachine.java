@@ -869,7 +869,7 @@ final class RockserverStateMachine extends BaseStateMachine {
 	}
 
 	private void applyLoop() {
-		var group = new ArrayList<Applying>();
+		List<Applying> group = List.of();
 		while (true) {
 			Applying first;
 			try {
@@ -890,7 +890,9 @@ final class RockserverStateMachine extends BaseStateMachine {
 				default -> {
 				}
 			}
-			group.clear();
+			// A list of its own for each group (R61-2): the completer's failure handler reads it after this thread went
+			// on to the next groups. Sized as the previous one, so that a steady load does not grow it again.
+			group = new ArrayList<>(Math.max(16, group.size()));
 			group.add(first);
 			long bytes = first instanceof ApplyEntry entry ? entry.bytes() : 0;
 			while (group.size() < MAX_GROUP_ENTRIES && bytes < MAX_GROUP_BYTES) {
@@ -1092,12 +1094,17 @@ final class RockserverStateMachine extends BaseStateMachine {
 				snapshotByBytes(appliedBytes);
 			} catch (Throwable error) {
 				// The replies first: reporting the failure may itself fail.
+				// R61-2: this group's own list and last position (the apply thread is on later groups by now), and the
+				// node is told whatever failing the replies throws.
 				failed = true;
-				failAll(group, error);
+				completionFailurePosition = last;
 				try {
-					var position = positionOf(group.getLast());
-					completionFailurePosition = position;
-					fail("complete entries up to " + position, error);
+					failAll(group, error);
+				} catch (Throwable secondary) {
+					error.addSuppressed(secondary);
+				}
+				try {
+					fail("complete entries up to " + last, error);
 				} catch (Throwable secondary) {
 					error.addSuppressed(secondary);
 				}
