@@ -59,6 +59,11 @@ public class MetricsManager implements AutoCloseable {
 	private Vertx vertx;
 
 	public MetricsManager(DatabaseConfig config) {
+		this(config, LOG);
+	}
+
+	/** The logger is a seam for tests: a failed exporter initialisation is reported on it (R61-14). */
+	public MetricsManager(DatabaseConfig config, Logger log) {
 		try {
 			this.startTime = System.currentTimeMillis();
 			compositeRegistry = new CompositeMeterRegistry();
@@ -83,7 +88,7 @@ public class MetricsManager implements AutoCloseable {
 					}, Clock.SYSTEM);
 					compositeRegistry.add(jmxMeterRegistry);
 				} catch (Throwable ex) {
-					LOG.error("Failed to initialize jmx metrics");
+					log.error("Failed to initialize jmx metrics");
 				}
 			}
    if (config.metrics().influx().enabled()) {
@@ -189,7 +194,7 @@ public class MetricsManager implements AutoCloseable {
 							.build();
 					compositeRegistry.add(influxMeterRegistry);
     } catch (Throwable ex) {
-                    LOG.error("Failed to initialize influx metrics");
+                    log.error("Failed to initialize influx metrics");
                 }
             } else {
                 this.httpClient = null;
