@@ -5693,7 +5693,7 @@ install it (`apt-get install gcc libc6-dev`) and run with `-Drockserver.test.req
      left out for lack of memory. Eight classes failed, the same way alone on an idle machine: `DiskFaultTest`,
      `MembershipFaultTest`, `LaggingInstallTest`, `ProtocolPointKillTest`, `PublicApiRecoveryTest`, `RandomFaultTest`,
      `PipelinedRandomFaultTest` and one method of `MembershipTest`. Three product defects (R62-1 to R62-3) and four
-     tests that no longer met the product (R62-4 to R62-6, R62-8); R62-7 was found in the node logs on the way.
+     tests that no longer met the product (R62-4 to R62-6, R62-8); R62-7 was found in the node logs on the way, and R62-9, one more test that passed by luck, in a second pass.
    - R62-1 / HALT-HANGS-WHILE-ROCKSDB-WRITES (high): see "Long pauses" (the halt) and "Targeted faults and component tests". `Runtime.halt` does not end a node whose database is writing: the VM stops the Java threads at
      a safepoint and calls libc's `exit`, the static destructors of `librocksdbjni` join RocksDB's background threads
      (`ThreadPoolImpl::JoinThreads`), and a flush or compaction thread that is inside a call into Java (the FFM merge
@@ -5784,6 +5784,15 @@ install it (`apt-get install gcc libc6-dev`) and run with `-Drockserver.test.req
      `NullPointerException` on a gRPC thread for every such failure after the first of a minute (in the node logs of
      `RandomFaultTest`). The other side is boxed now. No test of its own: the class is private to the core's server
      package, which the core's test module cannot open.
+   - R62-9 / TEST-ISOLATED-LEADER-AHEAD-BY-LUCK (test only):
+     `ProtocolPointKillTest.aLeaderKilledWithAppendedButUnreplicatedEntriesLosesOnlyUnacknowledgedWrites` cuts the
+     leader off and waits 5 s for its log to pass the followers'. It passed in the first full run and failed in the
+     second pass of this round ("the isolated leader appended nothing past the followers' last entry"): the
+     workload's writers each wait for their write in flight, which had reached the followers, and the leader appends
+     nothing once it has stepped down for lack of a majority (one election timeout), so its log was ahead only when a
+     write happened to be between its append and its send at the cut. The test now sends two writes of its own
+     straight to the leader right after the cut, over a connection opened before it: 5 of 5 runs, with the leader's
+     log 2 to 4 entries ahead and those entries replaced after its restart. The bound of 5 s is unchanged.
    - R62-8 / TEST-SEEDED-LINE (test only): `MembershipTest.seededClusterServesTheSeedAndANewMemberReceivesItAsASnapshot`
      looked for `(seeded: true)` in the leader's output; the line has gone on with the seed's digest since R3-G2b
      (c059654): `(seeded: true, seed digest ...)`. The cluster was seeded all along; the test reads the line as it
