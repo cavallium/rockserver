@@ -5897,7 +5897,8 @@ install it (`apt-get install gcc libc6-dev`) and run with `-Drockserver.test.req
        and its channels. Pinned by `WatchdogThreadsTest.aStartRefusedBeforeTheRaftServerStartsStopsItsThreads` (red
        before: `still running after the refused start of r63a: [rockserver-metrics-r63a]`): two refused starts under
        node ids of its own leave no thread with the id in its name, and the node then starts. A Raft port that is
-       taken is not such a case: Ratis ends the JVM itself there (`GrpcServicesImpl`, "Failed to start Grpc server").
+       taken is not such a case: Ratis calls `System.exit` itself there (`GrpcServicesImpl`, "Failed to start Grpc
+       server"), which did not end the JVM until R61-13 (below).
    - R63-2 / TEST-NPE-MESSAGE-OMITTED-BY-THE-JVM (test only): `RatisContractTest.aProxyMadeWhileTheOneBeforeItClosesCanGetNoMetricRegistry`
      asserted that the message of the `NullPointerException` of a proxy without a registry names `this.registry`. After
      `ProposerBrokenProxyTest` (it throws that exception from the same place again and again) the JIT compiler throws a
@@ -5941,6 +5942,54 @@ install it (`apt-get install gcc libc6-dev`) and run with `-Drockserver.test.req
      addresses (`adminConfig`), so a list that a repair needs is not refused by `NodeConfig`. Pinned by
      `CommandLineTest.adminRefusesMembersSharingAnAddress` and two cases of
      `StartupChecksTest.runRefusesMalformedValuesWithTwo` (red before), and `PeerConfigAddressTest`.
+   - R61-13 / RAFT-PORT-BIND-HANG (availability at start; medium): a node whose Raft port could not be bound (two nodes
+     with one port, a bind host the machine lacks, a restart racing a process that still holds the port) never exited.
+     Ratis 3.3.1 answers the bind failure with `ExitUtils.terminate`, a `System.exit(1)` on the main thread inside
+     `RaftServer.start()` (its only caller of `ExitUtils`, by a search of the class files of ratis-common, -server,
+     -server-api, -grpc, -netty and -client). `System.exit` runs the shutdown hooks on its own thread and waits for
+     them; the hook of `run` waited for the start to end (R28-4), which that thread was still in. Reproduced with a real
+     process (`PortInUseProcessTest`, red: still running after 60 s, the thread dump showing `main` in
+     `Shutdown.runHooks` under `ExitUtils.terminate` and `rockserver-shutdown` in `started.join()`). The node had logged
+     the cause, served no API, kept its database open and its Raft division running (alone in its group, it elected
+     itself), and SIGTERM did nothing: only the SIGKILL after `TimeoutStopSec` ended it, and a supervisor that restarts on failure saw none.
+     - The rule now: the hook never waits for something that only the exiting thread can do. While the start has not
+       ended, the hook looks at it every 200 ms (`ReplicatedServerMain.awaitStart`) and asks `JvmExit` who is exiting:
+       1. the starting thread is inside `System.exit` (a frame of `java.lang.Shutdown` on its stack: it runs the hooks,
+          or waits behind the thread that does, as when the exit comes after a SIGTERM): the start cannot return. The
+          hook prints `Node <id> does not start: its start called System.exit ...` with that thread's stack and halts
+          with 1, the status of a node that did not start, at its first look;
+       2. a signal started the shutdown (the thread that runs the hooks has a frame of `java.lang.Terminator`): the hook
+          waits for the start without a limit and stops the node it returns, as before. This is the guarantee of R28-4
+          and the only shutdown during a start that an operator or a supervisor asks for;
+       3. anything else, which is a `System.exit` on another thread: the start may wait for that thread, which never
+          returns, and nothing can tell. The hook waits 30 s (`startAfterExitTimeout`) for the start, stops the node if
+          it started, and halts with 1 otherwise. A virtual thread that exits has no stack trace to find and falls here.
+     - A start that fails by an exception completes its result before its own exit, and the hook reads that result after
+       it looked at the thread: it has nothing to stop and leaves the start's status (1, 4 or 5) alone.
+     - Why a halt (`ProcessHalt`, libc's `_exit`) and not a return from the hook, which would let `System.exit` end with
+       Ratis' own status: the start still holds the open database and a running Raft division, and only the starting
+       thread could close them. An exit with them open is the case R28-4 and R62-1 exist to avoid (RocksDB's
+       destructors can hang it). A node that has not ended its start has answered no client, so the halt leaves what a
+       crash during a start leaves.
+     - Why not `ExitUtils.disableSystemExit()`: it is one switch for the whole JVM and for good, and it also takes the
+       exit out of the handler for uncaught exceptions that Ratis installs for every thread when `ExitUtils` first
+       loads (status -1), so a later exit Ratis asks for on another thread would end nothing. A bind check before `RaftServer.start()` would leave the race with another process and every other exit.
+     - What `JvmExit` reads are classes of the JDK's implementation (`java.lang.Shutdown`, its `runHooks`,
+       `java.lang.Terminator`), seen on Temurin 27.0.1. The process tests pin them: a JDK where the exit is not
+       recognised fails `PortInUseProcessTest` (the hang is back); one where the signal is not recognised fails
+       `StartExitProcessTest.aSignalDuringAStartStillStopsTheNodeCleanly` (a stop during a long start would become a halt
+       after 30 s, a crash for the node and not a hang).
+     - The other exits of the distributed main code were read for the same cycle: `run` registers this one hook and
+       nothing else does; every `exit` of `startAndServe` and `awaitStop` comes after the result of the start is set; the
+       direct-memory watch and the crash points halt and run no hook. A taken API port is not the Raft case: the API
+       server's start throws (`Failed to bind to address`, `Address already in use`), the start closes what it opened
+       and `run` exits with 1 through `Failed to start node <id>`, before and after this change.
+     - Tests: `PortInUseProcessTest` (a real node with its Raft port, then its API port, held by the test: exit 1, the
+       address and `Address already in use` in the output, no `READY`); `StartExitProcessTest` with `StartExitMain` (a
+       real SIGTERM during a start that takes 5 s more, with the limit of case 3 at 2 s: exit 143, the node started and
+       was stopped, the database's lock is free; a start that calls `System.exit` after a SIGTERM: 1; a start that waits
+       for a thread inside `System.exit`: 1 after the limit); `ShutdownSignalTest` with the probe replaced (cases 1 to 3
+       and the failed start whose exit the hook sees).
    - R63-3 (test gap): `WatchdogThreadsTest.aRuntimeFailureOfTheStateMachineInitializeStopsEverythingItStarted` fails the
      state machine's `initialize` inside `server.start()` with an `IllegalStateException` (seam
      `RockserverStateMachine.initializedForTesting`, after the store is open) and asserts that no thread with the node id

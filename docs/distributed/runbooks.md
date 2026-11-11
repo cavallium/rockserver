@@ -818,7 +818,19 @@ SIGKILL. A node prints `WARNING: libc's _exit could not be linked` at its start 
 halt (it needs `--enable-native-access=ALL-UNNAMED`, which the node is started with anyway). The hook is registered before the node starts: a SIGTERM while it is still
 starting (opening its database, loading its log, checking its membership) waits for the start to end and then stops
 the node as above, so a stop during a long start takes as long as the rest of the start, which `TimeoutStopSec`
-must cover for a large node (or it ends with SIGKILL, a crash for the node). Such a node does not print `READY`. A node that is killed (SIGKILL, 137 in a shell) or crashes in native code
+must cover for a large node (or it ends with SIGKILL, a crash for the node). Such a node does not print `READY`.
+
+A Raft port that cannot be bound (in use, or `--raft-bind-host` is no address of the machine) ends `run` with 1 within
+seconds: the log has `Terminating with exit status 1: Failed to start Grpc server` with
+`Failed to bind to address /<host>:<port>` and the cause (`Address already in use`), then
+`Node <id> does not start: its start called System.exit ...; halting with 1`. Ratis exits by itself there, inside the
+start, so the node halts instead of closing what it had opened, which is safe before it serves (R61-13; until then such
+a node never exited: it logged the first line and stayed, without its API and deaf to SIGTERM, until a SIGKILL). A taken
+API port also ends with 1: `Failed to start node <id>:` with the same `Failed to bind to address` and cause, after
+the start closed what it opened. Find the holder with `ss -ltnp 'sport = :<port>'`; when it is the node's previous
+process still stopping, the supervisor's next restart passes. A node that prints
+`... a System.exit on another thread started the shutdown, and the start did not end within PT30S ...; halting with 1`
+was asked to exit by a library while it started: the cause is above that line in its log. A node that is killed (SIGKILL, 137 in a shell) or crashes in native code
 (SIGABRT, 134) ends by a signal, and any other failure before the node serves (a malformed option value ends with 2
 instead) ends with 1, as in the table. A supervisor restarts all of these except a stop it asked for. So the codes a
 supervisor must not restart are 2, 4 and 5, and 143 is a clean stop.
