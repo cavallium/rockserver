@@ -107,12 +107,32 @@ class MembershipFaultTest {
 		var originals = new LinkedHashMap<String, Utils.HostAndPort>();
 		ORIGINALS.forEach(id -> originals.put(id, cluster.apiAddress(id)));
 		client = new ClusterClient(originals, CLIENT_RETRY_TIMEOUT, false);
-		column = client.createColumn("data", SCHEMA, BATCH_CONTEXT).valueOrThrow();
+		column = createColumn();
 		workload = new ScenarioSupport.UniqueWrites(originals, column, 4, 256).start();
 		workload.awaitMore(200, PHASE_TIMEOUT, "before the change");
 		cluster.setMembers(ALL);
 		cluster.start("4", "--join");
 		cluster.waitReady("4", READY_TIMEOUT);
+	}
+
+	/**
+	 * Creates the column once a leader serves (R62-4). With {@link #SLOW_ELECTIONS} the cluster has no leader for its
+	 * first 15 to 20 s, and a write whose 5 s run out while the new leader is not ready yet (elected, the cluster not
+	 * initialized) is answered {@code UPDATE_RETRY}: not applied, to be sent again. This client does not send a write
+	 * again once a node took it, so the test does: creating a column that exists with the same schema answers its id.
+	 */
+	private long createColumn() {
+		support.awaitLeader(PHASE_TIMEOUT);
+		long deadline = System.nanoTime() + PHASE_TIMEOUT.toNanos();
+		while (true) {
+			var created = client.createColumn("data", SCHEMA, BATCH_CONTEXT);
+			if (created.acknowledged()) {
+				return created.value();
+			}
+			if (!ClusterClient.isRetryable(created.error()) || System.nanoTime() - deadline > 0) {
+				throw created.error();
+			}
+		}
 	}
 
 	/** Runs {@code add-peer 4} in the background: the command may fail when its leader dies. */
