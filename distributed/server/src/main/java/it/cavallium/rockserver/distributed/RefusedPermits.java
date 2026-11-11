@@ -34,10 +34,19 @@ import org.slf4j.LoggerFactory;
  * ({@code PendingRequests.RequestMap.remove}): it takes the request's bytes off the count and releases one request and
  * the megabytes that count no longer needs. The permit itself is an empty object that Ratis keeps in a map until the
  * request is added, and nothing tells which one of the map is this thread's: other threads hold permits of their own
- * between taking them and entering the monitor. So the object stays, and is removed later: a permit that two sweeps
- * found in the map {@link #STALE_AFTER} apart belongs to no thread that is about to use it (that takes microseconds
- * and one pass through the monitor), so it is one of those left behind. Without that the map would grow by one entry
- * for every conflict of a term.</p>
+ * between taking them and entering the monitor. So the object stays, and is removed later, by a sweep that runs at a
+ * refusal, at most every {@link #SWEEP_EVERY}: a permit that {@link #MIN_SIGHTINGS} sweeps found in the map, the first
+ * of them {@link #STALE_AFTER} ago, counts as left behind. Without that the map would grow by one entry for every
+ * conflict of a term.</p>
+ *
+ * <p>The time alone does not tell a permit that was left behind from one whose thread still waits for the monitor
+ * (review of R62): a process that stood still for {@link #STALE_AFTER} (SIGSTOP, a frozen virtual machine) has such a
+ * thread's permit in one sweep before the pause and in the next right after it. Removing it would make Ratis answer
+ * that thread's request, after appending its entry, with "Failed to add a pending write request" (an unknown outcome
+ * to {@link Proposer}, so nothing is lost), and keep its permit for good. Hence the number of sweeps: a pause
+ * shortens the time between two of them, not their number, and each sweep runs under the monitor that the waiting
+ * thread is next in line for. A thread that waits for that monitor through {@link #MIN_SIGHTINGS} refusals of others,
+ * {@link #SWEEP_EVERY} apart each, is not excluded by anything but is not a thing a running process does.</p>
  *
  * <p>All of this reaches into classes that are private to Ratis, by reflection, resolved once when this class loads.
  * If a member is missing (another Ratis version) nothing is released and one error is logged; {@code
@@ -50,6 +59,11 @@ final class RefusedPermits {
 	/** How long a permit stays in Ratis' map before it counts as left behind. */
 	static final Duration STALE_AFTER = Duration.ofSeconds(60);
 	static final Duration SWEEP_EVERY = Duration.ofSeconds(10);
+	/**
+	 * In how many sweeps a permit must have been found before it counts as left behind: as many as fit in
+	 * {@link #STALE_AFTER} of a process that runs.
+	 */
+	static final int MIN_SIGHTINGS = (int) (STALE_AFTER.toNanos() / SWEEP_EVERY.toNanos()) + 1;
 
 	private record Handles(Class<?> server, Method role, Method leaderState, Field pendingRequests, Field requestMap,
 			Field permits, Field resource, Field requestSize, Method release, Method roundUpMb) {}
@@ -104,9 +118,19 @@ final class RefusedPermits {
 		return HANDLES != null;
 	}
 
-	/** Ratis' map of permits not yet added as requests, in which the sweep last looked, and when it first saw each. */
+	/** When a sweep first found a permit in the map, and in how many sweeps it was found. */
+	private static final class Sighting {
+		final long firstNanos;
+		int count = 1;
+
+		Sighting(long firstNanos) {
+			this.firstNanos = firstNanos;
+		}
+	}
+
+	/** Ratis' map of permits not yet added as requests, in which the sweep last looked, and what it saw of each. */
 	private @Nullable Object sweptMap;
-	private final IdentityHashMap<Object, Long> firstSeenNanos = new IdentityHashMap<>();
+	private final IdentityHashMap<Object, Sighting> sightings = new IdentityHashMap<>();
 	private long lastSweepNanos;
 	private boolean failureLogged;
 	private final AtomicLong released = new AtomicLong();
@@ -168,26 +192,54 @@ final class RefusedPermits {
 		}
 	}
 
-	/** Removes the permits that were already in the map {@link #STALE_AFTER} ago; at most every {@link #SWEEP_EVERY}. */
+	/**
+	 * Runs the sweep alone, for tests: on a thread that holds the monitor of {@code division}, as a refusal does.
+	 *
+	 * @return the number of permits in Ratis' map after it, or -1 if the map cannot be reached
+	 */
+	int sweepForTesting(RaftServer.Division division, long nowNanos) throws ReflectiveOperationException {
+		var handles = HANDLES;
+		if (handles == null || !handles.server().isInstance(division)) {
+			return -1;
+		}
+		var leaderState = ((Optional<?>) handles.leaderState().invoke(handles.role().invoke(division))).orElse(null);
+		if (leaderState == null) {
+			return -1;
+		}
+		var map = handles.requestMap().get(handles.pendingRequests().get(leaderState));
+		@SuppressWarnings("unchecked")
+		var permits = (Map<Object, Object>) handles.permits().get(map);
+		synchronized (map) {
+			sweep(map, permits, nowNanos);
+			return permits.size();
+		}
+	}
+
+	/**
+	 * Removes the permits that {@link #MIN_SIGHTINGS} sweeps found in the map, the first of them {@link #STALE_AFTER}
+	 * ago; at most every {@link #SWEEP_EVERY}.
+	 */
 	private void sweep(Object map, Map<Object, Object> permits, long nowNanos) {
 		if (map != sweptMap) {
 			// A new term has a new map.
 			sweptMap = map;
-			firstSeenNanos.clear();
+			sightings.clear();
 			lastSweepNanos = nowNanos - SWEEP_EVERY.toNanos();
 		}
 		if (nowNanos - lastSweepNanos < SWEEP_EVERY.toNanos()) {
 			return;
 		}
 		lastSweepNanos = nowNanos;
-		firstSeenNanos.keySet().removeIf(permit -> !permits.containsKey(permit));
+		sightings.keySet().removeIf(permit -> !permits.containsKey(permit));
 		var each = permits.keySet().iterator();
 		while (each.hasNext()) {
 			var permit = each.next();
-			var seen = firstSeenNanos.putIfAbsent(permit, nowNanos);
-			if (seen != null && nowNanos - seen >= STALE_AFTER.toNanos()) {
+			var seen = sightings.get(permit);
+			if (seen == null) {
+				sightings.put(permit, new Sighting(nowNanos));
+			} else if (++seen.count >= MIN_SIGHTINGS && nowNanos - seen.firstNanos >= STALE_AFTER.toNanos()) {
 				each.remove();
-				firstSeenNanos.remove(permit);
+				sightings.remove(permit);
 				swept.incrementAndGet();
 			}
 		}
