@@ -1738,8 +1738,18 @@ final class RockserverStateMachine extends BaseStateMachine {
 		return ex;
 	}
 
+	/** Whether {@link #close()} was called: it runs once. */
+	private final AtomicBoolean closing = new AtomicBoolean();
+
+	/**
+	 * Runs once: a start that fails closes the state machine itself when no started Raft server does (R63-1), and the
+	 * Raft server whose start failed may close it too.
+	 */
 	@Override
 	public void close() throws IOException {
+		if (!closing.compareAndSet(false, true)) {
+			return;
+		}
 		ops.close();
 		// Offers whose answers never come, if any: nothing will take them now.
 		localProposals.clear();

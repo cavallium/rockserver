@@ -29,11 +29,54 @@ import java.util.Map;
 import org.apache.ratis.thirdparty.io.grpc.Status;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.TimeUnit;
+import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 /** Unit tests of the cluster operations' pieces: entries, wire answers, digests, metrics export, monitor helpers. */
 class ReplicaOpsTest {
+
+	/**
+	 * R63-1: every {@code NodeMetrics} starts a logger thread that only {@code close()} stops, and this class made 27
+	 * without closing them: the threads of a surefire JVM outlived it, and {@code WatchdogThreadsTest} (which waits for
+	 * the threads of one node id to be gone) failed in a full run. Nothing of this class stays running after it.
+	 */
+	private static long metricsThreadsBefore;
+
+	private static long metricsThreads() {
+		return Thread.getAllStackTraces().keySet().stream()
+				.filter(thread -> thread.isAlive() && thread.getName().startsWith("rockserver-metrics-")).count();
+	}
+
+	private final java.util.List<NodeMetrics> opened = new java.util.ArrayList<>();
+
+	/** A {@link NodeMetrics} that the test closes at its end. */
+	private NodeMetrics metrics() {
+		return metrics("n0");
+	}
+
+	private NodeMetrics metrics(String nodeId) {
+		var metrics = new NodeMetrics(nodeId);
+		opened.add(metrics);
+		return metrics;
+	}
+
+	@AfterEach
+	void closeMetrics() {
+		opened.forEach(NodeMetrics::close);
+	}
+
+	@BeforeAll
+	static void countMetricsThreads() {
+		metricsThreadsBefore = metricsThreads();
+	}
+
+	@AfterAll
+	static void noMetricsThreadLeaks() throws Exception {
+		InProcessCluster.await(java.time.Duration.ofSeconds(10), () -> metricsThreads() <= metricsThreadsBefore);
+	}
 
 	@TempDir
 	Path temp;
@@ -139,7 +182,7 @@ class ReplicaOpsTest {
 	@Test
 	void aStartingNodeMarksItsRefusalAsNotProposed() throws Exception {
 		var config = NodeConfig.defaults("n0", List.of(new PeerConfig("n0", "127.0.0.1", 1, "127.0.0.1", 2)), temp);
-		try (var ops = new ReplicaOps(config, null, new NodeMetrics("n0"))) {
+		try (var ops = new ReplicaOps(config, null, metrics())) {
 			ops.clusterVersion(Capabilities.SUPPORTED);
 			var error = assertThrows(CompletionException.class,
 					() -> ops.answer(ReplicaOps.request(ReplicaOps.OP_PROPOSE_CHECKSUM, new byte[0])).join());
@@ -330,7 +373,7 @@ class ReplicaOpsTest {
 		log.writeBytes("2026-11-01T10:03:00Z backup 10 DONE b2 /data/caffè\n".getBytes(StandardCharsets.UTF_8));
 		Files.write(temp.resolve("replica-ops.log"), log.toByteArray());
 
-		try (var ops = new ReplicaOps(config, null, new NodeMetrics("n0"))) {
+		try (var ops = new ReplicaOps(config, null, metrics())) {
 			assertEquals(List.of(7L, 9L), ops.checksumResults().stream().map(ReplicaOps.Result::index).toList());
 			assertEquals(new ReplicaOps.Result(ReplicaOps.State.DONE, 7, 3, "abc"), ops.checksumResult(7));
 			assertEquals(new ReplicaOps.Result(ReplicaOps.State.DONE, 9, 4, "def"), ops.checksumResult(9));
@@ -349,12 +392,12 @@ class ReplicaOpsTest {
 		var config = NodeConfig.defaults("n0", List.of(new PeerConfig("n0", "127.0.0.1", 1, "127.0.0.1", 2)), temp);
 		Files.writeString(temp.resolve("replica-ops.log"), "2026-11-01T10:00:00Z checksum 7 DONE 3 abc\n"
 				+ "2026-11-01T10:01:00Z checksum 8 DO", StandardCharsets.UTF_8);
-		try (var ops = new ReplicaOps(config, null, new NodeMetrics("n0"))) {
+		try (var ops = new ReplicaOps(config, null, metrics())) {
 			assertEquals(List.of(7L), ops.checksumResults().stream().map(ReplicaOps.Result::index).toList());
 			ops.persist("checksum 11 DONE 5 ghi");
 			ops.persist("checksum 12 DONE 6 jkl");
 		}
-		try (var ops = new ReplicaOps(config, null, new NodeMetrics("n0"))) {
+		try (var ops = new ReplicaOps(config, null, metrics())) {
 			assertEquals(List.of(7L, 11L, 12L), ops.checksumResults().stream().map(ReplicaOps.Result::index).toList());
 			assertEquals(new ReplicaOps.Result(ReplicaOps.State.DONE, 11, 5, "ghi"), ops.checksumResult(11));
 		}
@@ -376,7 +419,7 @@ class ReplicaOpsTest {
 	@Test
 	void anAppendCutWhileTheNodeRunsCostsOnlyItsOwnResult() throws Exception {
 		var config = NodeConfig.defaults("n0", List.of(new PeerConfig("n0", "127.0.0.1", 1, "127.0.0.1", 2)), temp);
-		try (var ops = new ReplicaOps(config, null, new NodeMetrics("n0"))) {
+		try (var ops = new ReplicaOps(config, null, metrics())) {
 			ops.persist("checksum 7 DONE 3 " + DIGEST);
 			ops.cutNextAppendForTesting = record -> record.indexOf(" DONE ") + 3;
 			ops.persist("checksum 8 DONE 3 " + DIGEST);
@@ -385,7 +428,7 @@ class ReplicaOpsTest {
 			ops.persist("checksum 12 DONE 3 " + DIGEST);
 			ops.persist("checksum 13 DONE 6 " + DIGEST);
 		}
-		try (var ops = new ReplicaOps(config, null, new NodeMetrics("n0"))) {
+		try (var ops = new ReplicaOps(config, null, metrics())) {
 			assertEquals(List.of(7L, 11L, 13L), checksumIndexes(ops));
 			assertEquals(new ReplicaOps.Result(ReplicaOps.State.DONE, 11, 5, DIGEST), ops.checksumResult(11));
 			assertEquals(new ReplicaOps.Result(ReplicaOps.State.DONE, 13, 6, DIGEST), ops.checksumResult(13));
@@ -404,18 +447,18 @@ class ReplicaOpsTest {
 		Files.writeString(temp.resolve("replica-ops.log"), "2026-11-01T10:00:00Z checksum 7 DONE 3 " + DIGEST + "\n"
 				+ "2026-11-01T10:00:30Z backup 9 DONE b1 /data/backups/b1\n"
 				+ "2026-11-01T10:01:00Z checksum 8 DONE 3 " + DIGEST.substring(0, 20), StandardCharsets.UTF_8);
-		try (var ops = new ReplicaOps(config, null, new NodeMetrics("n0"))) {
+		try (var ops = new ReplicaOps(config, null, metrics())) {
 			assertEquals(List.of(7L), checksumIndexes(ops));
 			assertEquals("/data/backups/b1", ops.backupResult("b1", 9).detail());
 			ops.persist("checksum 11 DONE 5 " + DIGEST);
 		}
-		try (var ops = new ReplicaOps(config, null, new NodeMetrics("n0"))) {
+		try (var ops = new ReplicaOps(config, null, metrics())) {
 			assertEquals(List.of(7L, 11L), checksumIndexes(ops));
 		}
 
 		Files.writeString(temp.resolve("replica-ops.log"), "2026-11-01T10:00:00Z backup 9 DONE b1 /data/backups/b1\n"
 				+ "2026-11-01T10:01:00Z backup 10 DONE b2 /data/back", StandardCharsets.UTF_8);
-		try (var ops = new ReplicaOps(config, null, new NodeMetrics("n0"))) {
+		try (var ops = new ReplicaOps(config, null, metrics())) {
 			assertEquals(ReplicaOps.State.DONE, ops.backupResult("b1", 9).state());
 			assertEquals(List.of(9L), ops.backupIndexesForTesting());
 		}
@@ -430,22 +473,22 @@ class ReplicaOpsTest {
 	void aCheckedLastLineThatLostOnlyItsNewlineLoads() throws Exception {
 		var config = NodeConfig.defaults("n0", List.of(new PeerConfig("n0", "127.0.0.1", 1, "127.0.0.1", 2)), temp);
 		var file = temp.resolve("replica-ops.log");
-		try (var ops = new ReplicaOps(config, null, new NodeMetrics("n0"))) {
+		try (var ops = new ReplicaOps(config, null, metrics())) {
 			ops.persist("checksum 7 DONE 3 " + DIGEST);
 			ops.persist("checksum 8 DONE 3 " + DIGEST);
 		}
 		var bytes = Files.readAllBytes(file);
 		Files.write(file, java.util.Arrays.copyOf(bytes, bytes.length - 1));
-		try (var ops = new ReplicaOps(config, null, new NodeMetrics("n0"))) {
+		try (var ops = new ReplicaOps(config, null, metrics())) {
 			assertEquals(List.of(7L, 8L), checksumIndexes(ops));
 			ops.persist("checksum 9 DONE 4 " + DIGEST);
 		}
-		try (var ops = new ReplicaOps(config, null, new NodeMetrics("n0"))) {
+		try (var ops = new ReplicaOps(config, null, metrics())) {
 			assertEquals(List.of(7L, 8L, 9L), checksumIndexes(ops));
 		}
 		bytes = Files.readAllBytes(file);
 		Files.write(file, java.util.Arrays.copyOf(bytes, bytes.length - 2));
-		try (var ops = new ReplicaOps(config, null, new NodeMetrics("n0"))) {
+		try (var ops = new ReplicaOps(config, null, metrics())) {
 			assertEquals(List.of(7L, 8L), checksumIndexes(ops));
 		}
 	}
@@ -460,16 +503,16 @@ class ReplicaOpsTest {
 		var config = NodeConfig.defaults("n0", List.of(new PeerConfig("n0", "127.0.0.1", 1, "127.0.0.1", 2)), temp);
 		var file = temp.resolve("replica-ops.log");
 		Files.writeString(file, "2026-11-01T10:00:00Z checksum 6 DONE 2 " + DIGEST + "\n", StandardCharsets.UTF_8);
-		try (var ops = new ReplicaOps(config, null, new NodeMetrics("n0"))) {
+		try (var ops = new ReplicaOps(config, null, metrics())) {
 			ops.persist("checksum 7 DONE 3 " + DIGEST);
 		}
 		Files.writeString(file, "2026-11-01T10:01:00Z checksum 10 DONE 4 " + DIGEST.substring(0, 9) + "\n"
 				+ "2026-11-01T10:01:30Z checksum 14 DONE 4 " + DIGEST + " #00000000\n", StandardCharsets.UTF_8,
 				StandardOpenOption.APPEND);
-		try (var ops = new ReplicaOps(config, null, new NodeMetrics("n0"))) {
+		try (var ops = new ReplicaOps(config, null, metrics())) {
 			ops.persist("checksum 12 DONE 5 " + DIGEST);
 		}
-		try (var ops = new ReplicaOps(config, null, new NodeMetrics("n0"))) {
+		try (var ops = new ReplicaOps(config, null, metrics())) {
 			assertEquals(List.of(6L, 7L, 12L), checksumIndexes(ops));
 			assertEquals(new ReplicaOps.Result(ReplicaOps.State.DONE, 7, 3, DIGEST), ops.checksumResult(7));
 		}
@@ -515,7 +558,7 @@ class ReplicaOpsTest {
 	@Test
 	void anOlderBinaryReadsTheResultsThisVersionWrites() throws Exception {
 		var config = NodeConfig.defaults("n0", List.of(new PeerConfig("n0", "127.0.0.1", 1, "127.0.0.1", 2)), temp);
-		try (var ops = new ReplicaOps(config, null, new NodeMetrics("n0"))) {
+		try (var ops = new ReplicaOps(config, null, metrics())) {
 			ops.persist("checksum 7 DONE 3 " + DIGEST);
 			ops.persist("backup 9 DONE b1 /data/backups/b1");
 			ops.persist("checksum 11 FAILED 0 disk full");
@@ -523,7 +566,7 @@ class ReplicaOpsTest {
 		var lines = Files.readAllLines(temp.resolve("replica-ops.log"), StandardCharsets.UTF_8);
 		assertEquals(Map.of("checksum 7", DIGEST, "backup b1 9", "/data/backups/b1", "checksum 11", "disk full"),
 				loadedByRound53(lines), String.join("\n", lines));
-		try (var ops = new ReplicaOps(config, null, new NodeMetrics("n0"))) {
+		try (var ops = new ReplicaOps(config, null, metrics())) {
 			assertEquals(new ReplicaOps.Result(ReplicaOps.State.DONE, 7, 3, DIGEST), ops.checksumResult(7));
 			assertEquals("/data/backups/b1", ops.backupResult("b1", 9).detail());
 			assertEquals(new ReplicaOps.Result(ReplicaOps.State.FAILED, 11, 0, "disk full"), ops.checksumResult(11));
@@ -551,13 +594,13 @@ class ReplicaOpsTest {
 				+ round54Line("2026-11-01T10:00:30Z", "checksum 7 DONE 3 " + DIGEST).replace(" 3 ", " 4 ") + "\n"
 				+ round54Line("2026-11-01T10:00:40Z", "backup 8 DONE b1 /data/backups/b1") + "\n",
 				StandardCharsets.UTF_8);
-		try (var ops = new ReplicaOps(config, null, new NodeMetrics("n0"))) {
+		try (var ops = new ReplicaOps(config, null, metrics())) {
 			assertEquals(List.of(5L, 6L), checksumIndexes(ops));
 			assertEquals(new ReplicaOps.Result(ReplicaOps.State.DONE, 6, 2, DIGEST), ops.checksumResult(6));
 			assertEquals("/data/backups/b1", ops.backupResult("b1", 8).detail());
 			ops.persist("checksum 12 DONE 5 " + DIGEST);
 		}
-		try (var ops = new ReplicaOps(config, null, new NodeMetrics("n0"))) {
+		try (var ops = new ReplicaOps(config, null, metrics())) {
 			assertEquals(List.of(5L, 6L, 12L), checksumIndexes(ops));
 			assertEquals(new ReplicaOps.Result(ReplicaOps.State.DONE, 12, 5, DIGEST), ops.checksumResult(12));
 		}
@@ -573,7 +616,7 @@ class ReplicaOpsTest {
 		var every = Duration.ofHours(1);
 		var config = NodeConfig.defaults("n0", List.of(new PeerConfig("n0", "127.0.0.1", 1, "127.0.0.1", 2)), temp);
 		long start;
-		try (var ops = new ReplicaOps(config, null, new NodeMetrics("n0"))) {
+		try (var ops = new ReplicaOps(config, null, metrics())) {
 			ops.clusterVersion(Capabilities.SUPPORTED);
 			ops.checksumEveryForTesting(every);
 			long now = System.currentTimeMillis();
@@ -603,7 +646,7 @@ class ReplicaOpsTest {
 		}
 		Thread.sleep(20);
 		// A restart before the first check: the schedule goes on from the first start.
-		try (var ops = new ReplicaOps(config, null, new NodeMetrics("n0"))) {
+		try (var ops = new ReplicaOps(config, null, metrics())) {
 			ops.clusterVersion(Capabilities.SUPPORTED);
 			ops.checksumEveryForTesting(every);
 			assertTrue(ops.periodicChecksumDue(start + every.toMillis()), "due one interval after the first start");
@@ -624,7 +667,7 @@ class ReplicaOpsTest {
 		Files.createDirectories(dir.resolve(ReplicaOps.BACKUP_DB_DIR));
 		Files.writeString(dir.resolve(ReplicaOps.BACKUP_PROPERTIES), "");
 		try (var store = NodeStore.open(temp.resolve("store"), null, "n0");
-				var ops = new ReplicaOps(config, null, new NodeMetrics("n0"))) {
+				var ops = new ReplicaOps(config, null, metrics())) {
 			ops.backup("b1", 5, org.apache.ratis.server.protocol.TermIndex.valueOf(1, 10), store);
 			var result = ops.backupResult("b1", 10);
 			assertEquals(ReplicaOps.State.DONE, result.state(), result.detail());
@@ -645,7 +688,7 @@ class ReplicaOpsTest {
 		var config = NodeConfig.defaults("n0", List.of(new PeerConfig("n0", "127.0.0.1", 1, "127.0.0.1", 2)), temp);
 		Path dir = ReplicaOps.backupsDir(config.dataDir()).resolve("nightly");
 		try (var store = NodeStore.open(temp.resolve("store"), null, "n0");
-				var ops = new ReplicaOps(config, null, new NodeMetrics("n0"))) {
+				var ops = new ReplicaOps(config, null, metrics())) {
 			NodeStore.checkpointBuiltForTesting = building -> {
 				throw new java.io.IOException("No space left on device (test)");
 			};
@@ -671,7 +714,7 @@ class ReplicaOpsTest {
 		var config = NodeConfig.defaults("n0", List.of(new PeerConfig("n0", "127.0.0.1", 1, "127.0.0.1", 2)), temp);
 		Path dir = ReplicaOps.backupsDir(config.dataDir()).resolve("nightly");
 		try (var store = NodeStore.open(temp.resolve("store"), null, "n0");
-				var ops = new ReplicaOps(config, null, new NodeMetrics("n0"))) {
+				var ops = new ReplicaOps(config, null, metrics())) {
 			// The properties' temporary file cannot be made: a directory with something in it is in its place.
 			NodeStore.checkpointBuiltForTesting = building -> Files.createDirectories(
 					building.resolveSibling(ReplicaOps.BACKUP_PROPERTIES + ".tmp").resolve("blocker"));
@@ -706,7 +749,7 @@ class ReplicaOpsTest {
 		Path backups = ReplicaOps.backupsDir(dataDir);
 		var synced = java.util.Collections.synchronizedList(new java.util.ArrayList<Path>());
 		try (var store = NodeStore.open(temp.resolve("store"), null, "n0");
-				var ops = new ReplicaOps(config, null, new NodeMetrics("n0"))) {
+				var ops = new ReplicaOps(config, null, metrics())) {
 			NodeStore.syncedForTesting = synced::add;
 			try {
 				ops.backup("nightly", 5, org.apache.ratis.server.protocol.TermIndex.valueOf(1, 10), store);
@@ -743,7 +786,7 @@ class ReplicaOpsTest {
 		Path dirB = ReplicaOps.backupsDir(configB.dataDir()).resolve("nightly");
 		Path storeB = temp.resolve("b-store");
 		try (var store = NodeStore.open(temp.resolve("a-store"), null, "a");
-				var ops = new ReplicaOps(configA, null, new NodeMetrics("a"))) {
+				var ops = new ReplicaOps(configA, null, metrics("a"))) {
 			var applier = new Applier(store);
 			applier.maintenance(ops);
 			applier.apply(first, i1);
@@ -757,7 +800,7 @@ class ReplicaOpsTest {
 		}
 		assertEquals("100", ReplicaOps.readBackupProperties(dirA).getProperty("index"));
 		try (var store = NodeStore.open(storeB, null, "b");
-				var ops = new ReplicaOps(configB, null, new NodeMetrics("b"))) {
+				var ops = new ReplicaOps(configB, null, metrics("b"))) {
 			var applier = new Applier(store);
 			applier.maintenance(ops);
 			applier.apply(again, i2);
@@ -780,7 +823,7 @@ class ReplicaOpsTest {
 		var config = NodeConfig.defaults("n0", List.of(new PeerConfig("n0", "127.0.0.1", 1, "127.0.0.1", 2)), temp);
 		Path dir = ReplicaOps.backupsDir(config.dataDir()).resolve("nightly");
 		try (var store = NodeStore.open(temp.resolve("store"), null, "n0");
-				var ops = new ReplicaOps(config, null, new NodeMetrics("n0"))) {
+				var ops = new ReplicaOps(config, null, metrics())) {
 			ops.backup("nightly", 77, org.apache.ratis.server.protocol.TermIndex.valueOf(1, 100), store);
 			assertEquals(ReplicaOps.State.DONE, ops.backupResult("nightly", 100).state());
 

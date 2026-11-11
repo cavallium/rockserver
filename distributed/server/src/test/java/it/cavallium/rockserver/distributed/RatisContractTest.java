@@ -972,24 +972,43 @@ class RatisContractTest {
 		assertTrue(lags.stream().allMatch(lag -> lag < 600_000), lags::toString);
 	}
 
+	/** The failure of a call of a proxy without a registry: Java's message says which reference was null. */
+	private static void assertRegistryNpe(NullPointerException npe) {
+		if (npe.getStackTrace().length == 0 && npe.getMessage() == null) {
+			// Omitted by the JVM (OmitStackTraceInFastThrow): nothing is left to read; the proxy has no registry, which
+			// proxyWithoutRegistry() checked, and the call threw the exception that the omission replaces.
+			return;
+		}
+		assertTrue(String.valueOf(npe.getMessage()).contains("\"this.registry\" is null"), npe::getMessage);
+	}
+
 	/**
-	 * R8-4: Ratis 3.3.1 can build a client proxy whose metric interceptor has no registry, and the proxy map lets the
-	 * failure of such a proxy's close out of its own close. Each {@code GrpcClientProtocolClient} makes a
-	 * {@link MessageMetrics} named after its client and peer ({@code MetricClientInterceptor}), and its close
-	 * unregisters it. {@code RatisMetrics.create} shares a registry that is already there without counting the new
-	 * holder, and {@code RefCountingMap.put} counts a new registry only after putting it in the map; so when a proxy
-	 * is made while the one before it to the same peer closes, a close that removes the registry between the put and
-	 * the count leaves the new proxy with {@code null}. Every call of that proxy then throws a
-	 * {@link NullPointerException} at its start ({@code MessageMetrics.rpcStarted}), its close too, and
-	 * {@code PeerProxyMap} catches only an {@link IOException} of a proxy's close: its own close throws a
-	 * {@link CompletionException} after closing the others. {@link Proposer} replaces such a proxy
-	 * ({@link Proposer#resetBrokenProxy}) and logs the failure of its client's close ({@link Proposer#closeClient}).
-	 * Here generations of one proxy name are made each while the one before closes, on two threads, until one has no
-	 * registry: a few thousand generations, under a second. A Ratis that fixes the race fails here after
-	 * {@link #WAIT}, and the proposer's handling can go.
+	 * R63-2: the JVM stops filling in the message and the stack trace of a {@link NullPointerException} thrown from a
+	 * place that threw it many times (the compiler's {@code OmitStackTraceInFastThrow}), and the proxy tests of the
+	 * classes before this one in a surefire JVM make that many: the check of the message failed in a full run, with
+	 * the same code that passes alone. Here the JVM is made to do it first.
 	 */
 	@Test
-	void aProxyMadeWhileTheOneBeforeItClosesCanGetNoMetricRegistry() throws Exception {
+	void theRegistryCheckHoldsWhenTheJvmOmitsTheMessageOfTheNullPointerException() throws Exception {
+		var broken = proxyWithoutRegistry();
+		NullPointerException last = null;
+		for (int i = 0; i < 5_000_000 && (last == null || last.getStackTrace().length > 0); i++) {
+			try {
+				broken.unregister();
+			} catch (NullPointerException npe) {
+				last = npe;
+			}
+		}
+		assertNotNull(last);
+		// Up to the JIT compiler: a JVM that never omits it (-XX:-OmitStackTraceInFastThrow, the interpreter) has nothing
+		// to check here.
+		org.junit.jupiter.api.Assumptions.assumeTrue(last.getStackTrace().length == 0,
+				"this JVM did not omit the stack trace of the exception");
+		assertRegistryNpe(last);
+	}
+
+	/** Generations of one proxy name are made each while the one before closes, until one has no registry. */
+	private static MessageMetrics proxyWithoutRegistry() throws Exception {
 		var name = ClientId.randomId() + "->h1";
 		var pool = Executors.newFixedThreadPool(2);
 		MessageMetrics broken = null;
@@ -1022,9 +1041,30 @@ class RatisContractTest {
 			pool.shutdownNow();
 		}
 		System.out.println("A proxy without a metric registry after " + generations + " generations");
+		return broken;
+	}
+
+	/**
+	 * R8-4: Ratis 3.3.1 can build a client proxy whose metric interceptor has no registry, and the proxy map lets the
+	 * failure of such a proxy's close out of its own close. Each {@code GrpcClientProtocolClient} makes a
+	 * {@link MessageMetrics} named after its client and peer ({@code MetricClientInterceptor}), and its close
+	 * unregisters it. {@code RatisMetrics.create} shares a registry that is already there without counting the new
+	 * holder, and {@code RefCountingMap.put} counts a new registry only after putting it in the map; so when a proxy
+	 * is made while the one before it to the same peer closes, a close that removes the registry between the put and
+	 * the count leaves the new proxy with {@code null}. Every call of that proxy then throws a
+	 * {@link NullPointerException} at its start ({@code MessageMetrics.rpcStarted}), its close too, and
+	 * {@code PeerProxyMap} catches only an {@link IOException} of a proxy's close: its own close throws a
+	 * {@link CompletionException} after closing the others. {@link Proposer} replaces such a proxy
+	 * ({@link Proposer#resetBrokenProxy}) and logs the failure of its client's close ({@link Proposer#closeClient}).
+	 * Here generations of one proxy name are made each while the one before closes, on two threads, until one has no
+	 * registry: a few thousand generations, under a second. A Ratis that fixes the race fails here after
+	 * {@link #WAIT}, and the proposer's handling can go.
+	 */
+	@Test
+	void aProxyMadeWhileTheOneBeforeItClosesCanGetNoMetricRegistry() throws Exception {
+		var broken = proxyWithoutRegistry();
 		var found = broken;
-		var npe = assertThrows(NullPointerException.class, found::unregister);
-		assertTrue(String.valueOf(npe.getMessage()).contains("\"this.registry\" is null"), npe::getMessage);
+		assertRegistryNpe(assertThrows(NullPointerException.class, found::unregister));
 
 		var others = new ArrayList<AtomicBoolean>();
 		var proxies = new PeerProxyMap<Closeable>("r8-4", peer -> {
