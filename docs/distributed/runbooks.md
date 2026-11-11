@@ -631,6 +631,8 @@ The alerts `rockserver-disk-low`, `rockserver-write-stopped`, `rockserver-write-
 The three `ALARM` lines need no metrics backend: the node reads the disks and RocksDB's stall state itself (R61-8;
 before, `write-stopped` and `write-delayed` were never logged on a node with JMX and InfluxDB both off or failed).
 The alerts need the InfluxDB pipeline.
+A line `Failed to initialize jmx metrics` or `Failed to initialize influx metrics` in the log carries the cause as its
+stack trace (R61-14); the credentials of the InfluxDB configuration are masked in it.
 
 - Disk space: delete backups that were copied off (`<data-dir>/backups`), then old snapshots are deleted by the node by
   itself once newer ones exist. Budget the database, one older snapshot's replaced files, the Raft log (up to

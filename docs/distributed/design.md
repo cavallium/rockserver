@@ -5922,6 +5922,12 @@ install it (`apt-get install gcc libc6-dev`) and run with `-Drockserver.test.req
      after accepting, and on a loaded machine the reset arrived before the client's `connect` returned ("Connection reset
      by peer (connect failed)", 3 of 20 runs); a test-only race, now `assertAcceptedThenCut`: a reset during `connect` is
      accepted, a refusal (`ConnectException`) still fails the test.
+   - R61-14 / METRICS-INIT-FAILURE-NOT-LOGGED (diagnostics; low): `MetricsManager` caught `Throwable` while building the JMX
+     and the InfluxDB registries and logged a fixed line, so a node that ran without a backend gave the operator no cause.
+     The exception is now logged with both lines. The InfluxDB one is logged as a copy of the failure (same class name,
+     stack and cause chain) whose messages have the token, the user and the user info of the `url` (whole and in parts)
+     masked as `<redacted>`, since a configuration error can echo a value it read (R60-1). `MetricsManager(config, logger)`
+     is the seam of `MetricsManagerTest.aFailedInfluxInitialisationLogsItsCauseWithoutTheCredentials`, red before.
    - Review of R46, 1 (low, docs): the R46-2 recipe ran `dependency:build-classpath` on `distributed/server/pom.xml`
      alone, so Maven resolved `rockserver-core:${revision}` and that version's pom from `~/.m2` (or the snapshot
      repository): `grep -v /rockserver-core/` dropped the jar but kept the third-party jars of that pom, from whichever
