@@ -66,12 +66,21 @@ pub fn is_outcome_unknown(status: &Status) -> bool {
         Some("READ_DEADLINE_EXCEEDED") => !is_not_applied(status),
         Some(_) => false,
         // Not an answer of Rockserver: the transport lost the call (UNAVAILABLE, CANCELLED when a stopping server
-        // resets it, DEADLINE_EXCEEDED of the transport, UNKNOWN for a broken stream).
+        // resets it, DEADLINE_EXCEEDED of the transport, UNKNOWN for a broken stream), or the client's own decoder
+        // refused the answer (OUT_OF_RANGE, see `is_undecodable_answer`).
         None => matches!(
             status.code(),
-            Code::Unavailable | Code::Cancelled | Code::DeadlineExceeded | Code::Unknown
+            Code::Unavailable | Code::Cancelled | Code::DeadlineExceeded | Code::Unknown | Code::OutOfRange
         ),
     }
+}
+
+/// True if the client's own decoder refused the answer: a message over its limit
+/// ([`crate::MAX_DECODING_MESSAGE_SIZE`]), which tonic reports as an `OUT_OF_RANGE` that is not a failure of
+/// Rockserver (those carry their type in the message, and are never `OUT_OF_RANGE` without one). The call reached the
+/// server and was answered, so a write was probably applied; what it answered is lost.
+fn is_undecodable_answer(status: &Status) -> bool {
+    rocksdb_error_type(status).is_none() && status.code() == Code::OutOfRange
 }
 
 /// The server says this copy was not applied but might be if sent again: overload, or a failure flagged not applied.
@@ -497,6 +506,10 @@ impl SessionWrites {
                     }
                     // Not applied, and no time left to send it again.
                     return Err(flagged_not_applied(&status));
+                }
+                if is_undecodable_answer(&status) {
+                    // Every copy would get the same answer, as large: no resend can settle it.
+                    return Err(unknown_outcome(&status));
                 }
                 if !is_outcome_unknown(&status)
                     && !(maybe_applied && is_retryable_not_applied(&status))

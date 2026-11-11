@@ -22,6 +22,11 @@ use tonic::{Request, Status}; // Disambiguate from proto
 pub type Result<T> = std::result::Result<T, Status>;
 
 pub const REQUIRED_WORKLOAD_CONTRACT_VERSION: i32 = 3;
+/// The largest response message the client decodes, in bytes: 64 MiB, the default of the Java client
+/// (`it.cavallium.rockserver.grpc.client.max-inbound-message-size-bytes`), instead of tonic's 4 MiB. A larger answer
+/// fails with an `OUT_OF_RANGE` of the client's own decoder; for a numbered write that is an unknown outcome
+/// ([`crate::sessions::is_outcome_unknown`]). [`RockserverClient::with_max_decoding_message_size`] changes it.
+pub const MAX_DECODING_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
 
 /// The content hash `check_merge_operator` takes: SHA-256 of the jar, as the server computes it.
 pub fn merge_operator_hash(jar_payload: &[u8]) -> Vec<u8> {
@@ -172,7 +177,8 @@ impl RockserverClient {
 
     fn with_capabilities(channel: Channel, context: RequestContext, capabilities: &CapabilitiesResponse) -> Self {
         Self {
-            client: RocksDbServiceClient::with_interceptor(channel, DeadlineInterceptor),
+            client: RocksDbServiceClient::with_interceptor(channel, DeadlineInterceptor)
+                .max_decoding_message_size(MAX_DECODING_MESSAGE_SIZE),
             context,
             sessions: capabilities
                 .client_sessions
@@ -184,7 +190,8 @@ impl RockserverClient {
     #[cfg(test)]
     fn new_unchecked(channel: Channel, context: RequestContext) -> Self {
         Self {
-            client: RocksDbServiceClient::with_interceptor(channel, DeadlineInterceptor),
+            client: RocksDbServiceClient::with_interceptor(channel, DeadlineInterceptor)
+                .max_decoding_message_size(MAX_DECODING_MESSAGE_SIZE),
             context,
             sessions: None,
             session_retry_window: DEFAULT_RETRY_WINDOW,
@@ -1739,6 +1746,15 @@ impl RockserverClient {
     pub fn without_client_sessions(&self) -> Self {
         Self {
             sessions: None,
+            ..self.clone()
+        }
+    }
+
+    /// A view of this client that decodes response messages of up to `limit` bytes
+    /// ([`MAX_DECODING_MESSAGE_SIZE`] by default).
+    pub fn with_max_decoding_message_size(&self, limit: usize) -> Self {
+        Self {
+            client: self.client.clone().max_decoding_message_size(limit),
             ..self.clone()
         }
     }
