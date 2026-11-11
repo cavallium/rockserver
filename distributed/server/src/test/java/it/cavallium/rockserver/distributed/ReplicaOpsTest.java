@@ -29,11 +29,35 @@ import java.util.Map;
 import org.apache.ratis.thirdparty.io.grpc.Status;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.TimeUnit;
+import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 /** Unit tests of the cluster operations' pieces: entries, wire answers, digests, metrics export, monitor helpers. */
 class ReplicaOpsTest {
+
+	/**
+	 * R63-1: every {@code NodeMetrics} starts a logger thread that only {@code close()} stops, and this class made 27
+	 * without closing them: the threads of a surefire JVM outlived it, and {@code WatchdogThreadsTest} (which waits for
+	 * the threads of one node id to be gone) failed in a full run. Nothing of this class stays running after it.
+	 */
+	private static long metricsThreadsBefore;
+
+	private static long metricsThreads() {
+		return Thread.getAllStackTraces().keySet().stream()
+				.filter(thread -> thread.isAlive() && thread.getName().startsWith("rockserver-metrics-")).count();
+	}
+
+	@BeforeAll
+	static void countMetricsThreads() {
+		metricsThreadsBefore = metricsThreads();
+	}
+
+	@AfterAll
+	static void noMetricsThreadLeaks() throws Exception {
+		InProcessCluster.await(java.time.Duration.ofSeconds(10), () -> metricsThreads() <= metricsThreadsBefore);
+	}
 
 	@TempDir
 	Path temp;
