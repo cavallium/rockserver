@@ -229,6 +229,64 @@ class WatchdogThreadsTest {
 		cluster.awaitLeader(TIMEOUT);
 	}
 
+	/**
+	 * R63-1: a start refused before the Raft server starts (the Raft directory cannot be made, the database belongs to a
+	 * cluster already, a port is taken) stops what the constructor started until then: the metrics logger, which runs
+	 * from the first line, the state machine's apply thread and the threads of its cluster operations. Before, only a
+	 * failure after the Raft server's start stopped them, and each refused start left a {@code rockserver-metrics-<id>}
+	 * thread for the life of the JVM. The node ids are this test's own: no thread of another class has them.
+	 */
+	@Test
+	@Timeout(120)
+	void aStartRefusedBeforeTheRaftServerStartsStopsItsThreads() throws Exception {
+		var ports = ProcessCluster.freePorts(2, List.of());
+		// The Raft directory cannot be made: before the state machine exists.
+		var noRaftDir = NodeConfig.defaults("r63a", List.of(new PeerConfig("r63a", "127.0.0.1", ports.get(0), "127.0.0.1",
+				ports.get(1))), Files.createDirectory(temp.resolve("r63a")));
+		Files.writeString(noRaftDir.raftDir(), "not a directory");
+		assertThrows(IOException.class, () -> ReplicatedNode.start(noRaftDir));
+		assertNoThreadOf("r63a");
+
+		// The start-up check of a first start fails: after the state machine started its apply thread.
+		var refused = NodeConfig.defaults("r63b", List.of(new PeerConfig("r63b", "127.0.0.1", ports.get(0), "127.0.0.1",
+				ports.get(1))), Files.createDirectory(temp.resolve("r63b")));
+		Files.createDirectories(refused.dbDir());
+		ReplicatedNode.startupCheckOpenedForTesting = _ -> {
+			throw new IllegalStateException("test: the start-up check");
+		};
+		try {
+			assertThrows(IllegalStateException.class, () -> ReplicatedNode.start(refused));
+		} finally {
+			ReplicatedNode.startupCheckOpenedForTesting = null;
+		}
+		assertNoThreadOf("r63b");
+
+		// The Raft port is taken: the Raft server's own start fails, after it opened the database.
+		var taken = NodeConfig.defaults("r63c", List.of(new PeerConfig("r63c", "127.0.0.1", ports.get(0), "127.0.0.1",
+				ports.get(1))), Files.createDirectory(temp.resolve("r63c")));
+		try (var socket = new java.net.ServerSocket()) {
+			socket.bind(new InetSocketAddress("127.0.0.1", ports.get(0)));
+			assertThrows(Exception.class, () -> ReplicatedNode.start(taken));
+		}
+		assertNoThreadOf("r63c");
+		// Nothing of the refused start is in the way of the next one: the database is closed, the port is free.
+		ReplicatedNode.start(taken).halt();
+		assertNoThreadOf("r63c");
+	}
+
+	/** Waits for every platform thread with {@code nodeId} in its name to end. */
+	private static void assertNoThreadOf(String nodeId) {
+		try {
+			InProcessCluster.await(Duration.ofSeconds(10), () -> Thread.getAllStackTraces().keySet().stream()
+					.noneMatch(thread -> thread.isAlive() && thread.getName().contains(nodeId)));
+		} catch (AssertionError | Exception notStopped) {
+			throw new AssertionError("still running after the refused start of " + nodeId + ": "
+					+ Thread.getAllStackTraces().keySet().stream()
+					.filter(thread -> thread.isAlive() && thread.getName().contains(nodeId)).map(Thread::getName).sorted()
+					.toList(), notStopped);
+		}
+	}
+
 	/** Holds the monitor of {@code lock} on a thread of its own until {@code release} opens; returns once held. */
 	private static Thread holdMonitor(Object lock, CountDownLatch release) throws InterruptedException {
 		var held = new CountDownLatch(1);
