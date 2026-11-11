@@ -70,6 +70,7 @@ class RefusedPermitsTest {
 		System.out.println(CONFLICTS + " conflicts in " + Duration.ofNanos(System.nanoTime() - start).toMillis() + " ms");
 		assertEquals(term, leader.stateMachine().division().getInfo().getCurrentTerm(),
 				"the leader changed: a new term has new limits, and the test shows nothing");
+		assertEquals(CONFLICTS, leader.stateMachine().refusedPermits().released());
 		api.put(0, column, key(2), value(7), RequestType.none());
 		assertArrayEquals(value(7).toByteArray(), api.get(0, column, key(2), RequestType.current()).toByteArray());
 		assertArrayEquals(value(CONFLICTS).toByteArray(), api.get(0, column, key(1), RequestType.current()).toByteArray());

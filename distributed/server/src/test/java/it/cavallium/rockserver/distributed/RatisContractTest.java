@@ -80,6 +80,7 @@ import org.apache.ratis.thirdparty.com.google.protobuf.CodedInputStream;
 import org.apache.ratis.util.PeerProxyMap;
 import org.apache.ratis.util.PureJavaCrc32C;
 import org.apache.ratis.util.TimeDuration;
+import org.jetbrains.annotations.Nullable;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
@@ -218,6 +219,104 @@ class RatisContractTest {
 		assertArrayEquals(new int[] {1, 3}, ConflictPositions.parse(localRefusal.getCause().getMessage(), 4));
 		assertTrue(server.getDivision(groupId).getInfo().isLeader(), "still the leader");
 		assertTrue(client.io().send(Message.valueOf("write")).isSuccess());
+	}
+
+	/**
+	 * R62-3, the Ratis side: a request that the state machine refuses in {@code preAppendTransaction} keeps the permit
+	 * that {@code RaftServerImpl.appendTransaction} took for it from the pending-request limits, until the leader stops
+	 * leading. With a limit of one request, one refusal is enough: the next write is refused for lack of a permit. A
+	 * Ratis version that releases the permit fails here: then {@link RefusedPermits} must go, or it would release
+	 * every refused request's permit a second time.
+	 */
+	@Test
+	void aRequestRefusedBeforeTheAppendKeepsItsPendingRequestPermit() throws Exception {
+		start(Duration.ofMillis(300), 1);
+		awaitLeader();
+		assertTrue(submitLocal("write").get(WAIT.toSeconds(), TimeUnit.SECONDS).isSuccess());
+		assertInstanceOf(StateMachineException.class,
+				submitLocal("conflict").get(WAIT.toSeconds(), TimeUnit.SECONDS).getException());
+		assertRefusedForLackOfAPermit(submitLocal("write"));
+	}
+
+	/**
+	 * R62-3, the fix: {@link RefusedPermits#release}, called by {@code preAppendTransaction} before it refuses, gives
+	 * back exactly what the refusal keeps. With a limit of one request: after 50 refusals a write is accepted (before,
+	 * the first refusal ended that); and the limit still holds one request, not more: while one write is held in its
+	 * apply, the next is refused for lack of a permit.
+	 */
+	@Test
+	void aRefusedRequestGivesItsPermitBackThroughRefusedPermits() throws Exception {
+		assertTrue(RefusedPermits.available(), "RefusedPermits does not reach the permits of this Ratis version");
+		var permits = new RefusedPermits();
+		stateMachine.refusedPermits = permits;
+		start(Duration.ofMillis(300), 1);
+		awaitLeader();
+		for (int i = 0; i < 50; i++) {
+			var refusal = i % 2 == 0 ? submitLocal("conflict").get(WAIT.toSeconds(), TimeUnit.SECONDS).getException()
+					: Assertions.assertThrows(StateMachineException.class, () -> client.io().send(Message.valueOf("conflict")));
+			assertInstanceOf(StateMachineException.class, refusal);
+			assertTrue(submitLocal("write").get(WAIT.toSeconds(), TimeUnit.SECONDS).isSuccess(),
+					"a write after " + (i + 1) + " refusals");
+		}
+		assertEquals(50, permits.released());
+		stateMachine.blockApply();
+		var held = submitLocal("held");
+		waitUntil(() -> stateMachine.applying.getCount() == 0, "the held request applying");
+		assertRefusedForLackOfAPermit(submitLocal("write"));
+		stateMachine.gate.countDown();
+		assertTrue(held.get(WAIT.toSeconds(), TimeUnit.SECONDS).isSuccess());
+		waitUntil(() -> {
+			try {
+				return submitLocal("write").get(WAIT.toSeconds(), TimeUnit.SECONDS).isSuccess();
+			} catch (Exception e) {
+				return false;
+			}
+		}, "a write once the held one was answered");
+	}
+
+	/**
+	 * R62-3: the permit objects that the refusals leave in Ratis' map are removed once they have been there for
+	 * {@link RefusedPermits#STALE_AFTER}, at the refusals themselves (a clock of the test's).
+	 */
+	@Test
+	void thePermitObjectsOfRefusedRequestsAreRemovedOnceStale() throws Exception {
+		var permits = new RefusedPermits();
+		var now = new AtomicLong(System.nanoTime());
+		stateMachine.refusedPermits = permits;
+		stateMachine.refusedPermitsClock = now::get;
+		start(Duration.ofMillis(300), RaftServerConfigKeys.Write.ELEMENT_LIMIT_DEFAULT);
+		awaitLeader();
+		for (int i = 0; i < 20; i++) {
+			assertInstanceOf(StateMachineException.class,
+					submitLocal("conflict").get(WAIT.toSeconds(), TimeUnit.SECONDS).getException());
+		}
+		assertEquals(0, permits.swept(), "nothing is stale yet");
+		// Seen by a sweep now, and again after the stale time.
+		now.addAndGet(RefusedPermits.SWEEP_EVERY.toNanos());
+		assertInstanceOf(StateMachineException.class,
+				submitLocal("conflict").get(WAIT.toSeconds(), TimeUnit.SECONDS).getException());
+		assertEquals(0, permits.swept());
+		now.addAndGet(RefusedPermits.STALE_AFTER.toNanos());
+		assertInstanceOf(StateMachineException.class,
+				submitLocal("conflict").get(WAIT.toSeconds(), TimeUnit.SECONDS).getException());
+		// The 21 that the first sweep saw; the request of this very refusal holds the 22nd, which stays.
+		assertEquals(21, permits.swept());
+		assertEquals(22, permits.released());
+		assertTrue(submitLocal("write").get(WAIT.toSeconds(), TimeUnit.SECONDS).isSuccess());
+		assertTrue(client.io().send(Message.valueOf("write")).isSuccess());
+	}
+
+	private static void assertRefusedForLackOfAPermit(CompletableFuture<RaftClientReply> answer) throws Exception {
+		Throwable refusal;
+		try {
+			var reply = answer.get(WAIT.toSeconds(), TimeUnit.SECONDS);
+			assertFalse(reply.isSuccess(), "the request was accepted");
+			refusal = reply.getException();
+		} catch (ExecutionException ex) {
+			refusal = ReplicatedConnection.unwrap(ex);
+		}
+		assertInstanceOf(ResourceUnavailableException.class, refusal);
+		assertTrue(Proposer.isRatisPendingLimit(refusal), refusal::toString);
 	}
 
 	/**
@@ -959,6 +1058,9 @@ class RatisContractTest {
 		final CountDownLatch gate = new CountDownLatch(1);
 		volatile CountDownLatch applying = new CountDownLatch(0);
 		private final AtomicReference<Boolean> blocking = new AtomicReference<>(false);
+		/** If set, a refusal gives its permit back as the real state machine does (R62-3); else as stock Ratis. */
+		volatile @Nullable RefusedPermits refusedPermits;
+		volatile java.util.function.LongSupplier refusedPermitsClock = System::nanoTime;
 
 		void blockApply() {
 			applying = new CountDownLatch(1);
@@ -980,6 +1082,10 @@ class RatisContractTest {
 		public TransactionContext preAppendTransaction(TransactionContext trx) throws IOException {
 			var request = trx.getClientRequest();
 			if (request != null && request.getMessage().getContent().toStringUtf8().equals("conflict")) {
+				var permits = refusedPermits;
+				if (permits != null) {
+					permits.release(getServer().join().getDivision(getGroupId()), request, refusedPermitsClock.getAsLong());
+				}
 				var conflict = RockserverStateMachine.ConflictException.of(IntList.of(1, 3));
 				throw new StateMachineException(conflict.getMessage(), conflict, false);
 			}
