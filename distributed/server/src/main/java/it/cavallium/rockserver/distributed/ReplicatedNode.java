@@ -165,65 +165,66 @@ public final class ReplicatedNode implements AutoCloseable {
 
 	private ReplicatedNode(NodeConfig config) throws IOException {
 		this.config = config;
+		// The metrics start their logger thread here: everything after it is inside the try, whose catch stops it (R63-1).
 		this.metrics = new NodeMetrics(config.nodeId());
-		this.raftTraffic = new RaftTraffic(config.nodeId(), config.raftDir(), this::currentTerm,
-				this::installFloor, metrics.amount("install.recordFailures"), metrics.amount("install.staleChunks"));
-		Files.createDirectories(config.dbDir().getParent());
-		Files.createDirectories(config.raftDir());
-		requireSameFileSystem(config.raftDir(), config.dbDir().getParent());
-		var groupId = RaftGroupId.valueOf(UUID.fromString(config.groupId()));
-		this.group = RaftGroup.valueOf(groupId, raftPeers(config));
-		this.commitHeartbeats = new CommitHeartbeats(this::raftServer, groupId);
-		this.leaderStall = LeaderStall.forElectionTimeout(config.electionTimeoutMax());
-		var configDigest = NodeStore.configDigest(config.rockserverConfig());
-		this.clusterCheck = new ClusterCheck(config.nodeId(), groupId, config.electionTimeoutMax(), configDigest);
-		this.diskProbe = DiskProbe.forDirectory(config.nodeId(), config.dataDir());
-		this.leaderStallStepDowns = metrics.amount("leader.stall.stepdowns");
-		this.leaderLogStepDowns = metrics.amount("leader.log.stepdowns");
-		this.stateMachine = new RockserverStateMachine(config, this::onReplicaFailure, metrics);
-		stateMachine.ops().channels(peerChannels);
-		this.threads = new NodeThreads(config.nodeId());
-
-		var parameters = new Parameters();
-		parameters.put(CommitHeartbeats.PARAMETER, commitHeartbeats, CommitHeartbeats.class);
-		var apiAddress = new HostAndPort(config.self().apiHost(), config.self().apiPort());
-		GrpcConfigKeys.Server.setServicesCustomizer(parameters, TermService.customizer(this::raftServer, apiAddress,
-				this::nodeState, this::readIndex, configDigest, this::answerOps, raftTraffic, this::configurationReport,
-				new MembershipGuard(this::raftServer)));
-		boolean existing = Files.isDirectory(config.raftDir().resolve(groupId.getUuid().toString()));
-		if (!existing) {
-			// Before anything opens the database: copies of a seed are the same only until then. It fsyncs the seed's
-			// files first, which an operator copied into place and nothing fsynced (R34-1).
-			NodeStore.recordSeedDigest(config.dbDir());
-			// Durably, before the check's open changes the files: a start killed during that open keeps the seed digest
-			// at the next first start (R41-1).
-			NodeStore.noteSeedOpening(config.dbDir());
-			requireNoClusterData(config);
-			NodeStore.noteSeedOpened(config.dbDir());
-		} else if (config.join() && startedOutsideJoin()) {
-			throw new IOException("Node " + config.nodeId() + " was started without --join: "
-					+ raftMetaFile(BOOTSTRAP_FILE) + " holds the peer list of that start, and Ratis uses it whatever this start"
-					+ " says, so --join would change nothing. Wipe the data directory " + config.dataDir()
-					+ " and start the node again with --join. Do not do it if an add-peer already reached this node: it is then"
-					+ " a member, see \"Replacing a node\" in the design document");
-		}
-		// Before the Raft server can take a snapshot chunk: the floor of the term bounds of installed configurations is
-		// the term Ratis persisted, which no chunk it handled before this start exceeds (round 15, R14-1).
-		InstalledConfiguration.initialize(config.raftDir(), existing ? persistedTerm() : 0);
-		this.server = RaftServer.newBuilder()
-				.setServerId(RaftPeerId.valueOf(config.nodeId()))
-				// With no peers at all Ratis starts the node without an election timer, until a leader's first request
-				// that is not part of bringing the node up to date. Its own log or snapshot overrides this when it has a
-				// configuration, and nothing about this start stays behind for a later start without the option.
-				.setGroup(config.join() ? RaftGroup.valueOf(groupId) : group)
-				.setStateMachine(stateMachine)
-				.setProperties(RaftSettings.server(config))
-				.setParameters(parameters)
-				.setOption(existing ? RaftStorage.StartupOption.RECOVER : RaftStorage.StartupOption.FORMAT)
-				.build();
-
 		var started = new ArrayList<Closeable>();
 		try {
+			this.raftTraffic = new RaftTraffic(config.nodeId(), config.raftDir(), this::currentTerm,
+					this::installFloor, metrics.amount("install.recordFailures"), metrics.amount("install.staleChunks"));
+			Files.createDirectories(config.dbDir().getParent());
+			Files.createDirectories(config.raftDir());
+			requireSameFileSystem(config.raftDir(), config.dbDir().getParent());
+			var groupId = RaftGroupId.valueOf(UUID.fromString(config.groupId()));
+			this.group = RaftGroup.valueOf(groupId, raftPeers(config));
+			this.commitHeartbeats = new CommitHeartbeats(this::raftServer, groupId);
+			this.leaderStall = LeaderStall.forElectionTimeout(config.electionTimeoutMax());
+			var configDigest = NodeStore.configDigest(config.rockserverConfig());
+			this.clusterCheck = new ClusterCheck(config.nodeId(), groupId, config.electionTimeoutMax(), configDigest);
+			this.diskProbe = DiskProbe.forDirectory(config.nodeId(), config.dataDir());
+			this.leaderStallStepDowns = metrics.amount("leader.stall.stepdowns");
+			this.leaderLogStepDowns = metrics.amount("leader.log.stepdowns");
+			this.stateMachine = new RockserverStateMachine(config, this::onReplicaFailure, metrics);
+			stateMachine.ops().channels(peerChannels);
+			this.threads = new NodeThreads(config.nodeId());
+
+			var parameters = new Parameters();
+			parameters.put(CommitHeartbeats.PARAMETER, commitHeartbeats, CommitHeartbeats.class);
+			var apiAddress = new HostAndPort(config.self().apiHost(), config.self().apiPort());
+			GrpcConfigKeys.Server.setServicesCustomizer(parameters, TermService.customizer(this::raftServer, apiAddress,
+					this::nodeState, this::readIndex, configDigest, this::answerOps, raftTraffic, this::configurationReport,
+					new MembershipGuard(this::raftServer)));
+			boolean existing = Files.isDirectory(config.raftDir().resolve(groupId.getUuid().toString()));
+			if (!existing) {
+				// Before anything opens the database: copies of a seed are the same only until then. It fsyncs the seed's
+				// files first, which an operator copied into place and nothing fsynced (R34-1).
+				NodeStore.recordSeedDigest(config.dbDir());
+				// Durably, before the check's open changes the files: a start killed during that open keeps the seed digest
+				// at the next first start (R41-1).
+				NodeStore.noteSeedOpening(config.dbDir());
+				requireNoClusterData(config);
+				NodeStore.noteSeedOpened(config.dbDir());
+			} else if (config.join() && startedOutsideJoin()) {
+				throw new IOException("Node " + config.nodeId() + " was started without --join: "
+						+ raftMetaFile(BOOTSTRAP_FILE) + " holds the peer list of that start, and Ratis uses it whatever this start"
+						+ " says, so --join would change nothing. Wipe the data directory " + config.dataDir()
+						+ " and start the node again with --join. Do not do it if an add-peer already reached this node: it is then"
+						+ " a member, see \"Replacing a node\" in the design document");
+			}
+			// Before the Raft server can take a snapshot chunk: the floor of the term bounds of installed configurations is
+			// the term Ratis persisted, which no chunk it handled before this start exceeds (round 15, R14-1).
+			InstalledConfiguration.initialize(config.raftDir(), existing ? persistedTerm() : 0);
+			this.server = RaftServer.newBuilder()
+					.setServerId(RaftPeerId.valueOf(config.nodeId()))
+					// With no peers at all Ratis starts the node without an election timer, until a leader's first request
+					// that is not part of bringing the node up to date. Its own log or snapshot overrides this when it has a
+					// configuration, and nothing about this start stays behind for a later start without the option.
+					.setGroup(config.join() ? RaftGroup.valueOf(groupId) : group)
+					.setStateMachine(stateMachine)
+					.setProperties(RaftSettings.server(config))
+					.setParameters(parameters)
+					.setOption(existing ? RaftStorage.StartupOption.RECOVER : RaftStorage.StartupOption.FORMAT)
+					.build();
+
 			try {
 				server.start();
 			} catch (IOException | RuntimeException ex) {
@@ -310,27 +311,54 @@ public final class ReplicatedNode implements AutoCloseable {
 			});
 			failForTesting(config.nodeId(), "start", () -> new IllegalStateException("test: " + config.nodeId() + "/start"));
 		} catch (Throwable ex) {
-			// The background tasks first: the API gate and the Raft watch must not go on against a half-built node, and
-			// only the Raft watch would stop them otherwise (when it finds the Raft server closed, as a replica failure).
-			closed.set(true);
-			try {
-				stopBackgroundTasks();
-			} catch (Throwable stopError) {
-				ex.addSuppressed(stopError);
-			}
-			for (int i = started.size() - 1; i >= 0; i--) {
-				try {
-					started.get(i).close();
-				} catch (IOException | RuntimeException closeError) {
-					ex.addSuppressed(closeError);
-				}
-			}
-			threads.close();
-			peerChannels.close();
+			closeFailedStart(started, ex);
 			throw ex;
 		}
 		LOG.info("{}: started, Raft {}, API {}:{}", config.nodeId(), config.self().raftAddress(),
 				config.self().apiHost(), config.self().apiPort());
+	}
+
+	/**
+	 * Closes what a constructor that failed with {@code ex} made until then; a field can still be null. The background
+	 * tasks first: the API gate and the Raft watch must not go on against a half-built node, and only the Raft watch
+	 * would stop them otherwise (when it finds the Raft server closed, as a replica failure). That also stops the
+	 * metrics threads, which run from the constructor's first line (R63-1).
+	 */
+	private void closeFailedStart(List<Closeable> started, Throwable ex) {
+		closed.set(true);
+		try {
+			stopBackgroundTasks();
+		} catch (Throwable stopError) {
+			ex.addSuppressed(stopError);
+		}
+		for (int i = started.size() - 1; i >= 0; i--) {
+			try {
+				started.get(i).close();
+			} catch (IOException | RuntimeException closeError) {
+				ex.addSuppressed(closeError);
+			}
+		}
+		if (stateMachine != null && !started.contains(server)) {
+			// No started Raft server closes the state machine: its apply thread and its cluster operations' thread run
+			// since its constructor. A Raft server whose start failed may have closed it already, or not: its close runs
+			// once.
+			try {
+				if (server != null) {
+					server.close();
+				}
+			} catch (IOException | RuntimeException closeError) {
+				ex.addSuppressed(closeError);
+			}
+			try {
+				stateMachine.close();
+			} catch (IOException | RuntimeException closeError) {
+				ex.addSuppressed(closeError);
+			}
+		}
+		if (threads != null) {
+			threads.close();
+		}
+		peerChannels.close();
 	}
 
 	/** Starts the node; it joins the group and serves the API. */

@@ -231,10 +231,12 @@ class WatchdogThreadsTest {
 
 	/**
 	 * R63-1: a start refused before the Raft server starts (the Raft directory cannot be made, the database belongs to a
-	 * cluster already, a port is taken) stops what the constructor started until then: the metrics logger, which runs
-	 * from the first line, the state machine's apply thread and the threads of its cluster operations. Before, only a
-	 * failure after the Raft server's start stopped them, and each refused start left a {@code rockserver-metrics-<id>}
-	 * thread for the life of the JVM. The node ids are this test's own: no thread of another class has them.
+	 * cluster already) stops what the constructor started until then: the metrics logger, which runs from the first
+	 * line, the state machine's apply thread and the threads of its cluster operations. Before, only a failure after the
+	 * Raft server's start stopped them, and each refused start left a {@code rockserver-metrics-<id>} thread (and, past
+	 * the state machine, {@code <id>-apply}) for the life of the JVM. The node ids are this test's own: no thread of
+	 * another class has them. A Raft port that is taken is not tried: Ratis ends the JVM itself there
+	 * ({@code GrpcServicesImpl}, "Failed to start Grpc server").
 	 */
 	@Test
 	@Timeout(120)
@@ -261,17 +263,10 @@ class WatchdogThreadsTest {
 		}
 		assertNoThreadOf("r63b");
 
-		// The Raft port is taken: the Raft server's own start fails, after it opened the database.
-		var taken = NodeConfig.defaults("r63c", List.of(new PeerConfig("r63c", "127.0.0.1", ports.get(0), "127.0.0.1",
-				ports.get(1))), Files.createDirectory(temp.resolve("r63c")));
-		try (var socket = new java.net.ServerSocket()) {
-			socket.bind(new InetSocketAddress("127.0.0.1", ports.get(0)));
-			assertThrows(Exception.class, () -> ReplicatedNode.start(taken));
-		}
-		assertNoThreadOf("r63c");
-		// Nothing of the refused start is in the way of the next one: the database is closed, the port is free.
-		ReplicatedNode.start(taken).halt();
-		assertNoThreadOf("r63c");
+		// Nothing of the refused start is in the way of the next one.
+		var node = ReplicatedNode.start(refused);
+		node.halt();
+		assertNoThreadOf("r63b");
 	}
 
 	/** Waits for every platform thread with {@code nodeId} in its name to end. */

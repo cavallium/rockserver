@@ -24,9 +24,14 @@ import org.junit.jupiter.api.io.TempDir;
 class ConfigurationHistoryGapTest {
 
 	private NodeMetrics metrics;
+	private RockserverStateMachine made;
 
+	/** Both start threads in their constructors ({@code rockserver-metrics-n0}, {@code n0-apply}): R63-1. */
 	@org.junit.jupiter.api.AfterEach
-	void closeMetrics() {
+	void closeMetrics() throws Exception {
+		if (made != null) {
+			made.close();
+		}
 		if (metrics != null) {
 			metrics.close();
 		}
@@ -53,6 +58,7 @@ class ConfigurationHistoryGapTest {
 		var config = NodeConfig.defaults("n0", peers, temp);
 		metrics = new NodeMetrics("n0");
 		var stateMachine = new RockserverStateMachine(config, _ -> {}, metrics);
+		made = stateMachine;
 		stateMachine.notifyConfigurationChanged(4, 30, conf("n0", "n1", "n2"));
 		CompletableFuture.runAsync(() -> stateMachine.notifyConfigurationChanged(0, 40, conf("n0", "n1"))).get();
 		// What notifyTermIndexUpdated(4, 30) on this thread hands to the apply thread with the position (the apply

@@ -1000,7 +1000,10 @@ class RatisContractTest {
 			}
 		}
 		assertNotNull(last);
-		assertEquals(0, last.getStackTrace().length, "the JVM omitted the stack trace of the exception");
+		// Up to the JIT compiler: a JVM that never omits it (-XX:-OmitStackTraceInFastThrow, the interpreter) has nothing
+		// to check here.
+		org.junit.jupiter.api.Assumptions.assumeTrue(last.getStackTrace().length == 0,
+				"this JVM did not omit the stack trace of the exception");
 		assertRegistryNpe(last);
 	}
 
