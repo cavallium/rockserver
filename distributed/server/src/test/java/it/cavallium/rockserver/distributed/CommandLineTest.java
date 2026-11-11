@@ -1089,6 +1089,39 @@ class CommandLineTest {
 	}
 
 	/**
+	 * R61-15: {@code add-peer} and {@code remove-peer} refuse, as wrong usage, a group in which two different members
+	 * share a Raft or an API address, naming both ids. The member that {@code add-peer} replaces (same id) and the one
+	 * that {@code remove-peer} removes are not part of the group the change leaves: a repair of a wrong recorded address
+	 * is not refused (it goes on, here to the network, which fails with another code than 2).
+	 */
+	@Test
+	void adminRefusesMembersSharingAnAddress() {
+		var n1 = List.of("--peer", "n1=127.0.0.1:1/127.0.0.1:2");
+		var shared = run("admin", "--peer", "n1=127.0.0.1:1/127.0.0.1:2", "--timeout-ms", "1000",
+				"add-peer", "n2=127.0.0.1:1/127.0.0.1:4");
+		assertEquals(2, shared.code(), shared.toString());
+		assertTrue(shared.err().contains("n1") && shared.err().contains("n2") && shared.err().contains("share"), shared.err());
+		var api = run("admin", "--peer", "n1=127.0.0.1:1/127.0.0.1:2", "--timeout-ms", "1000",
+				"add-peer", "n2=127.0.0.1:3/127.0.0.1:2");
+		assertEquals(2, api.code(), api.toString());
+		var removeShared = run("admin", "--peer", "n1=127.0.0.1:1/127.0.0.1:2", "--peer", "n2=127.0.0.1:3/127.0.0.1:4",
+				"--peer", "n3=127.0.0.1:3/127.0.0.1:6", "--timeout-ms", "1000", "remove-peer", "n1");
+		assertEquals(2, removeShared.code(), removeShared.toString());
+		assertTrue(removeShared.err().contains("n2") && removeShared.err().contains("n3"), removeShared.err());
+		// repair: the removed member's recorded address is the wrong one (it is n2's)
+		var repair = run("admin", "--peer", "n1=127.0.0.1:1/127.0.0.1:2", "--peer", "n2=127.0.0.1:3/127.0.0.1:4",
+				"--peer", "n3=127.0.0.1:3/127.0.0.1:6", "--timeout-ms", "1000", "remove-peer", "n3");
+		assertTrue(repair.code() != 2, repair.toString());
+		// --change-addresses: the replaced member (same id) given a corrected address
+		var changed = run("admin", "--peer", "n1=127.0.0.1:1/127.0.0.1:2", "--peer", "n2=127.0.0.1:1/127.0.0.1:4",
+				"--timeout-ms", "1000", "--change-addresses", "add-peer", "n2=127.0.0.1:3/127.0.0.1:4");
+		assertTrue(changed.code() != 2, changed.toString());
+		for (var refused : List.of(shared, api, removeShared)) {
+			assertTrue(refused.thrown() == null, refused.toString());
+		}
+	}
+
+	/**
 	 * R61-12, R61-3: a value below what the command can use is wrong usage too, exit 2 with the problem line, as an
 	 * unparsable one: a zero or negative {@code admin --timeout-ms} (a deadline in the past, or an
 	 * {@code ArithmeticException} below about -9.2e12), a port outside 1 to 65535 in {@code --peer} or in the argument

@@ -103,7 +103,9 @@ import org.rocksdb.NativeLibraryLoader;
  *
  * <p>{@code run} prints {@code READY <node-id>} on stdout once the node serves the API, and stops gracefully
  * (leadership hand-off) on SIGTERM, also one that comes while the node is still starting: the stop then waits for the
- * start (see {@code startAndServe}), and a node so stopped prints no {@code READY}. A malformed or refused option
+ * start (see {@code startAndServe}), and a node so stopped prints no {@code READY}. A Raft port that cannot be bound
+ * exits with 1 like any failure of the start, although Ratis answers it with a {@code System.exit} inside the start
+ * (R61-13, see {@code awaitStart}). A malformed or refused option
  * value exits with 2, like an unknown option or a word that is no option's value (a flag given a value, such as
  * {@code --join false}): so do the other commands. Any failure of the start exits with 1, unless it has a code of its own
  * below. For {@code add-peer} the new member must already run, with the new peer list and
@@ -232,12 +234,22 @@ public final class ReplicatedServerMain {
 	static volatile IntConsumer exiter = System::exit;
 
 	/**
-	 * How the shutdown hook ends the process once the node stopped after a failure: {@link ProcessHalt#halt}, unless a
-	 * test replaced it. A test also replaces {@link #shutdownHooks}, to run the hook itself.
+	 * How the shutdown hook ends the process once the node stopped after a failure, or when its start cannot end
+	 * ({@link #awaitStart}): {@link ProcessHalt#halt}, unless a test replaced it. A test also replaces {@link #shutdownHooks}, to run the hook itself.
 	 */
 	static volatile IntConsumer halter = ProcessHalt::halt;
 	/** Where {@code run} registers its shutdown hook: the JVM's, unless a test replaced it. */
 	static volatile Consumer<Thread> shutdownHooks = hook -> Runtime.getRuntime().addShutdownHook(hook);
+	/** How the shutdown hook finds out who asked for the exit ({@link #awaitStart}): this JVM's, unless a test replaced it. */
+	static volatile JvmExit.Probe exitProbe = JvmExit.JVM;
+	/**
+	 * How long the shutdown hook waits for a start still running when a {@code System.exit} on another thread, not a
+	 * signal, started the shutdown ({@link #awaitStart}). A start that can still end does within it or is a crash away
+	 * from the same state: it has served nothing yet.
+	 */
+	static volatile Duration startAfterExitTimeout = Duration.ofSeconds(30);
+	/** How often the shutdown hook looks at a start still running. */
+	private static final long START_POLL_MILLIS = 200;
 
 	private static void exit(int code) {
 		exiter.accept(code);
@@ -374,13 +386,18 @@ public final class ReplicatedServerMain {
 	 * {@code ReplicatedNode.awaitDatabaseClosed}). A start that fails, also because the shutdown under way refuses what
 	 * it registers, closes what it opened itself, and the hook has nothing to stop.</p>
 	 *
+	 * <p>That wait is for a signal only. A start that calls {@link System#exit} itself never returns: the exit waits
+	 * for the hook, on the starting thread. Ratis does that when its Raft port cannot be bound
+	 * ({@code GrpcServicesImpl.startImpl}, through {@code ExitUtils.terminate}), and the node then stayed for good,
+	 * without its API and deaf to SIGTERM (R61-13). The hook does not wait for such a start: see {@link #awaitStart}.</p>
+	 *
 	 * <p>Any failure of the start ends {@code run} with its exit code, an {@link Error} too (R28-5): Ratis and gRPC leave
 	 * non-daemon threads behind, which would keep the JVM running without a node, and a supervisor restarts only a
 	 * process that ended.</p>
 	 */
 	static void startAndServe(NodeConfig config, @Nullable DirectMemoryWatch directMemoryWatch) {
 		var started = new CompletableFuture<@Nullable ReplicatedNode>();
-		var signalled = registerShutdownHook(config.nodeId(), started);
+		var signalled = registerShutdownHook(config.nodeId(), started, Thread.currentThread());
 		ReplicatedNode node;
 		try {
 			node = starter.start(config);
@@ -415,21 +432,22 @@ public final class ReplicatedServerMain {
 	 * then {@link #awaitStop}.
 	 */
 	static void serve(ReplicatedNode node, @Nullable DirectMemoryWatch directMemoryWatch) {
-		var signalled = registerShutdownHook(node.config().nodeId(), CompletableFuture.completedFuture(node));
+		var signalled = registerShutdownHook(node.config().nodeId(), CompletableFuture.completedFuture(node),
+				Thread.currentThread());
 		awaitStop(node, directMemoryWatch, !signalled.get());
 	}
 
 	/**
-	 * Registers the shutdown hook of {@code run}: it waits until {@code started} completes, with the node that started
-	 * (null if the start failed: nothing to stop), and stops that node ({@link #closeOnSignal}). Returns whether the
-	 * hook started.
+	 * Registers the shutdown hook of {@code run}: it waits until {@code started} completes ({@link #awaitStart}), with
+	 * the node that started (null if the start failed: nothing to stop), and stops that node ({@link #closeOnSignal}).
+	 * {@code starting} is the thread that completes {@code started}. Returns whether the hook started.
 	 */
 	private static AtomicBoolean registerShutdownHook(String nodeId,
-			CompletableFuture<@Nullable ReplicatedNode> started) {
+			CompletableFuture<@Nullable ReplicatedNode> started, Thread starting) {
 		var signalled = new AtomicBoolean();
 		shutdownHooks.accept(new Thread(() -> {
 			signalled.set(true);
-			var node = started.join();
+			var node = awaitStart(nodeId, started, starting);
 			if (node == null) {
 				return;
 			}
@@ -444,6 +462,85 @@ public final class ReplicatedServerMain {
 			}
 		}, "rockserver-shutdown"));
 		return signalled;
+	}
+
+	/**
+	 * The shutdown hook's wait for the start of {@code run}: the node that started, or null if the start failed and
+	 * closed what it opened. It never waits for a start that cannot end (R61-13); it then halts with 1, the status of a
+	 * node that did not start, and does not return.
+	 *
+	 * <ul>
+	 * <li>The starting thread is itself inside {@code System.exit} ({@link JvmExit.Probe#exiting}): the start called it,
+	 * as Ratis does for a Raft port it cannot bind, also after a signal had started the shutdown. That thread waits for
+	 * this hook, or for the thread that does, so the start never returns: halt at once.</li>
+	 * <li>A signal started the shutdown and the start goes on: wait for it, however long it takes, and stop the node it
+	 * returns (R28-4). This is the only wait without a limit, and the only shutdown during a start that an operator or a
+	 * supervisor asks for.</li>
+	 * <li>Anything else, which is a {@code System.exit} on another thread: the start may wait for that thread, which
+	 * never returns, and nothing here can tell. Wait {@link #startAfterExitTimeout} for the start, then halt.</li>
+	 * </ul>
+	 *
+	 * <p>The halt is {@link ProcessHalt#halt}, not a return from the hook: the start is still running and holds what it
+	 * opened, which nothing else can reach to close; returning would let the JVM exit with RocksDB and Ratis open, whose
+	 * destructors can hang it (see {@code startAndServe}). A node that has not ended its start has served no request, so
+	 * the halt leaves what a crash during a start leaves, which the next start recovers from.</p>
+	 */
+	private static @Nullable ReplicatedNode awaitStart(String nodeId, CompletableFuture<@Nullable ReplicatedNode> started,
+			Thread starting) {
+		long begin = System.nanoTime();
+		boolean interrupted = false;
+		// Asked once: the thread that runs the hooks is the same until the JVM ends.
+		Boolean bySignal = null;
+		try {
+			while (true) {
+				try {
+					return started.get(START_POLL_MILLIS, TimeUnit.MILLISECONDS);
+				} catch (TimeoutException stillStarting) {
+					// Looks at the start below.
+				} catch (ExecutionException | java.util.concurrent.CancellationException notStarted) {
+					return null;
+				} catch (InterruptedException ex) {
+					interrupted = true;
+					continue;
+				}
+				var probe = exitProbe;
+				boolean exiting = probe.exiting(starting);
+				// After the look at the thread: a start that failed completes `started` before its own exit, which is then
+				// seen here and is no reason to halt.
+				if (started.isDone()) {
+					continue;
+				}
+				if (exiting) {
+					haltUnstarted(nodeId, starting, "its start called System.exit, which waits for this shutdown and so"
+							+ " never returns (the cause is in the log above, and below is where the start stands)");
+					return null;
+				}
+				if (bySignal == null) {
+					bySignal = probe.bySignal();
+				}
+				if (!bySignal && System.nanoTime() - begin >= startAfterExitTimeout.toNanos()) {
+					haltUnstarted(nodeId, starting, "a System.exit on another thread started the shutdown, and the start did"
+							+ " not end within " + startAfterExitTimeout + " of it (below is where the start stands)");
+					return null;
+				}
+			}
+		} finally {
+			if (interrupted) {
+				Thread.currentThread().interrupt();
+			}
+		}
+	}
+
+	/** Halts a node whose start cannot end, with 1; returns only when a test replaced {@link #halter}. */
+	private static void haltUnstarted(String nodeId, Thread starting, String reason) {
+		var message = new StringBuilder("Node " + nodeId + " does not start: " + reason + "; halting with 1");
+		for (var frame : starting.getStackTrace()) {
+			message.append(System.lineSeparator()).append("\tat ").append(frame);
+		}
+		System.err.println(message);
+		System.err.flush();
+		System.out.flush();
+		halter.accept(1);
 	}
 
 	/**
@@ -699,6 +796,31 @@ public final class ReplicatedServerMain {
 		}
 	}
 
+	/**
+	 * A configuration for the clients of {@code admin}, built from the members with their own addresses only: a
+	 * {@code --peer} list of a repair may hold two members at one address (R61-15), which {@link NodeConfig} refuses.
+	 */
+	private static NodeConfig adminConfig(List<PeerConfig> peers) {
+		var distinct = PeerConfig.withDistinctAddresses(peers);
+		return NodeConfig.defaults(distinct.getFirst().id(), distinct, Path.of("."));
+	}
+
+	/**
+	 * R61-15: wrong usage when two different members of the group that the change leaves share an address. The member
+	 * that {@code add-peer} replaces (the same id) and the one that {@code remove-peer} removes are not part of it, so
+	 * that a wrong recorded address of either can still be repaired.
+	 */
+	private static void requireDistinctAddresses(List<PeerConfig> peers, String command, String excludedId, PeerConfig added) {
+		var after = new ArrayList<>(peers.stream().filter(p -> !p.id().equals(excludedId)).toList());
+		if (added != null) {
+			after.add(added);
+		}
+		var shared = PeerConfig.sharedAddress(after);
+		if (shared != null) {
+			usage("invalid " + command + ": " + shared);
+		}
+	}
+
 	private static void admin(Options options) throws IOException, InterruptedException {
 		NOTED_LEADERS.get().clear();
 		var peers = options.peers();
@@ -735,7 +857,7 @@ public final class ReplicatedServerMain {
 		}
 		long deadline = System.nanoTime() + timeout.toNanos();
 		var group = RaftGroup.valueOf(groupId, peers.stream().map(ReplicatedServerMain::raftPeer).toList());
-		var anyConfig = NodeConfig.defaults(peers.getFirst().id(), peers, Path.of("."));
+		var anyConfig = adminConfig(peers);
 		try (var client = RaftClient.newBuilder()
 				.setClientId(ClientId.randomId())
 				.setRaftGroup(group)
@@ -756,6 +878,7 @@ public final class ReplicatedServerMain {
 				}
 				case "add-peer" -> {
 					var added = addedPeer(command);
+					requireDistinctAddresses(peers, "add-peer", added.id(), added);
 					// A voter already (a re-run after a timeout, or of a call that succeeded): OK without asking the node,
 					// whose answer can look like a log of its own until it applies the genesis or its snapshot.
 					if (isVoter(added, peers, groupId, changeAddresses, deadline)
@@ -771,6 +894,7 @@ public final class ReplicatedServerMain {
 				}
 				case "remove-peer" -> {
 					var removed = peerId(command);
+					requireDistinctAddresses(peers, "remove-peer", removed, null);
 					var target = peers.stream()
 							.filter(p -> !p.id().equals(removed))
 							.map(ReplicatedServerMain::raftPeer)
@@ -1363,7 +1487,7 @@ public final class ReplicatedServerMain {
 
 	/** A client that asks one member once, for {@link #leaderConfiguration}. */
 	private static RaftClient infoClient(List<PeerConfig> peers, RaftGroupId groupId) {
-		var anyConfig = NodeConfig.defaults(peers.getFirst().id(), peers, Path.of("."));
+		var anyConfig = adminConfig(peers);
 		return RaftClient.newBuilder()
 				.setClientId(ClientId.randomId())
 				.setRaftGroup(RaftGroup.valueOf(groupId, peers.stream().map(ReplicatedServerMain::raftPeer).toList()))
@@ -1609,7 +1733,7 @@ public final class ReplicatedServerMain {
 		if (leftNanos <= 0) {
 			return null;
 		}
-		var anyConfig = NodeConfig.defaults(peers.getFirst().id(), peers, Path.of("."));
+		var anyConfig = adminConfig(peers);
 		var question = min(anyConfig.electionTimeoutMax(), Duration.ofMillis(Math.max(1, leftNanos / 1_000_000)));
 		var peer = RaftPeer.newBuilder().setId(hint.id()).setAddress(hint.address()).build();
 		try (var client = RaftClient.newBuilder()

@@ -140,7 +140,9 @@ class StartupClusterTest {
 		cluster = new InProcessCluster(root, 3, config -> config.nodeId().equals(wrongNode)
 				? config.withPeers(config.peers().stream()
 						.map(peer -> peer.id().equals(wrongNode) ? peer
-								: new PeerConfig(peer.id(), peer.raftHost(), peer.raftPort(), peer.apiHost(), 1))
+								// A wrong port of its own for each: two members with one API address are refused (R61-15).
+								: new PeerConfig(peer.id(), peer.raftHost(), peer.raftPort(), peer.apiHost(),
+										peer.id().equals("n0") ? 1 : 2))
 						.toList())
 				: config).startAll();
 		var leader = cluster.awaitLeader(TIMEOUT);

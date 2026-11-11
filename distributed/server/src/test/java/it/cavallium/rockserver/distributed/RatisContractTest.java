@@ -673,7 +673,9 @@ class RatisContractTest {
 		var peerConfigs = new ArrayList<PeerConfig>();
 		var ports = ProcessCluster.freePorts(3, List.of());
 		for (int port : ports) {
-			peerConfigs.add(new PeerConfig("h" + peerConfigs.size(), "127.0.0.1", port, "127.0.0.1", 1));
+			// An API port of its own for each, never used: two members with one API address are refused (R61-15).
+			peerConfigs.add(new PeerConfig("h" + peerConfigs.size(), "127.0.0.1", port, "127.0.0.1",
+					1 + peerConfigs.size()));
 		}
 		var peers = new ArrayList<RaftPeer>();
 		for (var peer : peerConfigs) {

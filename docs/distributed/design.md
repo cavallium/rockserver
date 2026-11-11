@@ -5897,7 +5897,8 @@ install it (`apt-get install gcc libc6-dev`) and run with `-Drockserver.test.req
        and its channels. Pinned by `WatchdogThreadsTest.aStartRefusedBeforeTheRaftServerStartsStopsItsThreads` (red
        before: `still running after the refused start of r63a: [rockserver-metrics-r63a]`): two refused starts under
        node ids of its own leave no thread with the id in its name, and the node then starts. A Raft port that is
-       taken is not such a case: Ratis ends the JVM itself there (`GrpcServicesImpl`, "Failed to start Grpc server").
+       taken is not such a case: Ratis calls `System.exit` itself there (`GrpcServicesImpl`, "Failed to start Grpc
+       server"), which did not end the JVM until R61-13 (below).
    - R63-2 / TEST-NPE-MESSAGE-OMITTED-BY-THE-JVM (test only): `RatisContractTest.aProxyMadeWhileTheOneBeforeItClosesCanGetNoMetricRegistry`
      asserted that the message of the `NullPointerException` of a proxy without a registry names `this.registry`. After
      `ProposerBrokenProxyTest` (it throws that exception from the same place again and again) the JIT compiler throws a
@@ -5922,6 +5923,107 @@ install it (`apt-get install gcc libc6-dev`) and run with `-Drockserver.test.req
      after accepting, and on a loaded machine the reset arrived before the client's `connect` returned ("Connection reset
      by peer (connect failed)", 3 of 20 runs); a test-only race, now `assertAcceptedThenCut`: a reset during `connect` is
      accepted, a refusal (`ConnectException`) still fails the test.
+   - R61-14 / METRICS-INIT-FAILURE-NOT-LOGGED (diagnostics; low): `MetricsManager` caught `Throwable` while building the JMX
+     and the InfluxDB registries and logged a fixed line, so a node that ran without a backend gave the operator no cause.
+     The exception is now logged with both lines. The InfluxDB one is logged as a copy of the failure (same class name,
+     stack and cause chain) whose messages have the token, the user and the user info of the `url` (whole and in parts,
+     as written and percent-decoded) masked as `<redacted>`, since a configuration error can echo a value it read (R60-1). `MetricsManager(config, logger)`
+     is the seam of `MetricsManagerTest.aFailedInfluxInitialisationLogsItsCauseWithoutTheCredentials`, red before.
+   - R61-15 / PEER-ADDRESS-DUPLICATE-UNCHECKED (validation; low): two different members could share a Raft or an API
+     address (a copy-paste typo in `--peer`): `run`, `admin add-peer` and `admin remove-peer` accepted it, the first leader
+     wrote it into the genesis configuration and the member never got an append. `PeerConfig.sharedAddress` finds the
+     first such pair (host compared case-insensitively, an IP address in any of its spellings as one host, port as a
+     number, no DNS: two names of one machine pass; a
+     member's own Raft and API address, or one member's Raft with another's API, are not compared). `NodeConfig`
+     refuses it (`Duplicate peer addresses: members n1 and n2 share the Raft address h:p`), which `run` maps to exit 2;
+     `admin add-peer` and `remove-peer` check the group the change leaves, without the member of the same id that
+     `add-peer` replaces and without the member that `remove-peer` removes, so a wrong recorded address of either can
+     still be repaired (and `--change-addresses` with a corrected `--peer` address works). `status`, `transfer-leader`
+     and `snapshot` check nothing, and `admin` builds its clients' configuration from the members with distinct
+     addresses (`adminConfig`), so a list that a repair needs is not refused by `NodeConfig`. Pinned by
+     `CommandLineTest.adminRefusesMembersSharingAnAddress` and two cases of
+     `StartupChecksTest.runRefusesMalformedValuesWithTwo` (red before), and `PeerConfigAddressTest`.
+   - R61-13 / RAFT-PORT-BIND-HANG (availability at start; medium): a node whose Raft port could not be bound (two nodes
+     with one port, a bind host the machine lacks, a restart racing a process that still holds the port) never exited.
+     Ratis 3.3.1 answers the bind failure with `ExitUtils.terminate`, a `System.exit(1)` on the main thread inside
+     `RaftServer.start()` (its only caller of `ExitUtils`, by a search of the class files of ratis-common, -server,
+     -server-api, -grpc, -netty and -client). `System.exit` runs the shutdown hooks on its own thread and waits for
+     them; the hook of `run` waited for the start to end (R28-4), which that thread was still in. Reproduced with a real
+     process (`PortInUseProcessTest`, red: still running after 60 s, the thread dump showing `main` in
+     `Shutdown.runHooks` under `ExitUtils.terminate` and `rockserver-shutdown` in `started.join()`). The node had logged
+     the cause, served no API, kept its database open and its Raft division running (alone in its group, it elected
+     itself), and SIGTERM did nothing: only the SIGKILL after `TimeoutStopSec` ended it, and a supervisor that restarts on failure saw none.
+     - The rule now: the hook never waits for something that only the exiting thread can do. While the start has not
+       ended, the hook looks at it every 200 ms (`ReplicatedServerMain.awaitStart`) and asks `JvmExit` who is exiting:
+       1. the starting thread is inside `System.exit` (a frame of `java.lang.Shutdown` on its stack: it runs the hooks,
+          or waits behind the thread that does, as when the exit comes after a SIGTERM): the start cannot return. The
+          hook prints `Node <id> does not start: its start called System.exit ...` with that thread's stack and halts
+          with 1, the status of a node that did not start, at its first look;
+       2. a signal started the shutdown (the thread that runs the hooks has a frame of `java.lang.Terminator`): the hook
+          waits for the start without a limit and stops the node it returns, as before. This is the guarantee of R28-4
+          and the only shutdown during a start that an operator or a supervisor asks for;
+       3. anything else, which is a `System.exit` on another thread: the start may wait for that thread, which never
+          returns, and nothing can tell. The hook waits 30 s (`startAfterExitTimeout`) for the start, stops the node if
+          it started, and halts with 1 otherwise. A virtual thread that exits has no stack trace to find and falls here.
+     - A start that fails by an exception completes its result before its own exit, and the hook reads that result after
+       it looked at the thread: it has nothing to stop and leaves the start's status (1, 4 or 5) alone.
+     - Why a halt (`ProcessHalt`, libc's `_exit`) and not a return from the hook, which would let `System.exit` end with
+       Ratis' own status: the start still holds the open database and a running Raft division, and only the starting
+       thread could close them. An exit with them open is the case R28-4 and R62-1 exist to avoid (RocksDB's
+       destructors can hang it). A node that has not ended its start has answered no client, so the halt leaves what a
+       crash during a start leaves.
+     - Why not `ExitUtils.disableSystemExit()`: it is one switch for the whole JVM and for good, and it also takes the
+       exit out of the handler for uncaught exceptions that Ratis installs for every thread when `ExitUtils` first
+       loads (status -1), so a later exit Ratis asks for on another thread would end nothing. A bind check before `RaftServer.start()` would leave the race with another process and every other exit.
+     - What `JvmExit` reads are classes of the JDK's implementation (`java.lang.Shutdown`, its `runHooks`,
+       `java.lang.Terminator`), seen on Temurin 27.0.1. The process tests pin them: a JDK where the exit is not
+       recognised fails `PortInUseProcessTest` (the hang is back); one where the signal is not recognised fails
+       `StartExitProcessTest.aSignalDuringAStartStillStopsTheNodeCleanly` (a stop during a long start would become a halt
+       after 30 s, a crash for the node and not a hang).
+     - The other exits of the distributed main code were read for the same cycle: `run` registers this one hook and
+       nothing else does; every `exit` of `startAndServe` and `awaitStop` comes after the result of the start is set; the
+       direct-memory watch and the crash points halt and run no hook. A taken API port is not the Raft case: the API
+       server's start throws (`Failed to bind to address`, `Address already in use`), the start closes what it opened
+       and `run` exits with 1 through `Failed to start node <id>`, before and after this change.
+     - Tests: `PortInUseProcessTest` (a real node with its Raft port, then its API port, held by the test: exit 1, the
+       address and `Address already in use` in the output, no `READY`); `StartExitProcessTest` with `StartExitMain` (a
+       real SIGTERM during a start that takes 5 s more, with the limit of case 3 at 2 s: exit 143, the node started and
+       was stopped, the database's lock is free; a start that calls `System.exit` after a SIGTERM: 1; a start that waits
+       for a thread inside `System.exit`: 1 after the limit); `ShutdownSignalTest` with the probe replaced (cases 1 to 3
+       and the failed start whose exit the hook sees).
+   - R63-3 (test gap): `WatchdogThreadsTest.aRuntimeFailureOfTheStateMachineInitializeStopsEverythingItStarted` fails the
+     state machine's `initialize` inside `server.start()` with an `IllegalStateException` (seam
+     `RockserverStateMachine.initializedForTesting`, after the store is open) and asserts that no thread with the node id
+     in its name is left (`rockserver-metrics-<id>`, `<id>-apply`, Ratis'), that the Raft port is free, and that the
+     next start of the same directory works. It passed on the code as it was: no leak found, no production change.
+   - Review of R65 (4 findings, all in tests or low):
+     1. (medium, tests) R61-15 broke three tests that the round did not run: `RatisContractTest`'s heartbeat cluster gave
+        its three members the API address `127.0.0.1:1`, and `aCommitHeartbeatSendsTheCommitIndexAtOnce`,
+        `aCommitHeartbeatLostWithItsStreamIsSentAgain` and `aCommitHeartbeatAskedForJustBeforeTheAppenderWaitsIsNotLost`
+        failed with `Duplicate peer addresses: members h0 and h1 share the API address 127.0.0.1:1`. Each member now has
+        an API port of its own. The other test peer lists were searched for a shared address (literal and computed
+        ones); the full suite was not run.
+     2. (low) R61-15 compared hosts as text, so two spellings of one IPv6 address (`[::1]` and `[0:0:0:0:0:0:0:1]`,
+        upper and lower case aside) passed as two addresses. `PeerConfig.comparableHost` reads an IP address from the
+        text (`InetAddress.ofLiteral`, no lookup) and compares the JDK's one spelling of it; a name stays as written.
+        Pinned by `PeerConfigAddressTest.spellingsOfOneIpAddressAreOneAddress` (red before).
+     3. (low) R61-14 masked the user info of the `url` as written. A password with a reserved character is
+        percent-encoded there (`p%40ss`), and a failure that echoes it decoded (`p@ss`) was logged in clear. The
+        decoded forms are masked too: `MetricsManagerTest.aFailedInfluxInitialisationMasksTheDecodedUserInfoOfTheUrl`
+        (red before). Not masked, as before: a credential in the query of the `url`, which this configuration has a
+        `token` and a `user` for instead.
+     4. (verification) The two claims the round left unrun. A Raft bind host that is no address of the machine ends
+        `run` with 1 through the same exit of Ratis: `PortInUseProcessTest.aRaftBindHostTheMachineLacksEndsRunWithOne`
+        (192.0.2.1; passes on the R61-13 code). The R63-3 test fails without the code it is for: with the
+        `server.close()` of `closeFailedStart` taken out, `still running after the refused start of r65a:
+        [r65a-groupManagement, r65a-impl-thread1]`.
+     - Read and left as they are: in R61-13, a signal's wait for the start has no limit also when another thread is
+       inside `System.exit` behind it and the start waits for that thread (no caller known; a SIGKILL ends it, as
+       before the round), and a `System.exit` on another thread during a start of more than 30 s halts a node that
+       would have started (a crash before it serves, for which the wait before the round had no limit). In R61-15, a
+       node whose `--peer` list gives two members one placeholder API address no longer starts (exit 2, which a
+       supervisor does not restart): check `PEERS` before the upgrade. The core server's `Main` has a shutdown hook of
+       the shape R61-13 fixed here (it waits for a latch that only the main thread releases) and was not changed.
    - Review of R46, 1 (low, docs): the R46-2 recipe ran `dependency:build-classpath` on `distributed/server/pom.xml`
      alone, so Maven resolved `rockserver-core:${revision}` and that version's pom from `~/.m2` (or the snapshot
      repository): `grep -v /rockserver-core/` dropped the jar but kept the third-party jars of that pom, from whichever

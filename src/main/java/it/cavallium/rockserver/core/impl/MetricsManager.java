@@ -50,6 +50,89 @@ public class MetricsManager implements AutoCloseable {
 
 	private static final Logger LOG = LoggerFactory.getLogger(MetricsManager.class);
 
+	private static final String REDACTED = "<redacted>";
+
+	/**
+	 * The influx token, user and the user info of the url (whole and in parts, as written and percent-decoded), as far as
+	 * they can be read.
+	 */
+	private static java.util.List<String> influxSecrets(DatabaseConfig config) {
+		var secrets = new ArrayList<String>();
+		try {
+			var influx = config.metrics().influx();
+			try {
+				secrets.add(influx.token());
+			} catch (Throwable ignored) {
+			}
+			try {
+				secrets.add(influx.user());
+			} catch (Throwable ignored) {
+			}
+			try {
+				var url = influx.url();
+				if (url != null) {
+					int scheme = url.indexOf("://");
+					int authority = scheme < 0 ? 0 : scheme + 3;
+					int end = authority;
+					while (end < url.length() && "/?#".indexOf(url.charAt(end)) < 0) {
+						end++;
+					}
+					int at = url.lastIndexOf('@', end - 1);
+					if (at > authority) {
+						var userInfo = url.substring(authority, at);
+						var written = new ArrayList<String>();
+						written.add(userInfo);
+						written.addAll(java.util.List.of(userInfo.split(":", -1)));
+						secrets.addAll(written);
+						// Percent-encoded in the url, and a failure can echo it decoded (review of R65). The parts are
+						// decoded one by one too: a decoded ':' or '@' belongs to its part.
+						for (var encoded : written) {
+							try {
+								var decoded = java.net.URLDecoder.decode(encoded.replace("+", "%2B"), StandardCharsets.UTF_8);
+								if (!decoded.equals(encoded)) {
+									secrets.add(decoded);
+								}
+							} catch (IllegalArgumentException notEncoded) {
+								// As written only.
+							}
+						}
+					}
+				}
+			} catch (Throwable ignored) {
+			}
+		} catch (Throwable ignored) {
+		}
+		return secrets;
+	}
+
+	/**
+	 * A copy of the failure (same class name, stack and cause chain) whose messages have the given secrets masked, so
+	 * that the log of a failed exporter initialisation names the cause without leaking a credential (R60-1, R61-14).
+	 */
+	static Throwable sanitize(Throwable ex, java.util.List<String> secrets) {
+		return sanitize(ex, secrets, 0);
+	}
+
+	private static Throwable sanitize(Throwable ex, java.util.List<String> secrets, int depth) {
+		var message = ex.getClass().getName();
+		if (ex.getMessage() != null) {
+			var text = ex.getMessage();
+			// longest first, so that "user:pass" is masked as one piece before "user" and "pass"
+			var sorted = new ArrayList<>(secrets);
+			sorted.sort((a, b) -> Integer.compare(b == null ? 0 : b.length(), a == null ? 0 : a.length()));
+			for (var secret : sorted) {
+				if (secret != null && !secret.isEmpty()) {
+					text = text.replace(secret, REDACTED);
+				}
+			}
+			message += ": " + text;
+		}
+		var cause = ex.getCause() == null || ex.getCause() == ex || depth > 16 ? null : sanitize(ex.getCause(), secrets, depth + 1);
+		var copy = new Throwable(message, cause);
+		copy.setStackTrace(ex.getStackTrace());
+		return copy;
+	}
+
 	private final JvmGcMetrics gcMetrics;
 	private final JvmHeapPressureMetrics heapPressureMetrics;
 	private final CompositeMeterRegistry compositeRegistry;
@@ -59,6 +142,11 @@ public class MetricsManager implements AutoCloseable {
 	private Vertx vertx;
 
 	public MetricsManager(DatabaseConfig config) {
+		this(config, LOG);
+	}
+
+	/** The logger is a seam for tests: a failed exporter initialisation is reported on it (R61-14). */
+	public MetricsManager(DatabaseConfig config, Logger log) {
 		try {
 			this.startTime = System.currentTimeMillis();
 			compositeRegistry = new CompositeMeterRegistry();
@@ -83,7 +171,7 @@ public class MetricsManager implements AutoCloseable {
 					}, Clock.SYSTEM);
 					compositeRegistry.add(jmxMeterRegistry);
 				} catch (Throwable ex) {
-					LOG.error("Failed to initialize jmx metrics");
+					log.error("Failed to initialize jmx metrics", sanitize(ex, java.util.List.of()));
 				}
 			}
    if (config.metrics().influx().enabled()) {
@@ -189,7 +277,7 @@ public class MetricsManager implements AutoCloseable {
 							.build();
 					compositeRegistry.add(influxMeterRegistry);
     } catch (Throwable ex) {
-                    LOG.error("Failed to initialize influx metrics");
+                    log.error("Failed to initialize influx metrics", sanitize(ex, influxSecrets(config)));
                 }
             } else {
                 this.httpClient = null;

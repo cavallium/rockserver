@@ -90,6 +90,12 @@ public record NodeConfig(String nodeId,
 		if (peers.stream().map(PeerConfig::id).distinct().count() != peers.size()) {
 			throw new IllegalArgumentException("Duplicate peer ids");
 		}
+		// R61-15: a copy-paste typo gave a member another's address; the first leader wrote it, and the member never
+		// received an append.
+		var shared = PeerConfig.sharedAddress(peers);
+		if (shared != null) {
+			throw new IllegalArgumentException("Duplicate peer addresses: " + shared);
+		}
 		// R61-3: zero or negative, the node started and failed every request at once (its deadlines were immediate, and
 		// its disk probe counted as hung whenever one was in flight); past MAX_TIMEOUT, toNanos() overflowed during the
 		// start, outside what run maps to wrong usage.

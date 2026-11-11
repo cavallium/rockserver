@@ -183,6 +183,82 @@ class MetricsManagerTest {
 		field.set(target, value);
 	}
 
+	@Test
+	void aFailedInfluxInitialisationLogsItsCauseWithoutTheCredentials() throws Exception {
+		var influx = mock(it.cavallium.rockserver.core.config.InfluxMetricsConfig.class);
+		when(influx.enabled()).thenReturn(true);
+		when(influx.url()).thenReturn("https://dbuser:p4ssw0rd-x@influx.example:8086/path");
+		when(influx.user()).thenReturn("dbuser");
+		when(influx.token()).thenReturn("tok-s3cret-1234");
+		when(influx.bucket()).thenThrow(new org.github.gestalt.config.exceptions.GestaltException(
+				"cannot read bucket with token tok-s3cret-1234 for dbuser at https://dbuser:p4ssw0rd-x@influx.example:8086/path"));
+		var base = ConfigParser.parse(writeConfig("""
+				database.metrics.jmx.enabled = false
+				database.metrics.influx.enabled = false
+				"""));
+		var metrics = mock(it.cavallium.rockserver.core.config.MetricsConfig.class);
+		when(metrics.jmx()).thenReturn(base.metrics().jmx());
+		when(metrics.influx()).thenReturn(influx);
+		when(metrics.databaseName()).thenReturn("influx-failure");
+		var config = spy(base);
+		when(config.metrics()).thenReturn(metrics);
+		var log = mock(org.slf4j.Logger.class);
+		var captor = org.mockito.ArgumentCaptor.forClass(Throwable.class);
+
+		var manager = new MetricsManager(config, log);
+		try {
+			verify(log).error(org.mockito.ArgumentMatchers.eq("Failed to initialize influx metrics"), captor.capture());
+		} finally {
+			manager.close();
+		}
+		var text = new StringBuilder();
+		for (Throwable t = captor.getValue(); t != null; t = t.getCause()) {
+			text.append(t).append('\n');
+		}
+		assertTrue(text.toString().contains("cannot read bucket"), text.toString());
+		assertTrue(text.toString().contains("GestaltException"), text.toString());
+		for (var secret : new String[] {"tok-s3cret-1234", "p4ssw0rd-x", "dbuser"}) {
+			assertFalse(text.toString().contains(secret), "the cause leaks " + secret + ": " + text);
+		}
+	}
+
+	/**
+	 * Review of R65: the user info of the url is percent-encoded there, and a failure can echo it decoded: that form is
+	 * masked too.
+	 */
+	@Test
+	void aFailedInfluxInitialisationMasksTheDecodedUserInfoOfTheUrl() throws Exception {
+		var influx = mock(it.cavallium.rockserver.core.config.InfluxMetricsConfig.class);
+		when(influx.enabled()).thenReturn(true);
+		when(influx.url()).thenReturn("https://db%2Fuser:p%40ss%3Aw0rd@influx.example:8086/path");
+		when(influx.bucket()).thenThrow(new org.github.gestalt.config.exceptions.GestaltException(
+				"cannot log in as db/user with p@ss:w0rd at influx.example"));
+		var base = ConfigParser.parse(writeConfig("""
+				database.metrics.jmx.enabled = false
+				database.metrics.influx.enabled = false
+				"""));
+		var metrics = mock(it.cavallium.rockserver.core.config.MetricsConfig.class);
+		when(metrics.jmx()).thenReturn(base.metrics().jmx());
+		when(metrics.influx()).thenReturn(influx);
+		when(metrics.databaseName()).thenReturn("influx-failure-encoded");
+		var config = spy(base);
+		when(config.metrics()).thenReturn(metrics);
+		var log = mock(org.slf4j.Logger.class);
+		var captor = org.mockito.ArgumentCaptor.forClass(Throwable.class);
+
+		var manager = new MetricsManager(config, log);
+		try {
+			verify(log).error(org.mockito.ArgumentMatchers.eq("Failed to initialize influx metrics"), captor.capture());
+		} finally {
+			manager.close();
+		}
+		var text = String.valueOf(captor.getValue());
+		assertTrue(text.contains("cannot log in as") && text.contains("influx.example"), text);
+		for (var secret : new String[] {"p@ss:w0rd", "db/user"}) {
+			assertFalse(text.contains(secret), "the cause leaks " + secret + ": " + text);
+		}
+	}
+
 	private Path writeConfig(String content) throws IOException {
 		return Files.writeString(tempDir.resolve("metrics-" + System.nanoTime() + ".conf"), content);
 	}
