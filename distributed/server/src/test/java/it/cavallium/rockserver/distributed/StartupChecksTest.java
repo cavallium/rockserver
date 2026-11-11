@@ -1028,7 +1028,9 @@ class StartupChecksTest {
 				List.of("--request-timeout-ms", "0"), List.of("--request-timeout-ms", "-5"),
 				List.of("--request-timeout-ms", "9223372036854775807"), List.of("--election-timeout-ms", "0:2000"),
 				List.of("--election-timeout-ms", "1000:9223372036854775807"),
-				List.of("--peer", "b=127.0.0.1:0/127.0.0.1:3"), List.of("--peer", "b=127.0.0.1:3/127.0.0.1:70000"))) {
+				List.of("--peer", "b=127.0.0.1:0/127.0.0.1:3"), List.of("--peer", "b=127.0.0.1:3/127.0.0.1:70000"),
+				// R61-15: two members at one Raft address, or at one API address.
+				List.of("--peer", "b=127.0.0.1:1/127.0.0.1:4"), List.of("--peer", "b=127.0.0.1:3/127.0.0.1:2"))) {
 			var command = new java.util.ArrayList<>(List.of(Path.of(System.getProperty("java.home"), "bin", "java").toString(),
 					"-cp", System.getProperty("java.class.path"),
 					"-Djava.io.tmpdir=" + tempDir, "-XX:+ExitOnOutOfMemoryError",
