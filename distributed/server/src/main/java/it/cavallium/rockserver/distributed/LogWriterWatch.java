@@ -23,6 +23,13 @@ import org.jetbrains.annotations.Nullable;
  * {@link #AFTER} found the same flush index below the last entry and the writer idle, the log has failed, and the
  * node stops as a failed node (exit code 3), to be restarted on a disk that works. A check that finds the writer
  * busy, or does not find its thread, starts the time over.</p>
+ *
+ * <p>The time alone is not enough (review of R62): a process that was stopped for longer than {@link #AFTER} (SIGSTOP,
+ * a frozen virtual machine, a long safepoint) has one check before the pause and one right after it, {@link #AFTER}
+ * apart, and the second may run before the writer thread, which was handed its task before the pause, has run at
+ * all. So the checks must also be an unbroken row: a check that comes later than {@link #MAX_GAP} after the one
+ * before it starts the time over, and no fewer than {@link #MIN_CHECKS} checks in a row must have found the same.
+ * Between two checks of such a row the process ran, and a writer that runs takes its task.</p>
  */
 final class LogWriterWatch {
 
@@ -34,13 +41,31 @@ final class LogWriterWatch {
 	static final String IDLE_CLASS = "org.apache.ratis.util.DataBlockingQueue";
 	static final String IDLE_METHOD = "poll";
 
+	/**
+	 * Two checks further apart than this are not one row: the process, or the thread that checks, stood still between
+	 * them. Several times the interval of the Raft watch, and well under {@link #AFTER}.
+	 */
+	static final Duration MAX_GAP = Duration.ofSeconds(1);
+	/** The least number of checks in a row that must have found the same, whatever the time between them. */
+	static final int MIN_CHECKS = 5;
+
 	private final long afterNanos;
+	private final long maxGapNanos;
+	private final int minChecks;
 	private boolean waiting;
 	private long flushIndex;
 	private long sinceNanos;
+	private long lastNanos;
+	private int checks;
 
 	LogWriterWatch(Duration after) {
+		this(after, MAX_GAP, MIN_CHECKS);
+	}
+
+	LogWriterWatch(Duration after, Duration maxGap, int minChecks) {
 		this.afterNanos = after.toNanos();
+		this.maxGapNanos = maxGap.toNanos();
+		this.minChecks = minChecks;
 	}
 
 	/**
@@ -53,13 +78,18 @@ final class LogWriterWatch {
 	 */
 	boolean failed(long flushIndex, long lastIndex, long nowNanos, BooleanSupplier writerIdle) {
 		boolean waiting = flushIndex < lastIndex;
-		if (!waiting || !this.waiting || flushIndex != this.flushIndex || !writerIdle.getAsBoolean()) {
+		boolean gap = nowNanos - lastNanos > maxGapNanos;
+		lastNanos = nowNanos;
+		// The writer is not asked after a gap: what it does right after a pause says nothing.
+		if (!waiting || !this.waiting || flushIndex != this.flushIndex || gap || !writerIdle.getAsBoolean()) {
 			this.waiting = waiting;
 			this.flushIndex = flushIndex;
 			sinceNanos = nowNanos;
+			checks = 1;
 			return false;
 		}
-		return nowNanos - sinceNanos >= afterNanos;
+		checks++;
+		return nowNanos - sinceNanos >= afterNanos && checks >= minChecks;
 	}
 
 	/** The live thread named {@code name}, or null. */

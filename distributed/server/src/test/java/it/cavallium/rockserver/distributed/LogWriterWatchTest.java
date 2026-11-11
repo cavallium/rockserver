@@ -29,6 +29,8 @@ import org.junit.jupiter.api.io.TempDir;
 class LogWriterWatchTest {
 
 	private static final long SECOND = TimeUnit.SECONDS.toNanos(1);
+	/** Between two checks of one row: under {@link LogWriterWatch#MAX_GAP}. */
+	private static final long HALF = SECOND / 2;
 
 	@Test
 	void aLogWithNothingToFlushNeverFails() {
@@ -49,23 +51,82 @@ class LogWriterWatchTest {
 	@Test
 	void entriesWaitingBehindAnIdleWriterForTheWholeTimeAreAFailedLog() {
 		var watch = new LogWriterWatch(Duration.ofSeconds(3));
-		assertFalse(watch.failed(7, 9, 0, () -> true));
-		assertFalse(watch.failed(7, 9, SECOND, () -> true));
-		assertFalse(watch.failed(7, 12, 2 * SECOND, () -> true));
-		assertTrue(watch.failed(7, 12, 3 * SECOND, () -> true));
+		for (int i = 0; i < 6; i++) {
+			assertFalse(watch.failed(7, i < 3 ? 9 : 12, i * HALF, () -> true), "check " + i);
+		}
+		assertTrue(watch.failed(7, 12, 6 * HALF, () -> true));
 	}
 
 	@Test
 	void aBusyWriterStartsTheTimeOver() {
 		// A hung or slow disk: the writer is inside the write or the fsync, not waiting for work.
 		var watch = new LogWriterWatch(Duration.ofSeconds(3));
-		assertFalse(watch.failed(7, 9, 0, () -> true));
-		assertFalse(watch.failed(7, 9, 2 * SECOND, () -> false));
-		assertFalse(watch.failed(7, 9, 4 * SECOND, () -> true));
-		assertTrue(watch.failed(7, 9, 5 * SECOND, () -> true));
-		for (int i = 0; i < 100; i++) {
-			assertFalse(new LogWriterWatch(Duration.ofSeconds(3)).failed(7, 9, i * SECOND, () -> false));
+		for (int i = 0; i < 5; i++) {
+			assertFalse(watch.failed(7, 9, i * HALF, () -> true));
 		}
+		assertFalse(watch.failed(7, 9, 5 * HALF, () -> false));
+		for (int i = 6; i < 11; i++) {
+			assertFalse(watch.failed(7, 9, i * HALF, () -> true), "check " + i);
+		}
+		assertTrue(watch.failed(7, 9, 11 * HALF, () -> true));
+		var busy = new LogWriterWatch(Duration.ofSeconds(3));
+		for (int i = 0; i < 100; i++) {
+			assertFalse(busy.failed(7, 9, i * HALF, () -> false));
+		}
+	}
+
+	/**
+	 * Review of R62: a process stopped for longer than the whole time (SIGSTOP, a frozen machine) has one check before
+	 * the pause and one right after it, when the writer thread may not have run yet. The pause starts the time over,
+	 * and the writer is not even asked at the check after it.
+	 */
+	@Test
+	void aPauseOfTheProcessBetweenTwoChecksStartsTheTimeOver() {
+		var watch = new LogWriterWatch(Duration.ofSeconds(3));
+		assertFalse(watch.failed(7, 9, 0, () -> true));
+		assertFalse(watch.failed(7, 9, HALF, () -> true));
+		var asked = new AtomicInteger();
+		// 60 s without a check, then the first one: the same flush index, and the writer still where it was.
+		long after = HALF + 60 * SECOND;
+		assertFalse(watch.failed(7, 9, after, () -> asked.incrementAndGet() > 0));
+		assertTrue(asked.get() == 0, "the writer was asked right after a pause");
+		// A burst of checks right after the pause does not make up for the time either.
+		for (int i = 1; i <= 20; i++) {
+			assertFalse(watch.failed(7, 9, after + i, () -> true), "check " + i + " of the burst");
+		}
+		// It takes the whole time again, from the first check after the pause.
+		for (int i = 1; i < 6; i++) {
+			assertFalse(watch.failed(7, 9, after + i * HALF, () -> true), "check " + i + " after the pause");
+		}
+		assertTrue(watch.failed(7, 9, after + 6 * HALF, () -> true));
+	}
+
+	/** Every gap longer than {@link LogWriterWatch#MAX_GAP} starts over, so a row of pauses never adds up. */
+	@Test
+	void checksFurtherApartThanTheGapNeverAddUp() {
+		var watch = new LogWriterWatch(Duration.ofSeconds(3));
+		long gap = LogWriterWatch.MAX_GAP.toNanos() + 1;
+		for (int i = 0; i < 100; i++) {
+			assertFalse(watch.failed(7, 9, i * gap, () -> true), "check " + i);
+		}
+		// At exactly the gap they are one row.
+		var atTheGap = new LogWriterWatch(Duration.ofSeconds(3));
+		boolean failed = false;
+		for (int i = 0; i < 6 && !failed; i++) {
+			failed = atTheGap.failed(7, 9, i * LogWriterWatch.MAX_GAP.toNanos(), () -> true);
+		}
+		assertTrue(failed);
+	}
+
+	/** The time alone is not enough: no fewer than {@link LogWriterWatch#MIN_CHECKS} checks in a row. */
+	@Test
+	void fewerChecksThanTheLeastNumberAreNotAFailedLogWhateverTheTime() {
+		var watch = new LogWriterWatch(Duration.ofSeconds(3), Duration.ofSeconds(10), 5);
+		assertFalse(watch.failed(7, 9, 0, () -> true));
+		assertFalse(watch.failed(7, 9, 4 * SECOND, () -> true));
+		assertFalse(watch.failed(7, 9, 8 * SECOND, () -> true));
+		assertFalse(watch.failed(7, 9, 12 * SECOND, () -> true));
+		assertTrue(watch.failed(7, 9, 16 * SECOND, () -> true));
 	}
 
 	@Test
@@ -73,10 +134,10 @@ class LogWriterWatchTest {
 		var watch = new LogWriterWatch(Duration.ofSeconds(3));
 		var asked = new AtomicInteger();
 		watch.failed(7, 7, 0, () -> asked.incrementAndGet() > 0);
-		watch.failed(7, 9, SECOND, () -> asked.incrementAndGet() > 0);
-		watch.failed(8, 9, 2 * SECOND, () -> asked.incrementAndGet() > 0);
+		watch.failed(7, 9, HALF, () -> asked.incrementAndGet() > 0);
+		watch.failed(8, 9, 2 * HALF, () -> asked.incrementAndGet() > 0);
 		assertTrue(asked.get() == 0, "asked " + asked.get() + " times");
-		watch.failed(8, 9, 3 * SECOND, () -> asked.incrementAndGet() > 0);
+		watch.failed(8, 9, 3 * HALF, () -> asked.incrementAndGet() > 0);
 		assertTrue(asked.get() == 1, "asked " + asked.get() + " times");
 	}
 
