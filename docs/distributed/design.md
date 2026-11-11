@@ -5909,6 +5909,19 @@ install it (`apt-get install gcc libc6-dev`) and run with `-Drockserver.test.req
      counts an exception without a stack trace as the metrics race. Pinned by
      `theRegistryCheckHoldsWhenTheJvmOmitsTheMessageOfTheNullPointerException`, red before; it is skipped (an
      assumption) on a JVM that does not omit the trace within 5 million throws.
+   - R64-1 / LINKPROXY-REBIND-RACE (test harness; low): `LinkProxyTest.aWatchRequestedWhileTheLastWatcherEndsIsNotLost`
+     failed once in the full distributed run ("round 49: the proxy does not listen"). The log of that run holds the cause:
+     `LinkProxy ... cannot listen again`, `java.net.BindException: Address already in use`. `refuseConnections()` closes the
+     listening `ServerSocket` while the acceptor thread is blocked in `accept()`; the port is released only when that thread
+     has left the call, so a watcher that binds at once can find it still taken. The watcher logged the error and ended
+     without listening again, and nothing started another. A standalone loop of 3000 refuse-and-watch rounds failed in 2 of 3
+     runs before the change (no load needed). The watcher now treats a `BindException` as "not yet": it probes and binds again
+     every 50 ms until it binds or the proxy closes; 0 failures in 6 runs of 3000 rounds, and in 8 concurrent runs of 3000
+     rounds under 32 busy loops. Second cause found while repeating the class under load: the first connection of
+     `resetsClientWhenTargetIsDown` and `refusesConnectionsWhileTheTargetIsDown` reached the proxy, which resets it right
+     after accepting, and on a loaded machine the reset arrived before the client's `connect` returned ("Connection reset
+     by peer (connect failed)", 3 of 20 runs); a test-only race, now `assertAcceptedThenCut`: a reset during `connect` is
+     accepted, a refusal (`ConnectException`) still fails the test.
    - Review of R46, 1 (low, docs): the R46-2 recipe ran `dependency:build-classpath` on `distributed/server/pom.xml`
      alone, so Maven resolved `rockserver-core:${revision}` and that version's pom from `~/.m2` (or the snapshot
      repository): `grep -v /rockserver-core/` dropped the jar but kept the third-party jars of that pom, from whichever
