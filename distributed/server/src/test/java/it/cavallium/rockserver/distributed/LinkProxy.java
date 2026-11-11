@@ -3,6 +3,7 @@ package it.cavallium.rockserver.distributed;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.net.BindException;
 import java.net.ConnectException;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
@@ -209,7 +210,15 @@ public final class LinkProxy implements AutoCloseable {
 				while (!closed) {
 					long requests = watchRequests.get();
 					if (targetAccepts()) {
-						acceptConnections();
+						try {
+							acceptConnections();
+						} catch (BindException e) {
+							// The port is not free yet: closing a ServerSocket while the acceptor is blocked in accept()
+							// releases the port only once that thread has left it. Probe and bind again.
+							LOG.debug("{} cannot bind yet, retrying", this, e);
+							Thread.sleep(TARGET_PROBE_MILLIS);
+							continue;
+						}
 						served = requests;
 						return;
 					}

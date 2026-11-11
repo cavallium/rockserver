@@ -13,6 +13,7 @@ import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.net.SocketException;
 import java.net.SocketTimeoutException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -123,9 +124,8 @@ class LinkProxyTest {
 		try (var server = new ServerSocket(0, 50, LOOPBACK)) {
 			deadTarget = localAddress(server);
 		}
-		try (var proxy = new LinkProxy(new InetSocketAddress(LOOPBACK, 0), deadTarget);
-				var socket = connect(proxy.listenAddress())) {
-			assertCutPromptly(socket);
+		try (var proxy = new LinkProxy(new InetSocketAddress(LOOPBACK, 0), deadTarget)) {
+			assertAcceptedThenCut(proxy.listenAddress());
 		}
 	}
 
@@ -141,9 +141,7 @@ class LinkProxyTest {
 		try (var proxy = new LinkProxy(new InetSocketAddress(LOOPBACK, 0), targetAddress)) {
 			proxy.refuseWhileTargetDown();
 			// The first connection finds the target down: accepted, then reset.
-			try (var first = connect(proxy.listenAddress())) {
-				assertCutPromptly(first);
-			}
+			assertAcceptedThenCut(proxy.listenAddress());
 			awaitTrue(() -> !proxy.isAccepting(), "the proxy still listens");
 			assertThrows(ConnectException.class, () -> connect(proxy.listenAddress()).close());
 
@@ -506,6 +504,29 @@ class LinkProxyTest {
 		}
 		var elapsed = Duration.ofNanos(System.nanoTime() - start);
 		assertTrue(elapsed.compareTo(PROMPT) < 0, "Connection cut after " + elapsed);
+	}
+
+	/**
+	 * Connects to a proxy whose target is down and expects the connection to be accepted and then reset. The proxy
+	 * resets right after accepting, so on a loaded machine the reset can arrive before {@code connect} returns: the
+	 * client then fails with a reset ({@link SocketException}), still not a refusal ({@link ConnectException}).
+	 */
+	private static void assertAcceptedThenCut(InetSocketAddress address) throws IOException {
+		Socket socket;
+		try {
+			socket = connect(address);
+		} catch (ConnectException refused) {
+			throw new AssertionError("The proxy refused a connection it should have accepted", refused);
+		} catch (SocketException reset) {
+			// Only a reset counts: any other socket error fails the test.
+			if (reset.getMessage() == null || !reset.getMessage().contains("reset")) {
+				throw reset;
+			}
+			return;
+		}
+		try (socket) {
+			assertCutPromptly(socket);
+		}
 	}
 
 	private static Socket connect(InetSocketAddress address) throws IOException {

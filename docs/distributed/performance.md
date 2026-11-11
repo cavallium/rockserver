@@ -266,6 +266,255 @@ Other results:
   this rate is not measured: their call rates are known, their bytes per call are not (see "Known limits, decided"
   in the design document).
 
+### Suite s3 (commit `f506d2a`)
+
+Run on 2026-11-11, about 21:48 to 22:01, on the same PC, with nothing else running that the logs show (load average
+2.3 at the start, 80 GiB of RAM available). Same suite definition as s2 (`final-suite.sh`), same options: open loop, 30 s
+steps after 10 s of warmup, four client connections (two per node for `--route all`), 512 reads and 512 writes in
+flight unless noted. Raw results: `/home/cavallium/rockserver-bench/s3-*/results.md` and `s3-*.log`. Each number below is
+copied from those files. "Not reported" means the benchmark does not print it. At the saturated steps (4× and 8×
+replicated, 8× single) latencies of the write operations are the client queue's, as in s2 (the planned start is the
+clock), and p50 of seconds is a backlog, not a service time. The size of that backlog is set by the benchmark, not by
+the server: `LoadBench` keeps at most 100000 requests waiting for one of its in-flight slots and drops the rest
+("dropped (client queue full)"), so a saturated step's p50 is about 100000 divided by the served rate (100000 / 27738
+= 3.6 s for 3.83 s measured at 4× replicated, 100000 / 67790 = 1.5 s for 1.59 s at 8× single, 100000 / 39253 = 2.5 s
+for 2.87 s at 8× with 2048 in flight). See "Reading the saturated steps and the failover" below.
+
+**Disks, and what differs from s2 there.** In s3 the nodes' data directories are on three different devices:
+`df` after the suite says node 1 (`/home/cavallium/.rockserver-bench`) is on `/dev/nvme1n1p1`, node 2
+(`/var/tmp/rockserver-bench`) on `/dev/nvme0n1p4`, node 3 (`/media/datissd/rockserver-bench`) on `/dev/sdb1` (SATA),
+and the replicated runs' device writes show all three busy (at 1× 36.2, 35.3 and 35.7 MiB/s on `nvme0n1`, `nvme1n1`,
+`sdb`). So nodes 1 and 2 were not on the same partition in s3. The s2 logs hold no `df`; they suggest the opposite
+for s2: at 1× its replicated run wrote 65.4 MiB/s on `nvme0n1`, 34.1 on `nvme1n1` and 37.0 on `sdb`, about twice the
+others on one NVMe, which fits two nodes sharing it, and its single-node run (directory of node 1) wrote on `nvme0n1`
+where s3's wrote on `nvme1n1`. That is an inference from `/proc/diskstats`, not a check, and the machine rebooted in
+between (s3's boot is about 20 h 59 min old at 22:03). If it holds, s2's leader (node 2) shared a disk with node 1 and
+s3's did not, which favors s3. The leader also differs: node 2 in every s2 replicated run, node 1 in `s3-repl` and
+`s3-repl-2048` (a NVMe disk), node 3 in `s3-bw-repl` (the SATA disk); in `s3-route-all` the heaviest node (CPU) was node 3.
+s2 says results move 10–15% with the elected node.
+
+**Single node** (`s3-single`; preload 1000000 messages in 1.1 s, 937117 keys/s, 546.9 MiB/s; node RSS 7863 MiB):
+
+| Load | Served ops/s (offered) | `UPDATE` p50 / p99 / p999 ms | `GET` p50 / p99 / p999 ms | Dropped | Server cores | Device writes MiB/s |
+|---|---|---|---|---|---|---|
+| 1× | 10627 (10614) | 0.18 / 0.34 / 0.75 | 0.13 / 0.24 / 0.48 | 0 | 2.0 | `nvme1n1` 19.5 |
+| 2× | 21259 (21228) | 0.17 / 0.98 / 18.43 | 0.12 / 0.40 / 2.61 | 0 | 2.8 | `nvme1n1` 50.3 |
+| 4× | 42440 (42456) | 0.20 / 55.14 / 104.77 | 0.13 / 4.37 / 14.86 | 0 | 4.6 | `nvme1n1` 121.6 |
+| 8× | 67790 (84912), saturated | 1591.30 / 2232.32 / 2467.84 | 2.37 / 14.24 / 32.16 | 476353 | 6.8 | `nvme1n1` 223.5 |
+
+Errors 0 at every step. `UPDATE` retries (commits told to retry): 4, 16, 281, 10657. No `lockretry`.
+
+**Replicated, 512 writes in flight** (`s3-repl`, leader node 1; node RSS 1=7502, 2=6958, 3=6916 MiB):
+
+| Load | Served ops/s | `UPDATE` p50 / p99 / p999 ms | `GET` p50 / p99 / p999 ms | Dropped | Cores (nodes 1, 2, 3) | Device writes MiB/s (`sdb`, `nvme0n1`, `nvme1n1`) |
+|---|---|---|---|---|---|---|
+| 1× | 10601 | 4.99 / 16.04 / 28.85 | 0.23 / 2.87 / 5.80 | 0 | 3.0, 0.6, 0.6 | 35.7, 36.2, 35.3 |
+| 2× | 21207 | 10.82 / 51.74 / 139.65 | 0.26 / 5.87 / 9.57 | 0 | 6.0, 1.3, 1.3 | 90.8, 91.1, 76.6 |
+| 4× | 27738 (saturated) | 3833.86 / 4628.48 / 4685.82 | 0.95 / 11.68 / 21.42 | 472468 | 6.6, 1.1, 1.1 | 123.9, 124.2, 102.1 |
+| 8× | 26411 (saturated) | 4272.13 / 4694.02 / 4976.64 | 1.48 / 12.73 / 24.77 | 2238410 | 6.5, 1.0, 1.1 | 122.4, 112.9, 122.7 |
+
+Errors 0 at every step. The saturation point is between 2× (21207 served, p99 51.74 ms) and 4× (27738 served, a client
+queue of about four seconds).
+
+**Replicated, 2048 writes in flight** (`s3-repl-2048`, leader node 1; node RSS 1=7380, 2=6564, 3=6661 MiB):
+
+| Load | Served ops/s | `UPDATE` p50 / p99 / p999 ms | `GET` p50 / p99 / p999 ms | Dropped | Cores (nodes 1, 2, 3) | Device writes MiB/s (`sdb`, `nvme0n1`, `nvme1n1`) |
+|---|---|---|---|---|---|---|
+| 4× | 42725 (offered 42456) | 21.70 / 154.88 / 1087.49 (max 2699.3) | 0.62 / 7.36 / 14.02 | 0 | 12.0, 2.1, 2.0 | 153.7, 163.7, 150.3 |
+| 8× | 39253 (saturated) | 2865.15 / 3958.78 / 6705.15 | 2.88 / 22.02 / 31.70 | 1680934 | 9.1, 1.6, 1.5 | 157.5, 176.4, 165.4 |
+
+Errors 0. At 4× the cluster kept up with the offered load in this run (nothing dropped); the saturation point with 2048
+in flight is between 4× and 8×.
+
+**All nodes, 2 connections each, 2×** (`s3-route-all`; preload 1000000 messages in 5.8 s, 172250 keys/s, 100.5 MiB/s;
+node RSS 1=5836, 2=5839, 3=6332 MiB): 21609 served, 16257 dropped, errors 0. `UPDATE` 4186.11 / 5562.37 / 5607.42 ms
+(p50 / p99 / p999), `GET` 4.46 / 128.45 / 210.43 ms (max 352.8). Cores 3.1, 3.1, 5.8; device writes `sdb` 77.0,
+`nvme0n1` 74.4, `nvme1n1` 77.0 MiB/s. Offered load of 21228 operations/s was not sustained: the cluster is behind by about
+four seconds, as with `--route all` in s2.
+
+**Failover** (`s3-failover`, same setup as `s3-route-all`, SIGKILL of the leader, node 1, at second 10; preload 4.3 s,
+230919 keys/s, 134.8 MiB/s). Node 2 logged `leading term 2`. The log has no timestamp for the election and the benchmark
+does not report the time without a leader. The per-second timeline (successful operations per second; `ok/errors`)
+from the kill second on is: 29103/11, 0/0, 0/0, 2306/346, 648/90, 0/0, 0/0, 3/7, 161/86, 127/71, 116/83, 466/212,
+126/61, 0/0, 1/3, 75/37, 158/83, 88/94, 0/133, 0/132. So there are two seconds with nothing (seconds 11–12), a
+trickle of 2306 and 648, and then no recovery to the 24k–33k per second before the kill within the 20 s that follow:
+at most 466 operations/s succeed, and the last two seconds have none. In the step table the whole step served 11095 ok/s
+(mean over 30 s), 315695 requests were dropped by the client queue, and errors totalled 1449 (`grpc-UNAVAILABLE` 367 on
+`EXISTS_MULTI`, 108 on `FIRST_LAST`, 509 on `GET`, 10 on `RANGE_PAGE`, 4 on `MONITOR_TX`; on `UPDATE` 444
+`grpc-UNAVAILABLE` and 7 `UPDATE_RETRY`). The per-operation write rows (`ENSURE`, `HISTORY_PUT_MULTI`,
+`FILE_PUT_MULTI`) show 0 errors, with p50 about 2.8 s, p99 5.77 s and p999 5.78 s (max 11739.1 ms on `ENSURE`). The log's error
+legend also lists `OUTCOME_UNKNOWN` ("the write was sent, and no answer settled its outcome before its deadline"),
+`CLIENT_CLOSED` and a `StatusRuntimeException: UNKNOWN: Uncaught exception in the SynchronizationContext`, without
+counts: **the report does not say how many writes ended with an unknown outcome, and does not check lost or duplicated
+writes (not reported).** Server cores `{1=-4.5, 2=2.2, 3=2.0}` and RSS `{1=-1, 2=5856, 3=5624}`: the negative values are
+the killed node's. After the kill node 2 applied only 1 to 545 entries per 10 s (before: thousands), so what the
+timeline shows is that the clients did not reach the new leader, not that it was slow.
+
+**Bulk writes** (16 clients, 1 MiB `putMulti`, closed loop, 20 s after 5 s of warmup, 1000 chats × 10 messages):
+
+| Run | MiB/s | p50 / p99 / p999 ms (max) | Server cores | Device writes MiB/s | Node RSS MiB |
+|---|---|---|---|---|---|
+| `s3-bw-single` | 218.59 (218 calls/s) | 8.74 / 1051.65 / 1396.74 (1396.7) | 0.9 | `nvme1n1` 520.7 (`nvme0n1` 0.1, `sda` and `sdb` 0.0) | 5959 |
+| `s3-bw-repl`, leader node 3 | 122.73 (123 calls/s) | 116.16 / 343.04 / 393.98 (394.0) | 0.6, 0.7, 1.4 | `sdb` 357.7, `nvme0n1` 437.0, `nvme1n1` 318.7 | 5356, 5404, 5531 |
+
+Errors 0 in both. The single node's rate swings between 14 and 595 calls/s from second to second.
+
+**s3 against s2** (same step, same metric; s2 from `/home/cavallium/rockserver-bench/s2-*/results.md`, commit
+`cdca0b2`, 2026-10-30; the change is s3 against s2 and only the cells that move by more than about 10% are worth reading,
+given the caveats below). In s2 `repl` and `repl-2048` the leader was node 2, in s3 node 1.
+
+| Run | Step | Metric | s2 | s3 | Change |
+|---|---|---|---|---|---|
+| single | 1× | served ops/s | 10631 | 10627 | 0% |
+| single | 1× | `UPDATE` p50 / p99 / p999 ms | 0.19 / 2.80 / 26.54 | 0.18 / 0.34 / 0.75 | -5% / -88% / -97% |
+| single | 1× | `GET` p50 / p99 / p999 ms | 0.15 / 2.92 / 26.18 | 0.13 / 0.24 / 0.48 | -13% / -92% / -98% |
+| single | 2× | served ops/s | 21247 | 21259 | 0% |
+| single | 2× | `UPDATE` p50 / p99 / p999 ms | 0.21 / 36.70 / 205.44 | 0.17 / 0.98 / 18.43 | -19% / -97% / -91% |
+| single | 2× | `GET` p50 / p99 / p999 ms | 0.14 / 4.00 / 21.97 | 0.12 / 0.40 / 2.61 | -14% / -90% / -88% |
+| single | 4× | served ops/s | 42461 | 42440 | 0% |
+| single | 4× | `UPDATE` p50 / p99 / p999 ms | 0.33 / 127.30 / 161.54 | 0.20 / 55.14 / 104.77 | -39% / -57% / -35% |
+| single | 4× | `GET` p50 / p99 / p999 ms | 0.21 / 24.00 / 61.18 | 0.13 / 4.37 / 14.86 | -38% / -82% / -76% |
+| single | 8× | served ops/s | 54598 | 67790 | +24% |
+| single | 8× | `UPDATE` p50 / p99 ms | 1953.79 / 3145.73 | 1591.30 / 2232.32 | -19% / -29% |
+| single | 8× | `GET` p50 / p99 ms | 2.59 / 19.04 | 2.37 / 14.24 | -8% / -25% |
+| repl | 1× | served ops/s | 10625 | 10601 | 0% |
+| repl | 1× | `UPDATE` p50 / p99 / p999 ms | 4.40 / 18.69 / 29.95 | 4.99 / 16.04 / 28.85 | +13% / -14% / -4% |
+| repl | 1× | `GET` p50 / p99 / p999 ms | 0.28 / 1.75 / 3.84 | 0.23 / 2.87 / 5.80 | -18% / +64% / +51% |
+| repl | 2× | served ops/s | 21217 | 21207 | 0% |
+| repl | 2× | `UPDATE` p50 / p99 / p999 ms | 11.93 / 104.90 / 174.46 | 10.82 / 51.74 / 139.65 | -9% / -51% / -20% |
+| repl | 2× | `GET` p50 / p99 / p999 ms | 0.33 / 5.42 / 9.28 | 0.26 / 5.87 / 9.57 | -21% / +8% / +3% |
+| repl | 4× | served ops/s | 24685 | 27738 | +12% |
+| repl | 4× | `UPDATE` p50 / p99 ms | 4333.57 / 5218.30 | 3833.86 / 4628.48 | -12% / -11% |
+| repl | 4× | `GET` p50 / p99 / p999 ms | 1.06 / 8.81 / 18.27 | 0.95 / 11.68 / 21.42 | -10% / +33% / +17% |
+| repl | 8× | served ops/s | 27245 | 26411 | -3% |
+| repl | 8× | `UPDATE` p50 / p99 ms | 4067.33 / 5943.30 | 4272.13 / 4694.02 | +5% / -21% |
+| repl | 8× | `GET` p50 / p99 / p999 ms | 1.52 / 9.34 / 17.66 | 1.48 / 12.73 / 24.77 | -3% / +36% / +40% |
+| repl, 2048 | 4× | served ops/s | 37374 | 42725 | +14% |
+| repl, 2048 | 4× | `UPDATE` p50 / p99 / p999 ms | 2938.88 / 3895.30 / 6737.92 | 21.70 / 154.88 / 1087.49 | -99% / -96% / -84% |
+| repl, 2048 | 4× | `GET` p50 / p99 / p999 ms | 1.83 / 20.58 / 32.10 | 0.62 / 7.36 / 14.02 | -66% / -64% / -56% |
+| repl, 2048 | 8× | served ops/s | 36735 | 39253 | +7% |
+| repl, 2048 | 8× | `UPDATE` p50 / p99 / p999 ms | 3149.82 / 4145.15 / 6451.20 | 2865.15 / 3958.78 / 6705.15 | -9% / -4% / +4% |
+| repl, 2048 | 8× | `GET` p50 / p99 / p999 ms | 2.71 / 18.62 / 28.38 | 2.88 / 22.02 / 31.70 | +6% / +18% / +12% |
+| route-all | 2× | served ops/s (dropped) | 24505 (21016) | 21609 (16257) | -12% |
+| route-all | 2× | `UPDATE` p50 / p99 / p999 ms | 1745.92 / 6127.62 / 6148.10 | 4186.11 / 5562.37 / 5607.42 | +140% / -9% / -9% |
+| route-all | 2× | `GET` p50 / p99 / p999 ms | 1.39 / 7.95 / 31.25 | 4.46 / 128.45 / 210.43 | +221% / +1516% / +573% |
+| failover | 2× | served ops/s (step mean) | 16976 | 11095 | -35% |
+| failover | 2× | errors / dropped | 109757 / 57272 | 1449 / 315695 | |
+| failover | 2× | seconds with 0 ok after the kill | 3 (seconds 11–13) | 7 of the 20 after it, never back to the pre-kill rate | |
+| bw-single | 16 clients | MiB/s; p50 / p99 / p999 ms | 183.12; 12.65 / 1000.96 / 1252.35 | 218.59; 8.74 / 1051.65 / 1396.74 | +19%; -31% / +5% / +12% |
+| bw-repl | 16 clients | MiB/s; p50 / p99 / p999 ms | 103.21; 144.13 / 299.78 / 364.54 | 122.73; 116.16 / 343.04 / 393.98 | +19%; -19% / +14% / +8% |
+
+Other s2 and s3 figures side by side (not percentages): server cores at 1× single 1.8 and 2.0, replicated leader 3.2 (node 2)
+and 3.0 (node 1); node RSS, single 7640 and 7863 MiB, replicated (1, 2, 3) 6908, 7673, 6724 and 7502, 6958, 6916 MiB.
+Device writes in s2 and s3 runs are totals for the device over all processes and are not comparable for the single
+node at 1× (115.4 and 19.5 MiB/s, on different devices and with other workloads on the PC in s2).
+
+**Improvements above about 10%** (s3 against s2):
+
+- Single node tails: `UPDATE` and `GET` p99 at 1× and 2× are 88–97% lower (for example `UPDATE` p99 at 2× 36.70 to 0.98 ms),
+  p99 at 4× 57% (`UPDATE`) and 82% (`GET`) lower; throughput at 8× +24% (54598 to 67790 ops/s) with 476353 requests
+  dropped against 993004. Medians at 2× and 4× are 14–39% lower. The s2 single-node tails were the ones the old
+  runs said came from "other workloads" on the PC, so the size of this gain is not a measurement of the code.
+- Replicated, 2048 in flight, 4×: 42725 against 37374 ops/s (+14%) with nothing dropped (146045 before), `UPDATE` p50 / p99
+  21.70 / 154.88 ms against 2938.88 / 3895.30 ms. s2 had a backlog at this step, s3 had none. Node 1 was the leader and the
+  nodes were on three devices, so part of this is the layout (see above).
+- Replicated, 512 in flight: `UPDATE` p99 at 2× 51.74 against 104.90 ms (-51%) and at 1× -14%, throughput at 4× +12%
+  (27738 against 24685; both saturated). Against the later s2-era runs of the same step in the table above (28 and 33 ms
+  at 2×, `cd8904b` and `a5b555e`) s3 is slower, so this is a gain only against the suite's own s2.
+- `GET` p50 is 10–21% lower at 1×, 2× and 4× (replicated) and 66% lower at 4× with 2048 in flight.
+- Bulk writes: 218.59 against 183.12 MiB/s on a single node (+19%) and 122.73 against 103.21 MiB/s replicated (+19%),
+  with a lower median (-31% and -19%).
+
+**Regressions above about 10%**:
+
+- **Failover.** Worse than s2 as measured, and the result of the suite to look at first: s2 had 3 seconds with no successful
+  operation and then mostly 8k–24k per second; s3 has two empty seconds, then at most 2306 per second and 7 of the 20
+  seconds after the kill empty, the last two included, with 315695 requests dropped (57272 in s2) and no recovery.
+  Fewer errors counted (1449 against 109757) does not mean better: the writes of the dead leader's connections do not
+  appear as errors in the per-operation rows and their outcome is not reported. The other variable is which node died:
+  node 2 in s2 (on `/var/tmp`), node 1 in s3 (on `/home`, also the leader's disk of `s3-repl`). The likely cause is
+  in the client and the benchmark, a change of behaviour between the suites, not a slower election (see "Reading the
+  saturated steps and the failover" below): as it is, this run no longer measures the cluster's failover.
+- **`--route all` at 2×**: served 21609 against 24505 ops/s (-12%), `UPDATE` p50 4186.11 against 1745.92 ms
+  (+140%), and `GET` p99 128.45 against 7.95 ms (+1516%; p50 4.46 against 1.39 ms, +221%). In s3 the leader was the
+  SATA node 3 by CPU use (5.8 cores), in s2 node 2 (7.8 cores).
+- Replicated `GET` p99 at 1× 2.87 against 1.75 ms (+64%), at 4× 11.68 against 8.81 ms (+33%) and at 8× 12.73 against
+  9.34 ms (+36%); p999 up 51%, 17% and 40%. Also `GET` p99 +18% and p999 +12% at 8× with 2048 in flight. The `GET` p99 at
+  2× is within 8%. The absolute values are 3–13 ms.
+- Replicated `UPDATE` p50 at 1× 4.99 against 4.40 ms (+13%).
+- Bulk writes: p99 +14% replicated (343.04 against 299.78 ms) and p999 +12% single (1396.74 against 1252.35 ms).
+
+Every other cell is within 10%: served ops/s at 1× and 2× in every run, and at 4× single (42440 against 42461).
+
+**Caveats.** One run per cell, on a shared PC (the s2 runs also had other workloads on it at times, s3 had load average
+2.3 at the start and the suite's own load after that). The leader node, and with it its disk (NVMe or SATA), differs
+between the suites, and the s2 and s3 disk layouts probably differ too (see above); s2 itself says results move by
+10–15% with the elected node. Single-run tails at saturation and in the failover are noisy. Treat differences under
+about 15% as noise, and the large ones (single-node tails, failover) as a reason to repeat the run, not as a
+measurement of the code change alone. Node 1 and node 2 were not on the same partition in s3, contrary to what was
+assumed before this analysis (see "Disks" above).
+
+**Reading the saturated steps and the failover.** Two results look like a problem under high load. Both readings
+below come from the code and the logs, without a new run.
+
+- *Multi-second p50 with requests dropped at saturation.* This is the load generator's backlog, as designed, and the
+  server never saw the excess. The client holds at most 512 (or 2048) writes in flight, like Yotsuba's limit, so the
+  cluster is offered no more than that window whatever the planned rate: no step of the six runs without a kill has an
+  error, so no request was refused with `SERVER_OVERLOADED` and the nodes' own admission (16384 requests at once, the
+  byte admission of writes) was never reached. Requests beyond the window wait in the benchmark, up to 100000 of them,
+  and their wait counts from the planned start: the p50 is that queue's length over the served rate (see the top of
+  this section). With the window full a write took about 19 ms at 4× with 512 in flight (512 over about 26.7k
+  writes/s), and `GET`, which has a window of its own, kept a p50 of 0.95–2.88 ms and a p99 of 11.68–22.02 ms in every
+  saturated replicated step. So these numbers say where the capacity ends (between 2× and 4× of the production mean
+  with 512 writes in flight, between 4× and 8× with 2048), not that overload is shed too late. What they do not show
+  is how the nodes behave when the concurrency offered exceeds their own limits (many clients, or windows far larger
+  than 2048): no step of the suite reaches the server's admission, so shedding by the server is covered by tests
+  only, not by a load run. A caller with a bounded window and a queue in front of it, as Yotsuba has, builds the same
+  backlog while the load stays above capacity; bounding that queue, or the wait in it, is the caller's job.
+- *Failover with no recovery.* After the kill the cluster was healthy and idle: node 2 logged `leading term 2`, node 3
+  followed with no lag, and in one 10 s interval node 2 applied 3 entries and served 396 local reads. What stalled was
+  the benchmark. With `--route all` every connection has one address, and a third of them pointed at the dead node. The
+  client's numbered writes (`SessionWrites`, added after s2, in `a1120d2`) are sent again until the caller's deadline,
+  30 s here, where in s2 they failed at once, and a connection with one address has nowhere else to send them. Each of
+  those writes keeps one of the 512 write slots, which all the connections share, until the step ends, so after about
+  1500 writes every slot is held by a write to the dead node and the two live nodes get none. The log fits: the write
+  rows have 0 errors (those writes were still waiting when the step ended, which is also why their outcome is not
+  reported), the successes that remain are about twice the errors second by second (reads, a third of which go to the
+  dead node and fail), and what trickles through are updates whose first call failed `UNAVAILABLE` and gave its slot
+  back (444). In s2 the dead node's share of the requests failed fast and the rest were served. So this is the
+  documented limit of a client pinned to one node ("a dead node takes the clients pinned to it down with it", see
+  "Client failover" below), made worse for a caller with a shared window, since its writes to the dead node now wait
+  for their deadline. A production client lists every node and is not in this case. To measure failover again, the
+  suite's failover run has to use `--route failover` or `--route same-list`: not run yet. Not checked: whether a
+  connection with one address should give up a numbered write sooner when its only node refuses connections (it
+  cannot know that the node will not come back), and what the reads' own retries add to the stall.
+
+**Odd in the s3 logs.**
+
+- Failover: no recovery after the election (above, and "Reading the saturated steps and the failover"). Besides the errors listed there, the client log has 42 lines
+  `gRPC call to ... reached terminal status UNAVAILABLE. No further automatic retry will be attempted` (24 in s2) and, at
+  21:59:50, after the step, `SEVERE: RuntimeException while executing runnable CallbackListener ...
+  RejectedExecutionException` from `ThreadPerTaskExecutor.ensureNotShutdown` (client closing while calls were still
+  completing; it appears at shutdown, so it is probably harmless, but it is a client-side error in the log). Node 2's
+  stderr, after the kill: 52 `Connection refused: /127.0.0.1:32959` stack traces from `GrpcLogAppender` (node 1's port),
+  `Failed appendEntries` repeated about 6 times per 5 s, and at shutdown `leadership transfer to 3 failed`.
+- `s3-repl-2048` 4×: `UPDATE` p999 1087.49 ms and max 2699.3 ms while p99 is 154.88 ms: a tail event in the 30 s
+  step, one run. Leader node 1 used 12.0 cores, the highest of any step.
+- `s3-route-all`: the CPU was on node 3 (5.8 cores) while its device wrote like the others; the step never caught up.
+- Single node 8× has a throughput swing of 41282 to 82865 ok/s from second to second; the bulk single node 14 to 595
+  calls/s.
+- **Disk space alarm on node 1**: `NodeMonitor` logged `ALARM disk-space: 55.4 GiB free of 931.1 GiB` (49.2 GiB at the
+  lowest, in `s3-repl`; 51.1 GiB in `s3-repl-2048`) for node 1's data directory in `s3-repl`, `s3-repl-2048`, `s3-route-all`, `s3-failover` and
+  `s3-bw-repl`: `/home/cavallium` was 95% full. Node 1 was the leader in `s3-repl` and `s3-repl-2048` and the killed node
+  in `s3-failover`. A nearly full NVMe disk can slow writes; this is not measured here.
+- `s3-repl` node 3 logged one `ERROR ... RaftServer$Division - 3@group-...: Failed appendEntries* 1->3 ... HEARTBEAT`
+  (at startup, while the cluster formed). The nodes' only other startup noise is `Connection refused` traces (2 per
+  node in several runs: a peer not yet listening), the JDK's `sun.misc.Unsafe` and incubator-module warnings, and the
+  `java.io.tmpdir` is outside the data directory warning. Snapshots were taken at index about 500k in 2 to 3 runs (114
+  to 138 ms); nothing else warns.
+- The negative `server cores` and `-1` RSS of the killed node in `s3-failover` are the benchmark's marker for a dead
+  process, as in `s2-failover`.
+
 ## Deployment notes
 
 - **Disks.** Every write waits for an fsync of the Raft log on the leader and on one follower. Consumer SSDs
