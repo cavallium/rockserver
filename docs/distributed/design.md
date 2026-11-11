@@ -457,7 +457,11 @@ and the `LogEntry`.
   warns meanwhile. A long commit stall can still fill them with remote attempts that their nodes gave up on (the
   leader cannot know which: the attempt carries no deadline it could check before the append, and the copy may still
   be the one that commits). That is accepted: Ratis then refuses before the append and each proposer resends, a
-  liveness cost while the stall lasts, never a lost or doubled write. Ratis' refusal then (`ResourceUnavailableException`, "Failed to acquire a pending write
+  liveness cost while the stall lasts, never a lost or doubled write. A transaction refused in
+  `preAppendTransaction` (a conflict) gives its permit back itself (R62-3, `RefusedPermits`): Ratis 3.3.1 takes the
+  permit before the append and does not release it when the state machine refuses there, so every conflict took one
+  request and its bytes off these limits until the leader stopped leading, and a leader that had refused 4096
+  commits refused every write of every node from then on. Ratis' refusal then (`ResourceUnavailableException`, "Failed to acquire a pending write
   request") is a refusal before the append, resent like the node's own; Ratis raises the same type after an append
   ("add a pending write request"), an unknown outcome, and only the message tells them apart (Ratis 3.3.1 has no type
   or field for it): `RatisContractTest` pins it, and a changed message falls back to an unknown outcome, the safe
@@ -2560,12 +2564,30 @@ So the per-key lock stays, with pipelined updates as the measured option to shor
   port refuses connections, and a closed division still reports its last leader, which it can no longer follow. So
   the Raft watch thread of `ReplicatedNode` watches the division, and a node whose Raft closed while it was running
   stops like a failed replica: it exits with code 3, with `Raft closed` in its error, so that a supervisor restarts it.
-  Ratis' log worker does the same after a disk error (`hit exception`, then it closes the division). The loop runs
-  every 200 ms, so a graceful stop (a SIGTERM) can come first: `close()` checks the division too, before and after the
-  leadership hand-off, and if Raft closed by itself it stops as the failure's stop, with exit code 3, not 0 (DD-7h).
+  A failed write to the Raft log (a full disk, an I/O error) ends the same way, but Ratis does not close the
+  division for it (R62-2; this paragraph used to say that its log worker does, with `hit exception`, which is what
+  Ratis 3.3.1 does for any other exception). On an `IOException` the thread that writes the log
+  (`SegmentedRaftLogWorker`) fails that task, keeps the error, and fails every later task without touching the disk
+  ("Log already failed at index"). A leader's next append then closes the log while the division stays alive; a
+  follower fails every request that carries entries and stays a member that stores nothing. Ratis tells the state
+  machine only of a failed read. The entries of the failed request also stay in the log's memory, and a follower's
+  answer names its log's next index, not its flush index (read in the 3.3.1 bytecode), so the same entries sent
+  again may be answered as stored although no disk holds them (not reproduced): one more reason to stop soon. So the Raft watch also stops the node, with `the Raft log failed` in its log and `The Raft log of node N
+  failed` in its error, when the log is closed while the division is alive, and when entries wait behind a flush
+  index that stands still while the log's writer thread waits for work, for 3 s (`LogWriterWatch`). The writer is
+  found by its thread name (`<member id>-SegmentedRaftLogWorker`) and counts as waiting for work while it is in
+  `DataBlockingQueue.poll`: a writer on a hung or slow disk is inside the write or the fsync instead, so a hung disk
+  stays what it was (the API pauses, a leader steps down, the node stays up). The loop runs
+  every 200 ms, so a graceful stop (a SIGTERM) can come first: `close()` checks the division and the log too, before
+  and after the leadership hand-off, and if Raft closed by itself or its log failed it stops as the failure's stop,
+  with exit code 3, not 0 (DD-7h).
   It waits for the database first, which Ratis closes on a thread of its own: a JVM that exits during that close does
   not end, because the destructors of RocksDB join background threads that wait for the JVM to detach them (seen in a
-  thread dump, in about 1 run in 10). Its clients then move at once, and it comes back from its disk like any restart. The limit stays at Ratis' 60 s, set
+  thread dump, in about 1 run in 10). Every halt of a node, where the database may be open and writing, ends the
+  process with libc's `_exit` for the same reason (R62-1, `ProcessHalt`): `Runtime.halt` runs libc's `exit` and
+  with it those destructors, and a flush or compaction thread that is inside a call into Java (a merge operator) waits
+  for the safepoint of that very exit, so a halted node stayed for good, with its ports open and nothing behind
+  them, answering neither SIGTERM nor a thread dump. Its clients then move at once, and it comes back from its disk like any restart. The limit stays at Ratis' 60 s, set
   by `--jvm-pause-limit-ms`: a pause that long comes from a machine in trouble (swap, a stuck disk, a stopped VM), and
   a restart is the recovery path that every test covers. Raft stays safe through any pause, so a higher limit is safe
   too: it trades that restart for a node that resumes by itself. Without a supervisor the node stays down until an
@@ -3320,7 +3342,8 @@ safety does not depend on time, so these bounds only decide when a test gives up
 slower, not wrong. Where the claim itself is about time it is stated as one: the availability bound of the random
 fault suites (15 s without an acknowledged write) under the slow, throttled, blackholed and flapping links,
 `MembershipFaultTest`'s 15 s join window, and `LaggingInstallTest`'s 3 minutes for the leader to purge past the
-lagging node. Those are the known risks of flakiness, unverified until the process suites run on the runner; a test
+lagging node. Those are the known risks of flakiness; the process suites ran for the first time in round 62 (on the
+user's machine, not on the runner), and what failed then was not one of these bounds (R62-1 to R62-8); a test
 that turns out flaky gets an event to wait for instead of a longer bound (as `aRemovedNodeDoesNotStartAgain` did).
 Timing is measured with `System.nanoTime`, never the wall clock, so a clock step does not end or extend a wait.
 
@@ -3328,7 +3351,8 @@ Timing is measured with `System.nanoTime`, never the wall clock, so a clock step
 
 The suites above kill and cut at moments the test picks, but a kill there lands at a random point of the protocol.
 `CrashPoints` names the points that matter, and a test can halt a node exactly there: the node prints `CRASH POINT
-<name>` and calls `Runtime.halt` with exit code 99, which skips shutdown hooks, flushes and the leadership hand-off,
+<name>` and ends the process with exit code 99 through libc's `_exit` (`ProcessHalt`, R62-1: `Runtime.halt` did not
+end a node whose database was writing), which skips shutdown hooks, flushes and the leadership hand-off,
 as a SIGKILL at that instruction would. The points are: on the leader, in `preAppendTransaction` before Ratis appends
 a proposal (`BEFORE_APPEND`); a group of committed entries on the apply thread before it is applied (`BEFORE_APPLY`,
 on the leader the entries a majority holds and no client has an answer for); after the group was committed to the
@@ -3345,11 +3369,14 @@ hook: the test cuts the leader's links, lets clients write to it directly, and k
 | Test | What it proves |
 |---|---|
 | `ProtocolPointKillTest` (processes) | Rounds drawn from a seeded generator (`-Drockserver.test.seed`, `-Drockserver.test.protocolKillRounds`, 12 by default): the leader halted before an append, between commit and apply, between apply and replies; any node halted at those points or in the middle of a snapshot; the winner of an election halted as it learns it won (both followers armed, the leader killed). After each round writes resume and the node restarts and catches up; at the end every acknowledged write is readable, no write answered "not applied" took effect, and the replicas are identical. A leader killed with entries in its log that no follower has loses only unacknowledged writes, and drops them from its log when it rejoins: its links are cut, the followers' last entries are read 100 ms later (still of the leader's term, so before any election), and the leader is killed only once its last entry is past both. At the end, with every node stopped, the log files are read (`LogTerms`, as a starting node reads them): wherever two logs hold an index they hold the same term (log matching), and every entry the killed leader had appended past the followers' last one is gone from its log or replaced by a later term (the truncation itself, not only its effect on the data). |
-| `LaggingInstallTest` (processes) | An existing member that lags past what the leader still holds catches up through a snapshot install. With the production settings no node purges past a member that lags (see "Log retention"), so the nodes run with a test-only setting (`rockserver.test.purgeUpToSnapshot`, set through `CrashPointMain`) that purges up to each snapshot. The lagging follower is cut off, and the link heals only once the leader's log, read from its segment files, starts past the follower's last entry. Variants: the lagging member halted after receiving the snapshot (`INSTALL_RECEIVED`) and while restoring it (`INSTALL_RESTORING`) restarts and catches up; the sending leader killed as soon as the lagging member starts receiving files leaves it to the next leader. The test fails if the lagging member caught up without an install. The leader-kill variant stays timed by the receiver's first file, without a crash point in the sender (R3-G4b-3): Ratis' snapshot sender (`GrpcLogAppender` reading the snapshot files) calls nothing of the state machine between the chunks, so a hook there means patching Ratis. What the kill does to the receiver, which is what Rockserver code handles, is pinned exactly by `INSTALL_RECEIVED` and `INSTALL_RESTORING` on the receiving side, and a sender that dies between chunks only breaks the stream, which a receiver sees the same way at any chunk; the timed kill lands somewhere in the transfer, which is the one case left, and prints where. |
+| `LaggingInstallTest` (processes) | An existing member that lags past what the leader still holds catches up through a snapshot install. With the production settings no node purges past a member that lags (see "Log retention"), so the nodes run with a test-only setting (`rockserver.test.purgeUpToSnapshot`, set through `CrashPointMain`) that purges up to each snapshot. The lagging follower is cut off, and the link heals only once the leader's log, read from its segment files, starts past the follower's last entry. The nodes run with log segments of 4 MiB (R62-6): Ratis purges whole closed segments, and the default segment of 64 MiB takes this workload over 3 minutes to fill, so the log started at 0 for the whole wait. Variants: the lagging member halted after receiving the snapshot (`INSTALL_RECEIVED`) and while restoring it (`INSTALL_RESTORING`) restarts and catches up; the sending leader killed as soon as the lagging member starts receiving files leaves it to the next leader. The test fails if the lagging member caught up without an install. The leader-kill variant stays timed by the receiver's first file, without a crash point in the sender (R3-G4b-3): Ratis' snapshot sender (`GrpcLogAppender` reading the snapshot files) calls nothing of the state machine between the chunks, so a hook there means patching Ratis. What the kill does to the receiver, which is what Rockserver code handles, is pinned exactly by `INSTALL_RECEIVED` and `INSTALL_RESTORING` on the receiving side, and a sender that dies between chunks only breaks the stream, which a receiver sees the same way at any chunk; the timed kill lands somewhere in the transfer, which is the one case left, and prints where. |
 | `HungDiskTest` (processes) | R3-G2a-3 (DD-9): the shim's `HANG sync` on the leader and on a follower. The node does not exit, stops listening on its API port once its disk probe has not ended for the request timeout (3 s here), and the other two keep acknowledging writes; a leader on that disk is replaced (its log stops flushing, `LeaderStall`). Once the trigger goes, the node listens again and catches up; every acknowledged write is readable and the replicas are identical. Skipped without `gcc`. Written in round 6 and never run, so it runs only with `-Drockserver.test.hungDisk=true`, not in the nightly job: open are whether a leader whose log fsync hangs steps down within the phase timeout (while it still says it is the leader, `ScenarioSupport.leaderOrNull` sees two leaders and waits; each node's group-info query has a 1 s deadline, so a hung node does not block it), and whether teardown is clean. It joins the nightly job after one passing run on the user's machine. `DiskProbeTest` checks the API pause in process, with a test hook that holds one node's probe (`DiskProbe.HANGS_FOR_TESTING`): that node stops listening, a client given every address goes on writing, and it listens again once the probe ends. |
-| `DiskFaultTest` (processes) | A full disk and failing fsyncs, with the shim above preloaded into every node: ENOSPC on every write, and EIO on every fsync, of the leader and of a follower (and EIO on everything, of a follower). The node stops as a failed replica with exit code 3, the other two keep acknowledging writes, and once the trigger is gone the node starts again (after `repair-log` if Ratis refuses a torn tail of its open segment; safe here, since the write or fsync of that entry failed, so this node never acknowledged it) and catches up; every acknowledged write is readable and the replicas are identical. A write is acknowledged only once a majority fsynced it, so the node whose fsync failed never counted. DD-7h: a follower's disk starts failing right after a SIGCONT, and a SIGTERM follows either as soon as its log shows the failure (`hit exception`, `replica failed to`, `Raft closed`) or after 0-30 ms; whenever the failure showed before the signal the exit code is 3, never the 143 of a graceful stop (the JVM's status after SIGTERM), and at least one round must signal a node that was failing and still alive. A disk error that first shows during a graceful stop (the stop's own flush hits the failed disk) may exit 143: the stop was asked for, nothing acknowledged depends on that flush (an entry is acknowledged only once a majority fsynced it to its Raft log, and the database is rebuilt from the log), and the next start on that disk fails at its first write. Skipped without `gcc`. |
-| `PublicApiRecoveryTest` (processes) | Salvaged from the old public-quorum suite, through the public client (`GrpcConnection` with every node's address, sessions on). RT-70: the client link to the leader drops the reply of `deleteColumnIfExists` and of `uploadMergeOperator`; once applied, another client creates a column of the same name (or uploads another version), then the link is reset, or the leader is SIGKILLed: the client sends the request again under the same id and gets the first answer (`true`, the first version), and the new column stays, so the deletion ran once. The registry deduplicates uploads by content, so a second apply would answer the first version too; the nodes run with the registry's log at info, and no node may log the upload as applied again (`already exists as version`). RT-72: a transaction opened through a follower is refused at commit after its leader's SIGKILL, as safe to run again, its writes stay absent seconds later (never rebased onto the new leader), and the same transaction run again commits. |
-| `MembershipFaultTest` (processes) | Node 4 joins under writes and a node stops during the joint configuration. Halted where it applies the committed joint configuration: the leader (node 4 ends a member), or node 4 (the others complete the change without it, it rejoins after a restart). Killed while the joint configuration is appended and not committed: the old followers are paused before `add-peer` (long election timeouts keep the leader in place), so the leader catches node 4 up and appends the joint configuration, which cannot commit; the leader, or node 4, is killed once its own configuration shows the joint one, then the followers resume. The configuration ends plain, old or new, and node 4 can be added afterwards. The configuration never stays joint, no acknowledged write is lost, all members end identical. |
+| `DiskFaultTest` (processes) | A full disk and failing fsyncs, with the shim above preloaded into every node: ENOSPC on every write, and EIO on every fsync, of the leader and of a follower (and EIO on everything, of a follower). The node stops as a failed replica with exit code 3, the other two keep acknowledging writes, and once the trigger is gone the node starts again (after `repair-log` if Ratis refuses a torn tail of its open segment; safe here, since the write or fsync of that entry failed, so this node never acknowledged it) and catches up; every acknowledged write is readable and the replicas are identical. A write is acknowledged only once a majority fsynced it, so the node whose fsync failed never counted. The node stops because its replica failed to apply, or because its Raft log failed (R62-2: a leader's log is closed by Ratis, a follower's writer fails every task; before the fix 5 of the 6 cases stayed up for the whole minute). DD-7h: a follower's disk starts failing right after a SIGCONT, and a SIGTERM follows either as soon as its log shows the failure (`replica failed to`, `the Raft log failed`, `Raft closed`, `hit exception`) or after 0-30 ms; whenever the failure showed before the signal the exit code is 3, never the 143 of a graceful stop (the JVM's status after SIGTERM), and at least one round must signal a node that was failing and still alive. A disk error that first shows during a graceful stop (the stop's own flush hits the failed disk) may exit 143: the stop was asked for, nothing acknowledged depends on that flush (an entry is acknowledged only once a majority fsynced it to its Raft log, and the database is rebuilt from the log), and the next start on that disk fails at its first write. Skipped without `gcc`. |
+| `RaftLogFailureTest`, `LogWriterWatchTest` | R62-2. In process, three nodes: the next task of one node's log writer fails with an `IOException` (`LogWorkerGate.fail`), under writes through another node. The leader stops within a second (Ratis closed its log) and a follower after the 3 s of `LogWriterWatch`, both with a failure that names the Raft log and exit status 3, and the two others go on (red at `1fc44e1`: both stayed up for the 30 s of the test). `LogWriterWatchTest`: the rule (nothing to flush, a log that flushes, a busy writer starts the time over, the writer is asked only while entries wait behind a standing flush index), and against the Ratis in use that the writer thread is found by its name, waits in `DataBlockingQueue.poll` when idle and does not count as idle while a task of its log runs. |
+| `ProcessHaltTest` (a process) | R62-1. A JVM of its own merges into a RocksDB database with the FFM merge operator from four threads (1 MiB write buffer, so flushes and compactions call the operator in Java all the time) and halts after 3 s as a crash point does. It must be gone within 15 s with the status asked for, 3 times (red at `00afe5b`, 3 of 3: with `Runtime.halt` the process stayed until killed; about 0.3 s with `_exit`). |
+| `RefusedPermitsTest`, `RatisContractTest` (R62-3) | `RefusedPermitsTest`: on one leader, 4296 transactions whose commit conflicts, with a write between each two; every write is accepted, the term is the same at the end, and 4296 permits were given back (red at `45cf7ac`: "the write after 4096 conflicts was not accepted"). `RatisContractTest`, with a limit of one request: stock Ratis refuses the next write after one refusal in `preAppendTransaction` (`aRequestRefusedBeforeTheAppendKeepsItsPendingRequestPermit`: a Ratis that releases the permit fails here, and `RefusedPermits` goes); with `RefusedPermits`, a write is accepted after each of 50 refusals, local and through the client, and the limit still holds exactly one request (`aRefusedRequestGivesItsPermitBackThroughRefusedPermits`); the permit objects left in Ratis' map are removed once two sweeps saw them 60 s apart, 21 of 22 with the last one still in use (`thePermitObjectsOfRefusedRequestsAreRemovedOnceStale`, on a clock of the test's). |
+| `PublicApiRecoveryTest` (processes) | Salvaged from the old public-quorum suite, through the public client (`GrpcConnection` with every node's address, sessions on). RT-70: the client link to the leader drops the reply of `deleteColumnIfExists` and of `uploadMergeOperator`; once applied, and once the link has dropped reply bytes with the call still unanswered, another client creates a column of the same name (or uploads another version), then the link is reset, or the leader is SIGKILLed: the client sends the request again under the same id and gets the first answer (`true`, the first version), and the new column stays, so the deletion ran once. The registry deduplicates uploads by content, so a second apply would answer the first version too; the nodes run with the registry's log at info, and no node may log the upload as applied again (`already exists as version`). RT-72: a transaction opened through a follower is refused at commit after its leader's SIGKILL, as safe to run again, its writes stay absent seconds later (never rebased onto the new leader), and the same transaction run again commits. R62-5: the client's session is opened before the link starts losing replies, by a numbered write that changes nothing; the session opens with the first numbered write, so without that the lost reply was the one of `openClientSession`, the channel moved to a follower after the call's deadline, and the write under test was answered there with nothing of its own lost. |
+| `MembershipFaultTest` (processes) | Node 4 joins under writes and a node stops during the joint configuration. Halted where it applies the committed joint configuration: the leader (node 4 ends a member), or node 4 (the others complete the change without it, it rejoins after a restart). Killed while the joint configuration is appended and not committed: the old followers are cut off from the leader and from node 4 before `add-peer` (long election timeouts keep the leader in place and the followers from an election), so the leader catches node 4 up and appends the joint configuration, which cannot commit; the leader, or node 4, is killed once its own configuration shows the joint one, then the links are healed. Cut off, not paused as the test first did (R62-4): `add-peer` asks the members for their state first and needs the answers of a majority (R3-G2a), over connections of its own that the cut links do not carry. The configuration ends plain, old or new, and node 4 can be added afterwards. The configuration never stays joint, no acknowledged write is lost, all members end identical. |
 | `SlowFollowerDiskTest` (in-process) | One follower's log worker sleeps 180 ms of every 200 ms (`LogWorkerGate.pause`) under 20 s of writes: the leader keeps its term, writes are acknowledged in every second, the follower falls behind (hundreds of entries) and catches up once its disk is fast again. Memory: the nodes use 1 MiB log segments, and the leader's Ratis log cache, read directly, must stay within Ratis' cached-segment limit plus three segments (9 MiB) while the load writes far more (about 200 MiB; the test fails below four times the bound, where the check could not fail). The appender's buffers are not measured. |
 | `LogWorkerGateContractTest` | The Ratis-private members that `LogWorkerGate` uses still exist, and on a real single node a blocked worker holds a write back and a pause delays one: a Ratis upgrade that breaks the gate fails here by name. |
 | `LongStreamSemanticsTest` (in-process) | A range stream outside a transaction is one point-in-time view of the leader's database, taken when its cursor opens: writes acknowledged while it runs (updates, deletes, inserts ahead of the cursor) are not in it, also when a follower forwards the stream. |
@@ -3681,10 +3708,10 @@ install it (`apt-get install gcc libc6-dev`) and run with `-Drockserver.test.req
      stopped (also when the failure's own stop was already closing it, for at most twice the database's 1-minute
      close timeout), so that the JVM does not exit while RocksDB still closes, and halts with 3 if the replica had
      failed meanwhile. A signal that comes after Ratis closed the division by itself (its log worker after a disk
-     error) but before the Raft watch noticed is the failure's stop too: `close()` checks the division. Still
-     open until `DiskFaultTest` runs: `ShutdownSignalTest` checks both in process (a failed apply, and a division
-     closed right before the signal); `DiskFaultTest` sends a real SIGTERM to a node whose disk is failing (written,
-     not run yet: it is a process suite).
+     error) but before the Raft watch noticed is the failure's stop too: `close()` checks the division. `ShutdownSignalTest` checks both in process (a failed apply, and a division
+     closed right before the signal); `DiskFaultTest` sends a real SIGTERM to a node whose disk is failing (run in
+     round 62, see R62-2: Ratis does not close the division after a failed log write, the Raft watch finds the
+     failed log).
    - A SIGTERM during the start of `run` (R28-4): the shutdown hook is registered before `ReplicatedNode.start`, waits
      for the start to end, and stops the node it returned as above; a start that fails (also because the shutdown
      refuses what it registers) closed what it opened, and the hook has nothing to stop. Before, the hook was
@@ -5421,7 +5448,7 @@ install it (`apt-get install gcc libc6-dev`) and run with `-Drockserver.test.req
      with `FAILED`, about 5 s with the cluster's start, the deadline now spent in the pre-read). The two failures:
      `seededClusterServesTheSeedAndANewMemberReceivesItAsASnapshot` (`the cluster was not initialized as seeded`,
      before any `remove-peer`; the same pre-existing failure as in R52's notes, also on the run without the logging
-     change) and `addPeerRefusesANodeWithALogOfItsOwn`, whose wait for node 4 to lead its own group let `leaderOf`'s
+     change; a stale assertion, R62-8) and `addPeerRefusesANodeWithALogOfItsOwn`, whose wait for node 4 to lead its own group let `leaderOf`'s
      `No leader in status` (4 still a FOLLOWER) escape the wait: it failed twice once the nodes logged more, and the
      wait now treats it as "not yet".
    - Review of R59, 4 (nit, argued): the case-variant check looks at voters only, so `remove-peer L1` with a listener
@@ -5662,6 +5689,94 @@ install it (`apt-get install gcc libc6-dev`) and run with `-Drockserver.test.req
      `CommandLineTest.addAndRemovePeerFollowTheLeaderThatIsNotInPeer` counts the line in each of its three
      commands (red at `4f8e9c2`: twice in the removal). Not covered: the shorter wait (it needs a leader named at
      an address that accepts and never answers).
+   - Round 62 ran the whole distributed suite, with the process and fault suites that every round since round 3 had
+     left out for lack of memory. Eight classes failed, the same way alone on an idle machine: `DiskFaultTest`,
+     `MembershipFaultTest`, `LaggingInstallTest`, `ProtocolPointKillTest`, `PublicApiRecoveryTest`, `RandomFaultTest`,
+     `PipelinedRandomFaultTest` and one method of `MembershipTest`. Three product defects (R62-1 to R62-3) and four
+     tests that no longer met the product (R62-4 to R62-6, R62-8); R62-7 was found in the node logs on the way.
+   - R62-1 / HALT-HANGS-WHILE-ROCKSDB-WRITES (high): see "Long pauses" (the halt) and "Targeted faults and component tests". `Runtime.halt` does not end a node whose database is writing: the VM stops the Java threads at
+     a safepoint and calls libc's `exit`, the static destructors of `librocksdbjni` join RocksDB's background threads
+     (`ThreadPoolImpl::JoinThreads`), and a flush or compaction thread that is inside a call into Java (the FFM merge
+     operator: `UpcallLinker::on_entry`) blocks on that safepoint (both stacks seen with gdb on a hung node). The
+     process stays for good, with its ports open, and answers neither SIGTERM nor `jstack`. That was every halt: the
+     crash points of the tests ("Node N is still running after PT1M30S", "no follower won the election": the follower
+     that won had printed `CRASH POINT ELECTED` and never went away), and in production the halt after a failure that
+     raced a signal and the halt of the direct memory watch, which runs with the database open. Fix: `ProcessHalt`
+     calls libc's `_exit` through FFM, which runs no exit handler and no destructor; the call is linked when the node
+     starts (a warning if it cannot be: then `Runtime.halt` as before). Used by `CrashPoints.halt`,
+     `ReplicatedServerMain.halter` and the direct memory watch. What `_exit` skips beside the destructors: the JVM's
+     own exit work (it leaves `hsperfdata_<pid>` behind, which `jps` cleans), nothing of Rockserver. Not changed: a
+     normal exit (status 0, and the `System.exit` of a failed node, which runs the shutdown hook and so the halt
+     above) still goes through `exit` after the database closed, which `awaitDatabaseClosed` waits for. Tests:
+     `ProcessHaltTest` (red at `00afe5b`, 3 of 3), and the halting process suites.
+   - R62-2 / RAFT-LOG-FAILURE-LEAVES-THE-NODE-UP (high): see "Long pauses" (the paragraph on a failed write to the
+     Raft log). The design said that Ratis' log worker closes the division after a disk error. Ratis 3.3.1 does that
+     for any exception but an `IOException`; for that one (ENOSPC, EIO) the worker only fails the task and every
+     later one (checked in the bytecode of `SegmentedRaftLogWorker.run`). `DiskFaultTest`, 5 of 6: a leader stayed up
+     with a closed log, and the Raft watch threw on every check (`SegmentedRaftLog is expected to be opened but it is
+     CLOSED`, logged as "failed to check Raft, retrying"); a follower stayed up failing every request with entries,
+     with the disk probe's warning once a second. Fix: `ReplicatedNode.watchRaft` stops the node when the log is
+     closed while the division is alive, and when `LogWriterWatch` finds, for 3 s, entries behind a standing flush
+     index and the writer thread waiting for work; `close()` takes both for the failure's stop (exit 3 also when a
+     SIGTERM comes first). The rule reads two names of Ratis, the writer's thread name and the method it waits in,
+     which `LogWriterWatchTest` pins against the Ratis in use; a writer that is not found never counts as idle, so a
+     rename costs the detection, not a healthy node. The disk probe is not part of the rule: on a full disk it
+     rewrites a block it already has and succeeds. Tests: `RaftLogFailureTest` (red at `1fc44e1`, both roles),
+     `LogWriterWatchTest`, `DiskFaultTest`.
+   - R62-3 / PENDING-PERMIT-LEAK-ON-CONFLICT (high): see "Writes, exactly once" (the pending-request limits). Ratis
+     3.3.1's `RaftServerImpl.appendTransaction` takes a permit from the leader's pending-request limits and then
+     appends; when `preAppendTransaction` throws, its handler answers the client and returns without the permit
+     (bytecode: the handler of `StateMachineException` around `ServerState.appendLog`; only `addPendingRequest` hands
+     the permit on). Every commit that conflicts is refused there, so every conflict took one request and its bytes
+     off the limits for the rest of the term. 9d609b0 (the runtime branch of the rewrite) lowered the limits from
+     65536 requests to Ratis' default 4096, which a workload with conflicts uses up in minutes: the leader then
+     refused every write of every node ("Failed to acquire a pending write request"), the proposers resent until
+     their callers' deadlines, and only a new leader ended it. `RandomFaultTest` (`READ_DEADLINE_EXCEEDED` on its
+     final read for a minute) and `PipelinedRandomFaultTest` ("No update chained in the PT30S after a fault") failed
+     on that since; found by a bisect of the latter over the merges. Fix: `RefusedPermits.release`, called by
+     `preAppendTransaction` for any refusal, does what Ratis' `RequestMap.remove` does (the request's bytes off the
+     count, one request and the megabytes no longer needed released), by reflection on Ratis-private members
+     resolved at class load (an error is logged once if they are missing, and nothing is released). The permit
+     object itself cannot be told from those of threads that are between taking a permit and the server's monitor, so
+     it is removed from Ratis' map later, once two sweeps 60 s apart found it there (a thread needs microseconds from
+     one to the other; a permit removed under a thread that did take a minute would cost that one request a refusal
+     after its append, which the proposer already treats as an unknown outcome). The limits stay at 4096 and 32 MiB
+     per node. Considered and not done: raising the limits (the leak stays, only later); checking conflicts before
+     the proposal (not in log order, so the check in `preAppendTransaction` stays and still leaks); appending the
+     refused commit as an entry that every replica skips (followers cannot tell, the decision is the leader's);
+     a patched Ratis (this tree runs the released jar). Tests: `RefusedPermitsTest` (red at `45cf7ac`, at the 4097th
+     write), three in `RatisContractTest`, and the two random-fault suites.
+   - R62-4 / TEST-JOINT-HOLD-PAUSED-FOLLOWERS (test only): `MembershipFaultTest`'s two "appended but not committed"
+     cases paused both old followers before `add-peer`, written (dcefba9) on another branch than the rule that
+     `add-peer` proposes nothing until a majority of the members answered its state query (28e107f, R3-G2a, see
+     "Membership"): with one of three answering, the command waited out its timeout and the joint configuration was
+     never proposed. The rule is the intended behaviour: a change is not started on a cluster whose majority cannot be
+     asked. The test now cuts the followers off from the leader and node 4 (`Network.partition`), which the command's
+     own connections do not use, and heals the links where it resumed the followers; it also checks that no old
+     follower received the joint configuration.
+   - R62-5 / TEST-LOST-REPLY-WAS-THE-SESSION-OPEN (test only): `PublicApiRecoveryTest`'s lost-reply tests predate
+     client sessions (a1120d2): the first numbered write opens the session, so the first message through the lossy
+     link was `openClientSession`. Its reply was lost, the call ended at its 10 s deadline, the channel moved to a
+     follower, and the deletion ran there and was answered: "the reply was not lost". Opening a session lazily is the
+     intended behaviour ("Client sessions"). The tests now open the session first with a deletion of a name that
+     does not exist, wait up to 10 s for the link to drop reply bytes (the other client sees the write applied a
+     moment before the leader's reply reaches the link), and require the call to be unanswered then; the upload
+     test, which asserted no lost reply at all, does the same.
+   - R62-6 / TEST-NO-CLOSED-SEGMENT-TO-PURGE (test only): `LaggingInstallTest` waited 3 minutes for the leader's log
+     to start past the lagging node's last entry, with the default segment size of 64 MiB: Ratis purges whole closed
+     segments, and the workload needs longer than that to fill one. The snapshots advanced meanwhile, so the purge
+     itself works (see "Log retention"). The nodes now run with `--log-segment-bytes` of 4 MiB. The bound of 3
+     minutes is unchanged.
+   - R62-7 / LATE-READ-DEADLINE-LOG-NPE (low, core): `GrpcRequestErrors` claims the log line of a late
+     `READ_DEADLINE_EXCEEDED` failure at most once a minute; the claim answers null for a suppressed line, and the
+     conditional it stood in had a primitive `0L` on its other side, so the null was unboxed: a
+     `NullPointerException` on a gRPC thread for every such failure after the first of a minute (in the node logs of
+     `RandomFaultTest`). The other side is boxed now. No test of its own: the class is private to the core's server
+     package, which the core's test module cannot open.
+   - R62-8 / TEST-SEEDED-LINE (test only): `MembershipTest.seededClusterServesTheSeedAndANewMemberReceivesItAsASnapshot`
+     looked for `(seeded: true)` in the leader's output; the line has gone on with the seed's digest since R3-G2b
+     (c059654): `(seeded: true, seed digest ...)`. The cluster was seeded all along; the test reads the line as it
+     is.
    - Review of R46, 1 (low, docs): the R46-2 recipe ran `dependency:build-classpath` on `distributed/server/pom.xml`
      alone, so Maven resolved `rockserver-core:${revision}` and that version's pom from `~/.m2` (or the snapshot
      repository): `grep -v /rockserver-core/` dropped the jar but kept the third-party jars of that pom, from whichever
@@ -5689,7 +5804,7 @@ install it (`apt-get install gcc libc6-dev`) and run with `-Drockserver.test.req
      throwaway single node on loopback ports, stopped once leader (2133 Ratis, 79 RocksDB, 154 gRPC, 463 Netty
      classes loaded here).
    - The exit status after a start is the same on both paths (R6-2): the main thread's exit is a `System.exit`,
-     which runs the shutdown hook, and the hook ends with `Runtime.halt`. The hook used to halt with 3 for any
+     which runs the shutdown hook, and the hook ends with a halt (`ProcessHalt`, libc's `_exit` since R62-1). The hook used to halt with 3 for any
      failure, which replaced the 4 of a node that found out, while it waited outside the cluster, that it was
      removed, and the 5 of a replica that met a newer cluster version in its log or in an installed snapshot, so
      `RestartPreventExitStatus=4 5` never saw them after a start. Both now take the status from the failure that
@@ -5756,6 +5871,16 @@ install it (`apt-get install gcc libc6-dev`) and run with `-Drockserver.test.req
      one after the other on the division's own transitions, never two of one name at once; `GrpcServerProtocolClient`
      (the leader's channel to a follower) has no metric interceptor. The `admin` command's `RaftClient` builds its
      proxies once, in a process of its own: a broken proxy there fails the command, which is run again.
+   - `RaftServerImpl.appendTransaction` keeps the pending-request permit of a request whose
+     `preAppendTransaction` throws (R62-3): the leader loses one request and its bytes of
+     `raft.server.write.element-limit` and `byte-limit` per refusal, until it steps down. Worked around by
+     `RefusedPermits`; `RatisContractTest.aRequestRefusedBeforeTheAppendKeepsItsPendingRequestPermit` pins it. If
+     filed, one line: "release the permit in the catch of StateMachineException around state.appendLog."
+   - `SegmentedRaftLogWorker.run` answers an `IOException` of a write or an fsync by failing that task and every
+     later one, and neither closes the division nor tells the state machine (R62-2): a follower stays a member that
+     can store nothing, and may answer entries of the failed request, sent again, as stored. Worked around by
+     `LogWriterWatch`. If filed, one line: "close the division (as for any other exception) or call
+     notifyLogFailed when a log I/O task fails."
    - The two `ResourceUnavailableException`s of the pending-request limit (before and after the append) differ only
      by their message: a typed refusal before the append would let `Proposer` stop matching text.
    - The retry cache has an expiry but no size bound (`RaftServerConfigKeys.RetryCache`): a bound in entries or
