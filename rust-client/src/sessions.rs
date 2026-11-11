@@ -770,6 +770,35 @@ mod tests {
         assert_eq!(sent.lock().unwrap().len(), 2);
     }
 
+    /// R61-10: an answer the client's own decoder refuses (a message over its limit: an untyped `OUT_OF_RANGE`) is
+    /// not an answer of the server about the write, which was sent and may well have been applied: the outcome is
+    /// unknown. It ends the write at once: every copy would get the same answer, as large.
+    #[tokio::test]
+    async fn an_answer_the_decoder_refuses_ends_the_write_as_outcome_unknown() {
+        let too_large = || {
+            Status::out_of_range(
+                "Error, decoded message length too large: found 70000000 bytes, the limit is: 67108864 bytes",
+            )
+        };
+        assert!(is_outcome_unknown(&too_large()));
+        // A typed failure of the server is its answer, whatever its code.
+        assert!(!is_outcome_unknown(&rocks(Code::OutOfRange, "INVALID_REQUEST", false)));
+        let writes = SessionWrites::new(true);
+        let copies = Arc::new(AtomicUsize::new(0));
+        let counted = copies.clone();
+        let error = writes
+            .run(soon(5_000), true, fixed_opener(1), move |_, _| {
+                counted.fetch_add(1, Ordering::SeqCst);
+                std::future::ready(Err::<(), _>(too_large()))
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(rocksdb_error_type(&error), Some("OUTCOME_UNKNOWN"), "{error:?}");
+        assert!(!is_not_applied(&error));
+        assert!(error.message().contains("too large"), "{error:?}");
+        assert_eq!(copies.load(Ordering::SeqCst), 1, "no copy is sent after it");
+    }
+
     #[tokio::test]
     async fn the_deadline_ends_an_unknown_write_as_outcome_unknown() {
         let writes = SessionWrites::new(true);
