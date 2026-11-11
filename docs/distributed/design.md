@@ -613,7 +613,19 @@ sessions, as in the Raft dissertation (section 6.3), the way etcd and TiKV dedup
   if an item after the end may take bytes). A write that does
   not fit is refused as `SERVER_OVERLOADED` with the not-applied flag, at once, without reading the rest of its
   stream; the caller knows it can send it again, as after a full admission (a client resends it under the same
-  number only when an earlier copy may have applied) (`NumberedWritesTest.numberedStreamedMultiWritesTakeTheServersCollectBudget`, with a 64 KiB budget). Before
+  number only when an earlier copy may have applied) (`NumberedWritesTest.numberedStreamedMultiWritesTakeTheServersCollectBudget`, with a 64 KiB budget).
+  A client that goes silent in the middle of its stream without closing its connection (power loss, a cut link)
+  would keep what it took until the transport noticed, and sixteen such streams of 4 MiB fill the budget: so a
+  collection that gets no item for `rockserver.grpc.numbered-multi-collect-idle-ms` (30 s by default, 0 for no
+  limit; the clients read their input whole before they send a numbered multi write, so their items arrive
+  together) ends as a cancel does, gives its bytes back, and the call fails `READ_DEADLINE_EXCEEDED` flagged not
+  applied, since nothing of a collected write is applied before its last item (R61-5; one periodic check per
+  collection at a quarter of the limit, so it ends between the limit and 1.25 times it;
+  `NumberedCollectIdleTest`). A replicated node exports the bytes taken as the gauge `api.multi_collect.bytes`.
+  The server can also ping its client connections
+  (`it.cavallium.rockserver.grpc.server.keep-alive-time-ms`, with `keep-alive-timeout-ms`, 20 s by default), which
+  ends every call of a vanished client and not only its collections; it is off by default (gRPC's own server
+  default pings after two hours), because it also closes the connection of a client frozen for that long. Before
   this, collecting counted only key and value bytes, up to 2^20 items, with no bound on how many streams were
   collected at once: a few million-item `deleteMulti` calls could hold gigabytes before admission refused them. The collected path also maps
   each result before streaming it, so a missing previous value (null) no longer fails the call
@@ -621,7 +633,15 @@ sessions, as in the Raft dissertation (section 6.3), the way etcd and TiKV dedup
   The Java client numbers a streamed `putMulti`, `deleteMulti` or `mergeMulti` only up to
   `SessionWrites.NUMBERED_MULTI_MAX_BYTES` (4 MiB counted as the server counts it, a quarter of its limit, as the Rust
   client does); a larger one is sent unnumbered, streamed and applied item by item as before numbering, once (a lost
-  call leaves its outcome unknown). It used to number every one, so a BATCH or INGEST call over 16 MiB counted (or
+  call leaves its outcome unknown). Each item of such a call is a write of its own, so the call can fail after some
+  of them were applied. A failure flagged not applied is then true for the item that met it only (a replicated node
+  that refused that item's proposal, a deadline that came before its dispatch), not for the call: once an item was
+  applied, the server ends the call with `INVALID_REQUEST` "partly applied" and the count of applied items, not
+  flagged, as a partly applied batch (R61-1, `GrpcServerImpl.AppliedItems`, on the seven item-by-item paths:
+  `putMulti`, `putMultiEnsure` in groups of 4096, the `putMulti` variants with results, `deleteMulti` with and
+  without results, `mergeMulti`, `mergeMultiGetMerged`). Before, it ended with `rockserver-applied: no`, which told
+  the caller that the whole stream could be sent again. A failure before any item was applied keeps its type and
+  its flag, and a failure that is not flagged passes unchanged (it already reads as "maybe"). It used to number every one, so a BATCH or INGEST call over 16 MiB counted (or
   about 150 000 items) that was applied before numbering was refused as invalid with nothing applied (R6-3). A
   `putMulti` without results that goes as one unary `putMultiList` (at most 65 536 items and 8 MiB) is not collected
   by the server and stays numbered. Splitting a large call into numbered chunks was not done, for the reasons given
@@ -778,7 +798,8 @@ sessions, as in the Raft dissertation (section 6.3), the way etcd and TiKV dedup
   `OUTCOME_UNKNOWN` only when the deadline ended the copies without an
   answer. Only a `getForUpdate` that opens an update (no transaction id) makes its id one whose write is numbered.
   Closing the connection ends the writes waiting for a resend: `OUTCOME_UNKNOWN` if a copy was sent, else
-  `SERVER_OVERLOADED` flagged not applied. From the moment `close()` begins, before the channel's graceful shutdown
+  `CLIENT_CLOSED` flagged not applied (`SERVER_OVERLOADED` before R61-7: an overload is a state of the server that
+  callers wait out, some without bound, and a closed client never sends). From the moment `close()` begins, before the channel's graceful shutdown
   (which can wait a minute for the calls on it), no copy is sent: a write started meanwhile fails flagged not applied,
   a resend ends its write as at the close, and the copies already in flight keep their answers (R50-3; it used to be
   sent to the shutting-down channel, whose local `UNAVAILABLE` read as a lost call, and ended `OUTCOME_UNKNOWN`).
@@ -798,7 +819,8 @@ sessions, as in the Raft dissertation (section 6.3), the way etcd and TiKV dedup
   (`ClientBuilder.setDeferred(true)`, Yotsuba's default, which connects at the first call) keeps this: until the
   connection exists a cancel stops the wait for it and nothing is sent; after, the cancel is the call's own and its
   future ends as the call does (R47-2). A call that fails before the connection exists was never sent and says so:
-  the deadline that came while connecting is a `READ_DEADLINE_EXCEEDED` and a closed client a `SERVER_OVERLOADED`,
+  the deadline that came while connecting is a `READ_DEADLINE_EXCEEDED` and a closed client a `CLIENT_CLOSED`
+  (R61-7; `SERVER_OVERLOADED` before, which Yotsuba's message writes and `closeFailedUpdate` resend without bound),
   both flagged not applied, as the direct client's expired deadline and closed connection are (R48-4); a failure to
   connect (the factory, the handshake) keeps its own exception, a transport failure callers classify by its gRPC
   status. `ensureMergeOperatorAsync`, a check and then, if the operator is missing, an upload (numbered with
@@ -893,7 +915,13 @@ sessions, as in the Raft dissertation (section 6.3), the way etcd and TiKV dedup
   deadline plus `COPY_ANSWER_MARGIN` (1 s, left to the transport's or the server's own answer at the deadline, which
   may say not applied), then ends `OUTCOME_UNKNOWN` (R60-5,
   `a_numbered_multi_write_with_results_ends_by_its_deadline_when_the_node_stalls_after_the_headers`: hung before,
-  against a server that answers the headers and then sends nothing). A caller
+  against a server that answers the headers and then sends nothing). The client decodes answers of up to 64 MiB
+  (`MAX_DECODING_MESSAGE_SIZE`, the Java client's default; `with_max_decoding_message_size` gives a view with
+  another limit), not tonic's 4 MiB, which failed a `get` of a larger value and the answer of a numbered write with
+  a larger result (R61-10). An answer over the limit is an `OUT_OF_RANGE` of the client's own decoder, without a
+  Rockserver type: `is_outcome_unknown` counts it, and a numbered write ends `OUTCOME_UNKNOWN` at once, without
+  another copy, which would get the same answer (the write reached the server and was answered, so it was probably
+  applied; only its result is lost). A caller
   without a deadline sends each copy and each session opening with no gRPC timeout, so that the server still sees a
   caller without one, and awaits it under a local `tokio::time::timeout_at` of its window (R19-1). Before, nothing
   else ended such a copy: a silent node (power loss, SIGSTOP, a partition with the host still up) held the write, and
@@ -2919,6 +2947,9 @@ not written by the InfluxDB registry, and `rockserver-snapshot-old` never fired 
 `disk.data.*` and `disk.raft.*` (usable and total bytes, usable percent), `replica.failed` and `membership.state` (0 a
 member, 1 never added, 2 outside and undecided, 3 removed: see "Removal and waiting outside"), and
 `monitor.refresh_age_seconds`; and from `ReplicaOps`, `cluster.version` and the last checksum matched or mismatched.
+`ReplicatedNode` exports `api.multi_collect.bytes`, what the numbered streamed multi writes being collected hold of
+the API server's collect budget (R61-5; no alert reads it: a budget that stays full shows as `SERVER_OVERLOADED`
+answers to such writes).
 A refresh lists, sizes and stats files, reads free space and reads Ratis' log under its read lock, so on a hung disk
 the monitor thread waits for good: every gauge it sets then keeps its last value, which looks healthy (lags of 0, a
 recent snapshot, free space). The metrics keep refreshing only while the disk answers. `monitor.refresh_age_seconds`,
@@ -3067,6 +3098,10 @@ failover" below).
 | `ApplierTest` | At-most-once retries, including after a restart; deletion of records, by count, by bytes and at start; results too large for a reply; rejections; atomic commits; detection of column id divergence; batches with duplicates and rejections; groups of entries, with copies and rejections in them; crash consistency of applies without the WAL, and of groups; a logged raise of the cluster version to a capability the node lacks stops the replica (`NewerVersionException` in the failure) and leaves the version and the position; genesis makes the version known before the cluster id (R16b-1); genesis writes the frozen version 0x1F and not what the applying node supports (R17-1; it pins the literal and does not reproduce a newer node, since the old code never asked `supported()`: it passes at `b3df680`, and fails there only with one more bit in `SUPPORTED`, 31 expected, 63 written; R17 review, finding 3). |
 | `SessionApplierTest` | Client sessions at apply: a write resent through other proposers, alone or in an entry with other sessions' writes, takes effect once, also after a restart; the session's floor refuses late copies; unknown and expired sessions are rejected and not recorded, a leader clock behind does not revive them, and expired sessions are deleted; a leader whose wall clock is a year ahead, or jumps within its term, expires nothing (`LeaderClock`); two replicas, one restarting midway, give the same results. |
 | `SessionWritesTest` (core) | The client's numbering: which writes are numbered (staged writes not, schema changes, `deleteRange` and batches yes, multi writes over 4 MiB counted not), update ids forgotten once the update ended, also by an unnumbered multi write that ends one; a first copy refused by an expired session re-issued under a new one, a later copy so refused ending unknown (also when that copy is flagged not applied), sessions that keep expiring ending at the deadline, flagged not applied; opening retried after an unknown outcome, and again by a write that waited on another write's opening, also when that opening ended "not applied" at the opener's deadline or overloaded; batches unnumbered when the server does not advertise `numberedBatches`; batches sent as numbered chunks in order, a chunk resent with its number, a later chunk's failure reported as partly applied; closing ends waiting writes; each answer of a copy (value, recorded failure, overload, flagged deadline: ends; unknown, then "not applied": same number again; a sender that throws: lost copy); a deadline without the "not applied" flag, gRPC's own included, on a first or a resent copy, ends unknown, whatever its message; a cancel after a copy was sent ends unknown and stops the resends and the copy in flight, before one was sent cancels it unsent, also for a batch (a batch whose chunk only waits for its session counts as unsent); a synchronous wait is bounded, unbounded without a deadline, and never overflows; the client's own expired-deadline check on a first copy ends "not applied"; past 65,536 open updates the oldest is forgotten and counted; a Reactor caller (`Mono.fromFuture`) that disposes its subscription or times out stops the resends and cancels the copy in flight. R26-3: a write that got no session (gRPC's deadline on every opening, a refusal, an opening of unknown outcome) ends flagged not applied, and nothing is sent (`aWriteThatGotNoSessionEndsNotApplied`, unflagged at `31e06ad`). R26-4: for a caller without a deadline, a session that opens after the window sends no copy and the write ends flagged not applied, `SERVER_OVERLOADED` at the window since R27-3 (`READ_DEADLINE_EXCEEDED` before) (`aSessionOpenedAfterTheWindowSendsNoCopyForACallerWithoutDeadline`, the copy was sent at `31e06ad`; since the R26 review the late session is opened by a caller with a deadline, which the window's timer on an opening does not end). R26 review: a write ended by close before it was sent, waiting between openings or sent on a closed connection, is flagged not applied (`aWriteEndedByCloseBeforeItWasSentIsNotApplied`); no session is opened after the deadline (`noSessionIsOpenedOnceTheDeadlineHasPassed`); an opening that never answers ends a caller without a deadline, and one waiting for the same opening, `SERVER_OVERLOADED` flagged at the window (`anOpeningThatNeverAnswersEndsACallerWithoutDeadlineUnsentAtTheWindow`). R27-3: a write joined to another write's opening ends at its own deadline, `SERVER_OVERLOADED` flagged, while the opener goes on (`aWriteJoiningAnOpeningEndsAtItsOwnDeadlineNotApplied`), also when it is re-issued after `SESSION_EXPIRED` (`aWriteReissuedAfterAnExpiredSessionThatJoinsAnOpeningEndsAtItsOwnDeadlineNotApplied`); a synchronous wait that cancels a numbered write before a copy was sent throws `READ_DEADLINE_EXCEEDED` flagged not applied, a plain future stays unflagged (`aSynchronousWaitThatEndsBeforeACopyWasSentIsNotApplied`). R28-6: a write cancelled while the opening it waits for completes, at the moment it is numbered, leaves no number behind: the write still in flight keeps `completedBelow` at its number, and once every write ended `completedBelow` reaches the next sequence (`aWriteCancelledWhileItIsNumberedLeavesNoNumberBehind`, the test holds the session's lock; at `f00426b` `completedBelow` was 1 with number 0 in flight). R28-7: a write that waited for an opening is collectable once it ended, not held by its deadline timer (`aWriteThatWaitedForAnOpeningIsNotHeldUntilItsDeadline`, held at `f00426b`). R58-1: a write whose context carries a request id is not numbered again (`aWriteWhoseContextCarriesARequestIdIsNotNumberedAgain`). |
+| `StreamedMultiPartlyAppliedTest` (core) | R61-1, over a real gRPC server with a backend that applies the first write and refuses the next ones flagged not applied (as a replicated node's proposer does): each of the seven item-by-item streamed multi paths (`putMultiEnsure` with a second group of 4096) ends `INVALID_ARGUMENT` "partly applied" with `rockserver-applied: maybe` and one write applied (red at `eee0dff`: `RESOURCE_EXHAUSTED` with `no`); a refusal of the first item keeps `RESOURCE_EXHAUSTED` and `no`; a deadline that passes while the first item is applied is not flagged (the streaming scheduler ends it first, unflagged, before and after the fix). |
+| `NumberedCollectIdleTest` (core) | R61-5, over a real gRPC server: a numbered `putMulti` that sends two items and goes silent holds bytes of the collect budget (`GrpcServer.numberedMultiCollectBytes`), ends `DEADLINE_EXCEEDED` with `rockserver-applied: no` once the idle limit (400 ms here) passed, gives its bytes back and applies nothing; a stream whose items arrive 150 ms apart for over a second is collected and applied (red at `3f9382d`: the accessor did not exist, and nothing ended the collection). With the server keepalive set to 300 ms, a live client keeps a stream open across several pings. `CollectHoldTest` passes the new idle argument. `NumberedWritesTest.numberedStreamedMultiWritesTakeTheServersCollectBudget` also reads the exported `api.multi_collect.bytes` of every node (0 once the collections ended; added with the fix). |
+| `DeferredRockserverConnectionTest`, `SessionWritesTest`, `GrpcConnectionCloseNumberedWriteTest` (core) | R61-7: a call on a closed deferred client (a single call, a stream, a WAL flush, a session opening, the synchronous API, and a call pending when the client closes), a numbered write ended by the close before it was sent, one sent on a closed `SessionWrites`, and one started while `GrpcConnection.close()` waits, all end `CLIENT_CLOSED` flagged not applied (red at `375bbbd`: `SERVER_OVERLOADED`). |
+| Rust unit tests (`cargo test`), `tests/live_server.rs` | R61-10: against an in-process tonic server that answers `putMultiGetPrevious` with one result of 5 MiB, a numbered and an unnumbered call both read it (`an_answer_over_tonics_four_mebibytes_is_read`; red at `f0017fc`: `OUT_OF_RANGE ... the limit is: 4194304 bytes`); an untyped `OUT_OF_RANGE` is an unknown outcome and ends `SessionWrites::run` as `OUTCOME_UNKNOWN` after one copy, while a typed failure with that code is not (`an_answer_the_decoder_refuses_ends_the_write_as_outcome_unknown`). Live (`RustClientLiveTest`): a `get` of a 5 MiB value and the 5 MiB previous value of a numbered `put_get_previous` (fails with the limit set back to 4 MiB). |
 | `ConfigPrinterSecretsTest` (core) | R60-1: the configuration each database open logs prints the InfluxDB token and user and the user info of its URL as `<redacted>`, the URL's host, port and path, the bucket and the org as they are; empty values print as they are (`theInfluxCredentialsAreNotPrinted`, red before: all three printed; `emptyCredentialsPrintAsTheyAre`). |
 | `GrpcProxyCallerRequestIdTest` (core) | R58-1: a `GrpcServer` over a `GrpcConnection` to a fake upstream that offers sessions and applies each request id once forwards two copies of a merge numbered (42, 7) by the downstream client with that id, applied once, and still numbers an unnumbered merge in its own session (red at `7dda2ad`: (5, 0) and (5, 1), applied twice). Review of R58, 2: the same with INGEST, no timeout and no stub deadline (`aProxyPassesTheRequestIdOfACallerWithNoTimeoutThrough`, red at `91677ce`: (5, 0) and (5, 1)). |
 | `ClientSessionTest` (in-process) | A merge and a transaction commit whose leader dies after its followers applied them and before it answered: the client sends them again with their request ids through the next node, the merge applies once and the commit answers `true` from its record. Copies of a commit and of the write that ends an update answer "unknown" while the first is in flight, then from the record. Copies of a numbered `mergeBatch` chunk, `deleteColumnIfExists`, `deleteColumn` and `deleteRange` take effect once; a numbered batch of two chunks is refused with nothing applied; the client library sends batches as numbered chunks over gRPC, a three-chunk batch of items that fill a chunk to the byte taking exactly one number per chunk (the client's and the server's split agree after encoding); a client batch whose leader dies after committing its first chunk, unanswered, resends that chunk with its number and every key is merged exactly once. |
@@ -5409,6 +5444,57 @@ install it (`apt-get install gcc libc6-dev`) and run with `-Drockserver.test.req
      `rockserver-snapshot-old` fires a day after a start, leaving out the rule's other condition (a Raft log over
      8 GiB, `$B > 86400 && $E > 8589934592`), which the alert table and the rule's summary state. It now says "a day
      after a start too, with a log over 8 GiB". Docs only.
+   - R61-1 / STREAMED-MULTI-PARTLY-APPLIED-FLAGGED-NOT-APPLIED (medium): see "Streamed multi writes under a
+     number". A streamed multi write that the server applies item by item (no request id, outside LATENCY: what both
+     clients send for a multi write over 4 MiB, with sessions off, or to a server without them) ended with the
+     `rockserver-applied: no` trailer when an item after the first was refused flagged not applied, although the
+     earlier items were applied. `GrpcServerImpl.AppliedItems` counts the items applied on each of the seven paths
+     and maps such a failure to `INVALID_REQUEST` "partly applied", not flagged, as `ReplicatedWrites.batch` and the
+     client's numbered batches do. Only flagged failures are mapped: an unflagged one already reads as "maybe", and
+     keeps its type. The new message names the type of the item's failure and not its text, because that text says
+     "not applied" and a client older than the trailer reads the flag from the text. Of the two routes in the
+     finding, the refusal of one item's proposal on a replicated node is the one a test reaches; the deadline route
+     (`GrpcRequestContexts.remainingContext`) needs the deadline to pass between the streaming scheduler's own
+     check, which ends the stream first with an unflagged "Workload deadline expired while streaming", and the
+     dispatch of the next item: the test of that case ends unflagged before and after the fix. Test:
+     `StreamedMultiPartlyAppliedTest` (red at `eee0dff`). Not covered: a real replicated node refusing the second
+     item (the backend of the test refuses it as a proposer would), and an item whose own outcome is unknown, which
+     was and stays unflagged.
+   - R61-5 / OVERLOAD-COLLECT-BUDGET-PINNED-BY-SILENT-CLIENT (low): see the same section. A collection without a new
+     item for `rockserver.grpc.numbered-multi-collect-idle-ms` (30 s) ends flagged not applied and gives its bytes
+     back; the gauge `api.multi_collect.bytes` shows the budget in use on a replicated node (the only server whose
+     clients number their writes; `GrpcServer.numberedMultiCollectBytes` for others). Considered: Reactor's
+     `timeout` per item (a timer armed for each of up to 150 000 items; the check here is one periodic task per
+     collection); a default-on server keepalive, the other half of the finding's direction. The keepalive is there
+     (`it.cavallium.rockserver.grpc.server.keep-alive-time-ms`) but off by default: it changes when every client
+     connection is closed, a frozen client's included, and only a run with a real silent peer can show its effect
+     (needs-user: "netem and link-fault runs"); the idle limit alone bounds the budget. Tests:
+     `NumberedCollectIdleTest` (red at `3f9382d`), `CollectHoldTest`, `NumberedWritesTest` for the gauge
+     (added with the fix, not red-first). Not covered: a real silent peer; the keepalive closing a connection.
+   - R61-7 / YOTSUBA-CLOSED-CLIENT-RETRIED-FOREVER (low): see "Client sessions". Fixed in Rockserver, not in
+     Yotsuba: the failure of a call that a closed client never sent has the new type `CLIENT_CLOSED`
+     (`RocksDBException.RocksDBErrorType`, Thrift value 50), still flagged not applied, in the deferred client and in
+     `SessionWrites`. Yotsuba classifies by type (`ReactiveGuard.overloaded`: `SERVER_OVERLOADED`, a rejected
+     execution or gRPC `RESOURCE_EXHAUSTED`; read at 8cf79428e, not changed): `retryMessageWriteOnOverload` and
+     `CLOSE_FAILED_UPDATE_OVERLOAD_RETRY_SPEC`, both `Retry.backoff(Long.MAX_VALUE)` filtered by it, no longer match,
+     and the error reaches the caller. Its other loops that list types (`READ_DEADLINE_EXCEEDED`, `UPDATE_RETRY`,
+     `TRANSACTION_NOT_FOUND`, `OUTCOME_UNKNOWN`) do not match either, and its switch on the type has a default, so a
+     Yotsuba built against the older enum runs unchanged. Chosen over a Yotsuba retry filter because every caller
+     that waits out an overload has the same loop, and "the client is closed" is not a state of the server. The
+     type is local to the client. A server in front of another connection whose own client was closed would answer
+     it as `INTERNAL` with the trailer (it answered `RESOURCE_EXHAUSTED` before); that only happens while such a
+     server shuts down. Tests: `DeferredRockserverConnectionTest`, `SessionWritesTest`,
+     `GrpcConnectionCloseNumberedWriteTest` (red at `375bbbd`). Not covered: Yotsuba itself (no Yotsuba build or
+     test was run; its classification was read), and the Rust client, whose `not_sent` is about a session that
+     could not be opened, not a closed client.
+   - R61-10 / RUST-DECODE-LIMIT-4MIB (low): see "Client sessions" (the Rust note). `with_capabilities` sets
+     `max_decoding_message_size(MAX_DECODING_MESSAGE_SIZE)` (64 MiB) on the stub, and
+     `with_max_decoding_message_size` gives a view with another limit; the handshake stubs keep tonic's default (a
+     capabilities answer is a few bytes). The encoding side has no limit in tonic, and the server accepts 512 MiB.
+     An answer over the limit now ends a numbered write `OUTCOME_UNKNOWN` at once (`is_undecodable_answer`).
+     Tests: the two Rust unit tests and the live test in the table (unit tests red at `f0017fc`; the live
+     assertions fail with the limit set back to 4 MiB). Not covered: an answer over 64 MiB from a real server;
+     `cargo test` ran on a scratch copy, not in place, and no clippy.
    - Review of R46, 1 (low, docs): the R46-2 recipe ran `dependency:build-classpath` on `distributed/server/pom.xml`
      alone, so Maven resolved `rockserver-core:${revision}` and that version's pom from `~/.m2` (or the snapshot
      repository): `grep -v /rockserver-core/` dropped the jar but kept the third-party jars of that pom, from whichever

@@ -621,6 +621,22 @@ The alerts `rockserver-disk-low`, `rockserver-write-stopped`, `rockserver-write-
 - A write stall on one node slows only that node's apply; on a majority, it stops the cluster's writes. It comes from
   compactions behind (look at the pending compaction gauges) or a full disk.
 
+## Numbered multi writes refused as overloaded
+
+A client's streamed multi write (`putMulti`, `deleteMulti`, `mergeMulti`) that carries a request id is collected
+whole by the node that receives it, and all such collections of a node share a heap budget (64 MiB,
+`-Drockserver.grpc.numbered-multi-collect-bytes`). A write that does not fit is refused `SERVER_OVERLOADED`, flagged
+not applied. The gauge `rockserver.replication.api.multi_collect.bytes` (per node) shows the bytes taken.
+
+- A gauge that returns to 0 between bursts is load: raise the budget if the heap allows, or send smaller calls.
+- A gauge that stays up without traffic means streams whose client went silent. Each is ended once it got no item
+  for 30 s (`-Drockserver.grpc.numbered-multi-collect-idle-ms`, 0 turns that off) and answered
+  `READ_DEADLINE_EXCEEDED` flagged not applied, so it should fall by itself; if it does not, check that property.
+- Client hosts that vanish without closing their connections (power loss, a cut link) also keep their other calls
+  open until TCP gives up. `-Dit.cavallium.rockserver.grpc.server.keep-alive-time-ms=60000` (off by default; the
+  wait for a ping's answer is `...keep-alive-timeout-ms`, 20 s) makes the node ping silent connections and close
+  those that do not answer. It also closes the connection of a client frozen for longer than the two together.
+
 ## Upgrades
 
 Upgrade one node at a time (a rolling restart): stop it (SIGTERM: a leader hands over first), replace the binary, start
