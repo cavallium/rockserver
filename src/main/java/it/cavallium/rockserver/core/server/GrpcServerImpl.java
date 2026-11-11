@@ -520,12 +520,15 @@ final class GrpcServerImpl extends ReactorRocksDBServiceGrpc.RocksDBServiceImplB
 					.transform(this.onErrorMapMonoWithRequestInfo(requestName, initialRequest));
 		}
 		var contextualApi = contexts.syncApi(context);
+		var appliedItems = new AppliedItems(requestName);
 		return dataFlux
 				.transform(publishOnStreamingScheduler(context, OperationFamily.MUTATION, initialRequest.getColumnId()))
 				.doOnNext(data -> contextualApi.delete(initialRequest.getTransactionOrUpdateId(),
 						initialRequest.getColumnId(),
 						mapKeys(data.getKeysList()),
 							RequestType.none()))
+				.doOnNext(_ -> appliedItems.add(1))
+				.onErrorMap(appliedItems::failure)
 				.transform(this.onErrorMapFluxWithRequestInfo(requestName, initialRequest))
 				.then(Mono.just(Empty.getDefaultInstance()));
 	}
@@ -571,12 +574,15 @@ final class GrpcServerImpl extends ReactorRocksDBServiceGrpc.RocksDBServiceImplB
 							.transform(this.onErrorMapFluxWithRequestInfo(requestName, initialRequest));
 				}
 				var contextualApi = contexts.syncApi(context);
+				var appliedItems = new AppliedItems(requestName);
 				return dataFlux
 						.transform(publishOnStreamingScheduler(context, OperationFamily.MUTATION, initialRequest.getColumnId()))
 						.map(data -> mapper.apply(contextualApi.delete(initialRequest.getTransactionOrUpdateId(),
 								initialRequest.getColumnId(),
 								mapKeys(data.getKeysList()),
 								requestType)))
+						.doOnNext(_ -> appliedItems.add(1))
+						.onErrorMap(appliedItems::failure)
 						.transform(this.onErrorMapFluxWithRequestInfo(requestName, initialRequest));
 			} else {
 				return Flux.error(RocksDBException.of(
@@ -692,6 +698,7 @@ final class GrpcServerImpl extends ReactorRocksDBServiceGrpc.RocksDBServiceImplB
 							.onErrorMap(ex -> GrpcRequestErrors.handleError(ex).asRuntimeException());
 				}
 				var contextualApi = contexts.syncApi(context);
+				var appliedItems = new AppliedItems("mergeMultiGetMerged");
 				return dataFlux
 						.transform(publishOnStreamingScheduler(context, OperationFamily.MUTATION, initialRequest.getColumnId()))
 						.map(data -> {
@@ -704,6 +711,8 @@ final class GrpcServerImpl extends ReactorRocksDBServiceGrpc.RocksDBServiceImplB
 									.setMerged(merged != null ? unmapValueHeap(merged) : ByteString.EMPTY)
 									.build();
 						})
+						.doOnNext(_ -> appliedItems.add(1))
+						.onErrorMap(appliedItems::failure)
 						.onErrorMap(ex -> GrpcRequestErrors.handleError(ex).asRuntimeException());
 			} else {
 				return Flux.error(RocksDBException.of(
@@ -731,6 +740,7 @@ final class GrpcServerImpl extends ReactorRocksDBServiceGrpc.RocksDBServiceImplB
 					.transform(this.onErrorMapMonoWithRequestInfo(requestName, initialRequest));
 		}
 		var contextualApi = contexts.syncApi(context);
+		var appliedItems = new AppliedItems(requestName);
 		return dataFlux
 				.transform(publishOnStreamingScheduler(context, OperationFamily.MUTATION, initialRequest.getColumnId()))
 				.doOnNext(data -> {
@@ -740,6 +750,8 @@ final class GrpcServerImpl extends ReactorRocksDBServiceGrpc.RocksDBServiceImplB
 							toBuf(data.getValue()),
 							RequestType.none());
 				})
+				.doOnNext(_ -> appliedItems.add(1))
+				.onErrorMap(appliedItems::failure)
 				.transform(this.onErrorMapFluxWithRequestInfo(requestName, initialRequest))
 				.then(Mono.just(Empty.getDefaultInstance()));
 	}
@@ -882,6 +894,7 @@ final class GrpcServerImpl extends ReactorRocksDBServiceGrpc.RocksDBServiceImplB
 							.transform(this.onErrorMapFluxWithRequestInfo(requestName, initialRequest));
 				}
 				var contextualApi = contexts.syncApi(context);
+				var appliedItems = new AppliedItems(requestName);
 				return dataFlux
 						.transform(publishOnStreamingScheduler(context, OperationFamily.MUTATION, initialRequest.getColumnId()))
 						.map(data -> mapper.apply(contextualApi.put(initialRequest.getTransactionOrUpdateId(),
@@ -889,6 +902,8 @@ final class GrpcServerImpl extends ReactorRocksDBServiceGrpc.RocksDBServiceImplB
 								mapKeys(data.getKeysList()),
 								toBuf(data.getValue()),
 								requestType)))
+						.doOnNext(_ -> appliedItems.add(1))
+						.onErrorMap(appliedItems::failure)
 						.transform(this.onErrorMapFluxWithRequestInfo(requestName, initialRequest));
 			} else {
 				return Flux.error(RocksDBException.of(
@@ -916,6 +931,7 @@ final class GrpcServerImpl extends ReactorRocksDBServiceGrpc.RocksDBServiceImplB
 					.transform(this.onErrorMapMonoWithRequestInfo(requestName, initialRequest));
 		}
 		var contextualApi = contexts.syncApi(context);
+		var appliedItems = new AppliedItems(requestName);
 		return dataFlux
 				.transform(publishOnStreamingScheduler(context, OperationFamily.MUTATION, initialRequest.getColumnId()))
 				.doOnNext(data -> {
@@ -925,6 +941,8 @@ final class GrpcServerImpl extends ReactorRocksDBServiceGrpc.RocksDBServiceImplB
 							toBuf(data.getValue()),
 							RequestType.none());
 				})
+				.doOnNext(_ -> appliedItems.add(1))
+				.onErrorMap(appliedItems::failure)
 				.transform(this.onErrorMapFluxWithRequestInfo(requestName, initialRequest))
 				.then(Mono.just(Empty.getDefaultInstance()));
 	}
@@ -949,6 +967,7 @@ final class GrpcServerImpl extends ReactorRocksDBServiceGrpc.RocksDBServiceImplB
 					.transform(this.onErrorMapMonoWithRequestInfo(requestName, initialRequest));
 		}
 		var contextualApi = contexts.syncApi(context);
+		var appliedItems = new AppliedItems(requestName);
 		return dataFlux
 				.buffer(WRITE_ELISION_MULTI_STEP_SIZE)
 				.transform(publishOnStreamingScheduler(context, OperationFamily.MUTATION, initialRequest.getColumnId()))
@@ -960,8 +979,46 @@ final class GrpcServerImpl extends ReactorRocksDBServiceGrpc.RocksDBServiceImplB
 							batch.values(),
 							RequestType.ensure());
 				})
+				.doOnNext(data -> appliedItems.add(data.size()))
+				.onErrorMap(appliedItems::failure)
 				.transform(this.onErrorMapFluxWithRequestInfo(requestName, initialRequest))
 				.then(Mono.just(Empty.getDefaultInstance()));
+	}
+
+	/**
+	 * What a streamed multi write applied item by item (not {@link #collectsWhole}) has applied so far. Each item is a
+	 * write of its own, so once one was applied, a later item's failure flagged "not applied"
+	 * ({@link RocksDBException#isNotApplied()}: a deadline that came before its dispatch, a replicated node that refused
+	 * its proposal) is true for that item only. The call then fails with {@code INVALID_REQUEST}, not flagged, which
+	 * clients do not resend, and says how much was applied, as a partly applied batch does. A failure before any item
+	 * was applied, and one that is not flagged, pass unchanged. The new message names the type of the item's failure
+	 * but not its text, which says "not applied": a client older than the trailer reads that from the text.
+	 */
+	static final class AppliedItems {
+
+		private final String requestName;
+		// Written by the stream's one onNext at a time, read by its onError.
+		private volatile long applied;
+
+		AppliedItems(String requestName) {
+			this.requestName = requestName;
+		}
+
+		void add(long items) {
+			applied += items;
+		}
+
+		Throwable failure(Throwable error) {
+			long applied = this.applied;
+			var rocksError = findRocksDBException(error);
+			if (applied == 0 || rocksError == null || !rocksError.isNotApplied()) {
+				return error;
+			}
+			return RocksDBException.of(RocksDBErrorType.INVALID_REQUEST,
+					requestName + " was partly applied: " + applied + " items were applied one by one before it failed, so"
+							+ " it is not safe to resend as a whole; the item that failed was refused with "
+							+ rocksError.getErrorUniqueId());
+		}
 	}
 
 	/** {@code mapper} applied to each of {@code results}, nulls included. */
