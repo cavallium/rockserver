@@ -274,7 +274,11 @@ steps after 10 s of warmup, four client connections (two per node for `--route a
 flight unless noted. Raw results: `/home/cavallium/rockserver-bench/s3-*/results.md` and `s3-*.log`. Each number below is
 copied from those files. "Not reported" means the benchmark does not print it. At the saturated steps (4× and 8×
 replicated, 8× single) latencies of the write operations are the client queue's, as in s2 (the planned start is the
-clock), and p50 of seconds is a backlog, not a service time.
+clock), and p50 of seconds is a backlog, not a service time. The size of that backlog is set by the benchmark, not by
+the server: `LoadBench` keeps at most 100000 requests waiting for one of its in-flight slots and drops the rest
+("dropped (client queue full)"), so a saturated step's p50 is about 100000 divided by the served rate (100000 / 27738
+= 3.6 s for 3.83 s measured at 4× replicated, 100000 / 67790 = 1.5 s for 1.59 s at 8× single, 100000 / 39253 = 2.5 s
+for 2.87 s at 8× with 2048 in flight). See "Reading the saturated steps and the failover" below.
 
 **Disks, and what differs from s2 there.** In s3 the nodes' data directories are on three different devices:
 `df` after the suite says node 1 (`/home/cavallium/.rockserver-bench`) is on `/dev/nvme1n1p1`, node 2
@@ -423,12 +427,14 @@ node at 1× (115.4 and 19.5 MiB/s, on different devices and with other workloads
 
 **Regressions above about 10%**:
 
-- **Failover.** Worse than s2 and the most important result of the suite: s2 had 3 seconds with no successful
+- **Failover.** Worse than s2 as measured, and the result of the suite to look at first: s2 had 3 seconds with no successful
   operation and then mostly 8k–24k per second; s3 has two empty seconds, then at most 2306 per second and 7 of the 20
   seconds after the kill empty, the last two included, with 315695 requests dropped (57272 in s2) and no recovery.
   Fewer errors counted (1449 against 109757) does not mean better: the writes of the dead leader's connections do not
   appear as errors in the per-operation rows and their outcome is not reported. The other variable is which node died:
-  node 2 in s2 (on `/var/tmp`), node 1 in s3 (on `/home`, also the leader's disk of `s3-repl`).
+  node 2 in s2 (on `/var/tmp`), node 1 in s3 (on `/home`, also the leader's disk of `s3-repl`). The likely cause is
+  in the client and the benchmark, a change of behaviour between the suites, not a slower election (see "Reading the
+  saturated steps and the failover" below): as it is, this run no longer measures the cluster's failover.
 - **`--route all` at 2×**: served 21609 against 24505 ops/s (-12%), `UPDATE` p50 4186.11 against 1745.92 ms
   (+140%), and `GET` p99 128.45 against 7.95 ms (+1516%; p50 4.46 against 1.39 ms, +221%). In s3 the leader was the
   SATA node 3 by CPU use (5.8 cores), in s2 node 2 (7.8 cores).
@@ -448,9 +454,44 @@ about 15% as noise, and the large ones (single-node tails, failover) as a reason
 measurement of the code change alone. Node 1 and node 2 were not on the same partition in s3, contrary to what was
 assumed before this analysis (see "Disks" above).
 
+**Reading the saturated steps and the failover.** Two results look like a problem under high load. Both readings
+below come from the code and the logs, without a new run.
+
+- *Multi-second p50 with requests dropped at saturation.* This is the load generator's backlog, as designed, and the
+  server never saw the excess. The client holds at most 512 (or 2048) writes in flight, like Yotsuba's limit, so the
+  cluster is offered no more than that window whatever the planned rate: no step of the six runs without a kill has an
+  error, so no request was refused with `SERVER_OVERLOADED` and the nodes' own admission (16384 requests at once, the
+  byte admission of writes) was never reached. Requests beyond the window wait in the benchmark, up to 100000 of them,
+  and their wait counts from the planned start: the p50 is that queue's length over the served rate (see the top of
+  this section). With the window full a write took about 19 ms at 4× with 512 in flight (512 over about 26.7k
+  writes/s), and `GET`, which has a window of its own, kept a p50 of 0.95–2.88 ms and a p99 of 11.68–22.02 ms in every
+  saturated replicated step. So these numbers say where the capacity ends (between 2× and 4× of the production mean
+  with 512 writes in flight, between 4× and 8× with 2048), not that overload is shed too late. What they do not show
+  is how the nodes behave when the concurrency offered exceeds their own limits (many clients, or windows far larger
+  than 2048): no step of the suite reaches the server's admission, so shedding by the server is covered by tests
+  only, not by a load run. A caller with a bounded window and a queue in front of it, as Yotsuba has, builds the same
+  backlog while the load stays above capacity; bounding that queue, or the wait in it, is the caller's job.
+- *Failover with no recovery.* After the kill the cluster was healthy and idle: node 2 logged `leading term 2`, node 3
+  followed with no lag, and in one 10 s interval node 2 applied 3 entries and served 396 local reads. What stalled was
+  the benchmark. With `--route all` every connection has one address, and a third of them pointed at the dead node. The
+  client's numbered writes (`SessionWrites`, added after s2, in `a1120d2`) are sent again until the caller's deadline,
+  30 s here, where in s2 they failed at once, and a connection with one address has nowhere else to send them. Each of
+  those writes keeps one of the 512 write slots, which all the connections share, until the step ends, so after about
+  1500 writes every slot is held by a write to the dead node and the two live nodes get none. The log fits: the write
+  rows have 0 errors (those writes were still waiting when the step ended, which is also why their outcome is not
+  reported), the successes that remain are about twice the errors second by second (reads, a third of which go to the
+  dead node and fail), and what trickles through are updates whose first call failed `UNAVAILABLE` and gave its slot
+  back (444). In s2 the dead node's share of the requests failed fast and the rest were served. So this is the
+  documented limit of a client pinned to one node ("a dead node takes the clients pinned to it down with it", see
+  "Client failover" below), made worse for a caller with a shared window, since its writes to the dead node now wait
+  for their deadline. A production client lists every node and is not in this case. To measure failover again, the
+  suite's failover run has to use `--route failover` or `--route same-list`: not run yet. Not checked: whether a
+  connection with one address should give up a numbered write sooner when its only node refuses connections (it
+  cannot know that the node will not come back), and what the reads' own retries add to the stall.
+
 **Odd in the s3 logs.**
 
-- Failover: no recovery after the election (above). Besides the errors listed there, the client log has 42 lines
+- Failover: no recovery after the election (above, and "Reading the saturated steps and the failover"). Besides the errors listed there, the client log has 42 lines
   `gRPC call to ... reached terminal status UNAVAILABLE. No further automatic retry will be attempted` (24 in s2) and, at
   21:59:50, after the step, `SEVERE: RuntimeException while executing runnable CallbackListener ...
   RejectedExecutionException` from `ThreadPerTaskExecutor.ensureNotShutdown` (client closing while calls were still
@@ -462,8 +503,8 @@ assumed before this analysis (see "Disks" above).
 - `s3-route-all`: the CPU was on node 3 (5.8 cores) while its device wrote like the others; the step never caught up.
 - Single node 8× has a throughput swing of 41282 to 82865 ok/s from second to second; the bulk single node 14 to 595
   calls/s.
-- **Disk space alarm on node 1**: `NodeMonitor` logged `ALARM disk-space: 55.4 GiB free of 931.1 GiB` (51.1 GiB at the
-  lowest, in `s3-repl-2048`) for node 1's data directory in `s3-repl`, `s3-repl-2048`, `s3-route-all`, `s3-failover` and
+- **Disk space alarm on node 1**: `NodeMonitor` logged `ALARM disk-space: 55.4 GiB free of 931.1 GiB` (49.2 GiB at the
+  lowest, in `s3-repl`; 51.1 GiB in `s3-repl-2048`) for node 1's data directory in `s3-repl`, `s3-repl-2048`, `s3-route-all`, `s3-failover` and
   `s3-bw-repl`: `/home/cavallium` was 95% full. Node 1 was the leader in `s3-repl` and `s3-repl-2048` and the killed node
   in `s3-failover`. A nearly full NVMe disk can slow writes; this is not measured here.
 - `s3-repl` node 3 logged one `ERROR ... RaftServer$Division - 3@group-...: Failed appendEntries* 1->3 ... HEARTBEAT`

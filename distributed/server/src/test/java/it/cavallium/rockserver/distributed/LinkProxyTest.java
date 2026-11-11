@@ -518,6 +518,10 @@ class LinkProxyTest {
 		} catch (ConnectException refused) {
 			throw new AssertionError("The proxy refused a connection it should have accepted", refused);
 		} catch (SocketException reset) {
+			// Only a reset counts: any other socket error fails the test.
+			if (reset.getMessage() == null || !reset.getMessage().contains("reset")) {
+				throw reset;
+			}
 			return;
 		}
 		try (socket) {
