@@ -485,7 +485,12 @@ below come from the code and the logs, without a new run.
   documented limit of a client pinned to one node ("a dead node takes the clients pinned to it down with it", see
   "Client failover" below), made worse for a caller with a shared window, since its writes to the dead node now wait
   for their deadline. A production client lists every node and is not in this case. To measure failover again, the
-  suite's failover run has to use `--route failover` or `--route same-list`: not run yet. Not checked: whether a
+  suite's failover run has to use `--route failover` or `--route same-list`. Both were run right after the suite
+  (2026-11-11, commit `670ce11`, 2× load, leader killed at second 10 of 30, results in `s3-failover-samelist` and
+  `s3-failover-rot`): one second with no successful operation, the offered rate served again 3 to 4 s after the
+  kill, then up to 33744 ops/s while the backlog cleared; 232 and 196 failed updates, nothing dropped at the client
+  queue; `UPDATE` p99 2705 ms and 1957 ms, `GET` p99 1852 ms and 1113 ms over the step (the outage itself). The
+  suite script's failover step now uses `--route same-list`. Not checked: whether a
   connection with one address should give up a numbered write sooner when its only node refuses connections (it
   cannot know that the node will not come back), and what the reads' own retries add to the stall.
 
