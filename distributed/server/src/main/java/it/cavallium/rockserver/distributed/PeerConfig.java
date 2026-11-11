@@ -1,5 +1,7 @@
 package it.cavallium.rockserver.distributed;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Objects;
 
 /**
@@ -29,6 +31,44 @@ public record PeerConfig(String id, String raftHost, int raftPort, String apiHos
 		if (port < 1 || port > 65535) {
 			throw new IllegalArgumentException("Invalid " + which + " port " + port + ": not in 1 to 65535");
 		}
+	}
+
+	/**
+	 * The first pair of members of {@code peers} that share a Raft address or an API address, as a refusal text naming
+	 * both ids; {@code null} when there is none (R61-15). Hosts are compared case-insensitively and ports as numbers;
+	 * nothing is resolved, so two names of one machine are not caught. A member's own Raft and API addresses are not
+	 * compared with each other.
+	 */
+	public static String sharedAddress(List<PeerConfig> peers) {
+		for (int i = 0; i < peers.size(); i++) {
+			for (int j = i + 1; j < peers.size(); j++) {
+				var a = peers.get(i);
+				var b = peers.get(j);
+				if (a.id().equals(b.id())) {
+					continue;
+				}
+				if (a.raftPort == b.raftPort && a.raftHost.equalsIgnoreCase(b.raftHost)) {
+					return "members " + a.id() + " and " + b.id() + " share the Raft address " + a.raftAddress();
+				}
+				if (a.apiPort == b.apiPort && a.apiHost.equalsIgnoreCase(b.apiHost)) {
+					return "members " + a.id() + " and " + b.id() + " share the API address " + a.apiHost + ":" + a.apiPort;
+				}
+			}
+		}
+		return null;
+	}
+
+	/** {@code peers} without the members that share an address with an earlier one: what a client needs of them. */
+	public static List<PeerConfig> withDistinctAddresses(List<PeerConfig> peers) {
+		var kept = new ArrayList<PeerConfig>();
+		for (var peer : peers) {
+			var next = new ArrayList<>(kept);
+			next.add(peer);
+			if (sharedAddress(next) == null) {
+				kept.add(peer);
+			}
+		}
+		return kept;
 	}
 
 	public String raftAddress() {
