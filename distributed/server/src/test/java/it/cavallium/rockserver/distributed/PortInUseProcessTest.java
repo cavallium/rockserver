@@ -37,6 +37,8 @@ class PortInUseProcessTest {
 			var output = runExpectingExit(ports.get(0), ports.get(1));
 			assertTrue(output.contains("Failed to start Grpc server"), output);
 			assertTrue(output.contains("Address already in use"), output);
+			assertTrue(output.contains("Failed to bind to address /127.0.0.1:" + ports.get(0)), output);
+			assertTrue(output.contains("Node a does not start: its start called System.exit"), output);
 			assertFalse(output.contains("READY"), output);
 		}
 	}
@@ -48,12 +50,14 @@ class PortInUseProcessTest {
 			var output = runExpectingExit(ports.get(0), ports.get(1));
 			assertTrue(output.contains("Failed to start node a"), output);
 			assertTrue(output.contains("Address already in use"), output);
+			assertTrue(output.contains("Failed to bind to address /127.0.0.1:" + ports.get(1)), output);
+			assertFalse(output.contains("halting"), output);
 			assertFalse(output.contains("READY"), output);
 		}
 	}
 
 	/** The thread dump of a node that did not exit, for the failure message: where its exit waits. */
-	private static String threads(long pid) throws Exception {
+	static String threads(long pid) throws Exception {
 		var jstack = new ProcessBuilder(Path.of(System.getProperty("java.home"), "bin", "jstack").toString(),
 				String.valueOf(pid)).redirectErrorStream(true).start();
 		var dump = new String(jstack.getInputStream().readAllBytes());
@@ -69,16 +73,24 @@ class PortInUseProcessTest {
 		return socket;
 	}
 
-	/** Runs a single node with these ports; it must exit with 1 within {@link #EXIT_SECONDS}. Returns its output. */
-	private String runExpectingExit(int raftPort, int apiPort) throws Exception {
+	/** The command of a single node {@code a} under {@code root}, with these ports, started through {@code main}. */
+	static List<String> command(Path root, Class<?> main, int raftPort, int apiPort, List<String> jvmOptions)
+			throws Exception {
 		var command = new ArrayList<>(List.of(Path.of(System.getProperty("java.home"), "bin", "java").toString(),
 				"-cp", System.getProperty("java.class.path"),
 				"--enable-native-access=ALL-UNNAMED", "--add-modules=jdk.incubator.vector",
-				"-XX:+ExitOnOutOfMemoryError", "-Djava.io.tmpdir=" + Files.createDirectories(tempDir.resolve("tmp")),
-				ReplicatedServerMain.class.getName(), "run", "--node-id", "a",
+				"-XX:+ExitOnOutOfMemoryError", "-Djava.io.tmpdir=" + Files.createDirectories(root.resolve("tmp"))));
+		command.addAll(jvmOptions);
+		command.addAll(List.of(main.getName(), "run", "--node-id", "a",
 				"--peer", "a=127.0.0.1:" + raftPort + "/127.0.0.1:" + apiPort,
-				"--data-dir", tempDir.resolve("node").toString(),
+				"--data-dir", root.resolve("node").toString(),
 				"--raft-bind-host", "127.0.0.1", "--api-bind-host", "127.0.0.1"));
+		return command;
+	}
+
+	/** Runs a single node with these ports; it must exit with 1 within {@link #EXIT_SECONDS}. Returns its output. */
+	private String runExpectingExit(int raftPort, int apiPort) throws Exception {
+		var command = command(tempDir, ReplicatedServerMain.class, raftPort, apiPort, List.of());
 		var log = tempDir.resolve("run.log");
 		var process = new ProcessBuilder(command).redirectErrorStream(true).redirectOutput(log.toFile()).start();
 		try {
