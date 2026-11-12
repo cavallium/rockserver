@@ -1,24 +1,12 @@
 package it.cavallium.rockserver.distributed;
 
 /**
- * What a shutdown hook can find out about the exit of the JVM it runs in: which thread asked for it (R61-13).
- *
- * <p>{@link System#exit} runs the shutdown hooks on the thread that called it and waits for them, holding a lock that
- * every later {@code System.exit} waits for, for good. A thread inside {@code System.exit} therefore never returns,
- * and a hook that waits for something only that thread can do waits for good too: the JVM never exits. A SIGTERM runs
- * the hooks on a thread of the JVM's own instead, which nothing else waits for.</p>
- *
- * <p>The JDK does not tell a hook who called it, so this reads the stack traces: {@code java.lang.Shutdown} is where
- * both {@code System.exit} and the signal handler ({@code java.lang.Terminator}) run and wait for the hooks. Those are
- * classes of the JDK's implementation, pinned for the JDK in use by {@code StartExitProcessTest} and
- * {@code PortInUseProcessTest}, which run real exits and a real signal. A virtual thread that called
- * {@code System.exit} has no stack trace here: {@link Probe#bySignal} is then false, as for any other thread.</p>
+ * What the shutdown hook of {@code run} asks about the exit of the JVM it runs in: which thread asked for it (R61-13).
+ * The answers for this JVM are read from the stack traces by {@link it.cavallium.rockserver.core.impl.JvmExit}, which
+ * the single-node server uses too and which says what is read and why; {@code StartExitProcessTest} and
+ * {@code PortInUseProcessTest} pin them for the JDK in use.
  */
 final class JvmExit {
-
-	private static final String SHUTDOWN = "java.lang.Shutdown";
-	private static final String RUN_HOOKS = "runHooks";
-	private static final String SIGNAL_HANDLER = "java.lang.Terminator";
 
 	private JvmExit() {}
 
@@ -39,29 +27,12 @@ final class JvmExit {
 	static final Probe JVM = new Probe() {
 		@Override
 		public boolean exiting(Thread thread) {
-			return has(thread.getStackTrace(), SHUTDOWN, null);
+			return it.cavallium.rockserver.core.impl.JvmExit.exiting(thread);
 		}
 
 		@Override
 		public boolean bySignal() {
-			for (var stack : Thread.getAllStackTraces().values()) {
-				// The thread that runs the hooks, not one that waits behind it: a signal after a System.exit waits there.
-				if (has(stack, SHUTDOWN, RUN_HOOKS) && has(stack, SIGNAL_HANDLER, null)) {
-					return true;
-				}
-			}
-			return false;
+			return it.cavallium.rockserver.core.impl.JvmExit.bySignal();
 		}
 	};
-
-	private static boolean has(StackTraceElement[] stack, String type, String method) {
-		for (var frame : stack) {
-			String name = frame.getClassName();
-			// Also a nested class, such as the signal handler's (Terminator$1).
-			if ((name.equals(type) || name.startsWith(type + "$")) && (method == null || method.equals(frame.getMethodName()))) {
-				return true;
-			}
-		}
-		return false;
-	}
 }

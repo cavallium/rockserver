@@ -144,6 +144,20 @@ public class MainStartProcessTest {
 		assertDatabaseOpens();
 	}
 
+	/**
+	 * The caller of {@code run} exits once {@code run} returned (here after a start that threw): that thread is inside
+	 * {@code System.exit} too, but it closed everything first. Its status stands.
+	 */
+	@Test
+	void anExitOnceRunReturnedKeepsItsStatus() throws Exception {
+		var child = start("fail-then-exit", reserveLoopbackPort(), reserveLoopbackPort());
+		String log = awaitExit(child);
+		assertEquals(7, child.exitValue(), log);
+		assertFalse(log.contains("halting"), log);
+		assertEquals("complete", Files.readString(shutdownComplete), log);
+		assertDatabaseOpens();
+	}
+
 	private Process start(String mode, int thriftPort, int grpcPort) throws Exception {
 		String classPath = System.getProperty("surefire.test.class.path", System.getProperty("java.class.path"));
 		var command = new ArrayList<>(List.of(
@@ -274,6 +288,7 @@ public class MainStartProcessTest {
 	 * <li>{@code none}: the start as it is.</li>
 	 * <li>{@code slow}: 5 s late. The test sends SIGTERM during the wait.</li>
 	 * <li>{@code fail}: throws.</li>
+	 * <li>{@code fail-then-exit}: throws, and the child calls {@code System.exit(7)} once {@code run} returned.</li>
 	 * <li>{@code exit}: calls {@code System.exit(9)}.</li>
 	 * <li>{@code exit-after-signal}: after 3 s, during which the test sends SIGTERM, calls {@code System.exit(9)}.</li>
 	 * </ul>
@@ -303,7 +318,7 @@ public class MainStartProcessTest {
 				try {
 					switch (mode) {
 						case "slow" -> Thread.sleep(5000);
-						case "fail" -> throw new IllegalStateException("test start failure");
+						case "fail", "fail-then-exit" -> throw new IllegalStateException("test start failure");
 						case "exit" -> System.exit(9);
 						case "exit-after-signal" -> {
 							Thread.sleep(3000);
@@ -320,6 +335,9 @@ public class MainStartProcessTest {
 			run.setAccessible(true);
 			try {
 				run.invoke(null, mainArgs, onShutdownComplete, onConnected);
+				if (mode.equals("fail-then-exit")) {
+					System.exit(7);
+				}
 			} catch (java.lang.reflect.InvocationTargetException ex) {
 				if (ex.getCause() instanceof Exception cause) {
 					throw cause;
