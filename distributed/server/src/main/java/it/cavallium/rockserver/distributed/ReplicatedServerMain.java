@@ -78,6 +78,8 @@ import org.rocksdb.NativeLibraryLoader;
  * export-seed --data-dir DIR --target DIR [--rockserver-config FILE] [--group-id UUID]
  *             [--without-damaged-snapshot]
  * restore-backup --backup DIR --data-dir DIR [--rockserver-config FILE]
+ * build-seed --source-db DIR [--source-config FILE] --target DIR [--rockserver-config FILE] [--column NAME]...
+ *            [--exclude-column NAME]... [--export-dir DIR]
  * </pre>
  *
  * <p>{@code checksum} has every replica digest its data at one log position and compares the digests; it prints each
@@ -273,6 +275,7 @@ public final class ReplicatedServerMain {
 			case "export-seed" -> exportSeed(new Options(rest));
 			case "restore-backup" -> restoreBackup(new Options(rest));
 			case "copy-columns" -> copyColumns(new Options(rest));
+			case "build-seed" -> buildSeed(new Options(rest));
 			default -> usage("unknown command " + args[0]);
 		}
 	}
@@ -316,6 +319,29 @@ public final class ReplicatedServerMain {
 			fail(ex.getMessage());
 		} catch (IOException | RuntimeException ex) {
 			fail(String.valueOf(ex));
+		}
+	}
+
+	/**
+	 * {@code build-seed}: builds a cluster's seed from columns of a stopped single-node database by linking their
+	 * table files; see {@link SeedBuilder}. Wrong usage ends with 2, a seed that was not built with 1.
+	 */
+	private static void buildSeed(Options options) {
+		var sourceConfig = options.value("--source-config");
+		var rockserverConfig = options.value("--rockserver-config");
+		var exportDir = options.value("--export-dir");
+		var config = new SeedBuilder.Config(Path.of(options.required("--source-db")),
+				sourceConfig == null ? null : Path.of(sourceConfig), Path.of(options.required("--target")),
+				rockserverConfig == null ? null : Path.of(rockserverConfig), options.values("--column"),
+				options.values("--exclude-column"), exportDir == null ? null : Path.of(exportDir));
+		options.requireConsumed();
+		try {
+			SeedBuilder.run(config, System.out);
+		} catch (SeedBuilder.UsageException ex) {
+			usage(ex.getMessage());
+		} catch (IOException | RuntimeException ex) {
+			System.err.println("Not built: " + (ex instanceof IOException ? ex.getMessage() : ex));
+			exit(1);
 		}
 	}
 
@@ -2424,7 +2450,14 @@ public final class ReplicatedServerMain {
 				        copies columns (default: all user columns) from the running Rockserver at --from to the one
 				        at --to (a cluster's API addresses, or ID=RAFTHOST:PORT/APIHOST:PORT as in --peer), while
 				        nothing writes to them. Refuses a target column that holds data unless --allow-non-empty;
-				        --verify compares count and a hash of every column afterwards; --dry-run writes nothing.""");
+				        --verify compares count and a hash of every column afterwards; --dry-run writes nothing.
+				  build-seed --source-db DIR [--source-config FILE] --target DIR [--rockserver-config FILE]
+				             [--column NAME]... [--exclude-column NAME]... [--export-dir DIR]
+				        builds in --target (must not exist) a cluster's seed database from the columns (default: all
+				        user columns) of the stopped single-node database in --source-db, opened read-write with
+				        --source-config: their table files are hard-linked (copied between file systems), not read.
+				        --rockserver-config is the cluster's. --export-dir must be on the file system of the
+				        columns' volumes to link (default: next to each column's volume).""");
 		exit(2);
 	}
 

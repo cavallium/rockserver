@@ -2157,6 +2157,27 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		return columnOps.createColumn(name, schema);
 	}
 
+	/** See {@link EmbeddedDBColumns#createColumnFromExport}. */
+	public long createColumnFromExport(String name, @NotNull ColumnSchema schema,
+			@NotNull ExportedColumn exported) throws RocksDBException {
+		return columnOps.createColumnFromExport(name, schema, exported);
+	}
+
+	/** See {@link EmbeddedDBColumns#exportColumn}. */
+	public ExportedColumn exportColumn(long columnId, Path exportDir) throws RocksDBException {
+		return columnOps.exportColumn(columnId, exportDir);
+	}
+
+	/** See {@link EmbeddedDBColumns#columnTableFiles}. */
+	public List<Path> columnTableFiles(long columnId) {
+		return columnOps.columnTableFiles(columnId);
+	}
+
+	/** See {@link EmbeddedDBColumns#columnMergeOperatorClass}. */
+	public @Nullable String columnMergeOperatorClass(long columnId) {
+		return columnOps.columnMergeOperatorClass(columnId);
+	}
+
 	@Override
 	public long uploadMergeOperator(String name, String className, byte[] jarData) {
 		return columnOps.uploadMergeOperator(name, className, jarData);

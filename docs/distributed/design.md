@@ -82,6 +82,28 @@ the seed has no `wal.detached/` (nothing ties them to the seed, and the seed dig
 `...RestoresOnANodeWithItsWalInside`, `anOutsideWalDirectoryWithWalFilesAndNoDatabaseIsRefused`. Not tested: a snapshot
 install between running nodes with the WAL outside, and a crash in the middle of the move.
 
+**A seed from some columns (`build-seed`).** A single node whose volumes are outside its database directory, or
+which holds columns that must not go to the cluster, cannot be copied as a seed. `build-seed` (`SeedBuilder`) opens
+the stopped source with its own config and creates a new database with the cluster's config, opened as a copy is
+(`NodeStore.replicaConfig`: volumes inside, an outside `wal-path` as `wal.detached/`). For each chosen column it
+exports the column family (`EmbeddedDB.exportColumn`: a flush, then hard links of its table files in an export
+directory) and creates the column in the seed from it (`EmbeddedDB.createColumnFromExport`: RocksDB's
+`CreateColumnFamilyWithImport`, which links the files into the seed's volume at the levels they had, then the same
+registration as `createColumn`: the schema in `_column_schemas_`, the options from the seed's config). No table is
+read; across file systems the files are copied. The seed has no replication metadata column and no seed digest, like
+an `export-seed` copy, and a first start treats it as any seed. Column ids are RocksDB's column family ids, assigned
+anew in the seed: nothing stores them outside a database (clients ask for them by name, and every node gets the same
+files). RocksDB's `Checkpoint::ExportColumnFamily` looks for table files in the database directory only, not in
+`cf_paths`, so `exportColumn` puts a symbolic link per table file there for the time of the call, lets RocksDB
+export (it hard-links the symbolic links) into a directory inside the database directory, and replaces that
+directory by a symbolic link to the export directory it fills itself with hard links to the files. A column whose
+schema names a merge operator is refused: the operator registry is not carried, and core does not give such a
+column its operator when a database is reopened (a read that merges crashes the process; found while testing this,
+not fixed here). Tests: `BuildSeedTest` (volume and WAL outside the source; links checked by inode; reads after a
+compaction and a reopen; a three-node cluster from three copies with equal checksums; a volume on another file
+system than the database directory, when `/var/tmp` and the temporary directory differ; refusals). Not tested: large
+columns, several volumes per column, a kill of the command.
+
 **What this module needs from core.** Single-node behavior and the wire contract are unchanged, apart from the
 separate removal of CDC from Rockserver. The core additions are used only by replicas or by a server that
 forwards to a non-embedded connection:

@@ -16,6 +16,10 @@ public class DelegatingMergeOperator extends FFMAbstractMergeOperator {
 		this.delegate = Objects.requireNonNull(delegate);
 	}
 
+	public FFMAbstractMergeOperator getDelegate() {
+		return delegate;
+	}
+
 	public void setDelegate(FFMAbstractMergeOperator newDelegate) {
 		FFMAbstractMergeOperator old = this.delegate;
 		this.delegate = Objects.requireNonNull(newDelegate);

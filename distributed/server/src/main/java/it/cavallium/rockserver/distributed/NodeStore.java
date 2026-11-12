@@ -309,7 +309,7 @@ final class NodeStore implements Closeable {
 	 * Like {@link #replicaConfig(Path, Path, Path, String)}, with {@code adjust} applied last (for example
 	 * {@link #withoutAutoCompactions} or {@link #withSmallFootprint}).
 	 */
-	private static Path replicaConfig(@Nullable Path rockserverConfig, Path dbDir, @Nullable Path sourceDbDir,
+	static Path replicaConfig(@Nullable Path rockserverConfig, Path dbDir, @Nullable Path sourceDbDir,
 			String nodeId, UnaryOperator<Config> adjust) throws IOException {
 		var config = ConfigFactory.parseString(REPLICA_OVERRIDES);
 		try {

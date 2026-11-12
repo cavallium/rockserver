@@ -30,6 +30,7 @@ import org.jetbrains.annotations.Nullable;
 import org.rocksdb.ColumnFamilyDescriptor;
 import org.rocksdb.ColumnFamilyHandle;
 import org.rocksdb.ColumnFamilyOptions;
+import org.rocksdb.ExportImportFilesMetaData;
 import org.rocksdb.RocksDB;
 import it.cavallium.rockserver.core.impl.EmbeddedDB.*;
 
@@ -312,6 +313,190 @@ final class EmbeddedDBColumns {
 		edb.logger.info("Updated schema for column: {} (MergeOperator changed)", name);
 	}
 	public long createColumn(String name, @NotNull ColumnSchema schema) throws RocksDBException {
+		return createColumn(name, schema, null);
+	}
+
+	/**
+	 * Creates the column {@code name}, which must not exist, with {@code schema} and with the table files of
+	 * {@code exported} (what {@link #exportColumn} of a column with the same schema returned, of this or of another
+	 * database) as its contents: RocksDB links the files into the column's volume (copies them from another file
+	 * system). The column is registered exactly as {@link #createColumn}
+	 * registers a new one (its options from this database's config, its schema in {@code _column_schemas_}); a merge
+	 * operator that the schema names must already be in this database's registry.
+	 */
+	public long createColumnFromExport(String name, @NotNull ColumnSchema schema,
+			@NotNull ExportedColumn exported) throws RocksDBException {
+		return createColumn(name, schema, exported.metadata());
+	}
+
+	/**
+	 * Flushes the column and hard-links its table files (copies those on another file system) into {@code exportDir},
+	 * which must not exist and whose parent must. The result is what {@link #createColumnFromExport} takes; the caller
+	 * closes it once the column is imported, and deletes {@code exportDir}. Nothing may write to the column or compact
+	 * it meanwhile. Refused for a column with blob files, which the export leaves out.
+	 *
+	 * <p>RocksDB's column family export ({@code Checkpoint::ExportColumnFamily}) looks for every table file in the
+	 * database directory, whatever the column's {@code cf_paths} (volumes) are, and fails for a file in a volume. So
+	 * for the time of RocksDB's call each such file gets a symbolic link of its name in the database directory, and
+	 * RocksDB exports into {@code column-export.<pid>.<column id>} inside the database directory, where it hard-links
+	 * what it finds: the symbolic links (Linux's {@code link} does not follow them), so no data is read. That directory
+	 * is then replaced by a symbolic link to {@code exportDir}, which this method fills with hard links to the files
+	 * themselves: the import follows it. The symbolic links in the database directory are removed before this returns,
+	 * the one to {@code exportDir} when the result is closed; a process killed in between leaves them, to be deleted
+	 * by hand ({@code *.sst} symbolic links and {@code column-export.*} in the database directory).</p>
+	 */
+	public ExportedColumn exportColumn(long columnId, java.nio.file.Path exportDir) throws RocksDBException {
+		edb.ops.beginOp();
+		try {
+			synchronized (edb.columnEditLock) {
+				var col = edb.getColumn(columnId);
+				var db = edb.db.get();
+				if (edb.path == null) {
+					throw RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, "An in-memory database exports no column");
+				}
+				try (var fo = new org.rocksdb.FlushOptions().setWaitForFlush(true).setAllowWriteStall(true)) {
+					db.flush(fo, col.cfh());
+				}
+				long blobFiles = db.getLongProperty(col.cfh(), "rocksdb.num-blob-files");
+				if (blobFiles > 0) {
+					throw RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, "The column has " + blobFiles
+							+ " blob files, which RocksDB's column family export does not carry");
+				}
+				var dbDir = java.nio.file.Path.of(db.getName()).toAbsolutePath();
+				var files = columnTableFiles(columnId);
+				var rocksExport = dbDir.resolve("column-export." + ProcessHandle.current().pid() + "." + columnId);
+				if (java.nio.file.Files.exists(rocksExport, java.nio.file.LinkOption.NOFOLLOW_LINKS)) {
+					throw RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, rocksExport + " already exists: remove it");
+				}
+				var placeholders = new ArrayList<java.nio.file.Path>();
+				ExportImportFilesMetaData metadata = null;
+				boolean done = false;
+				try {
+					try {
+						for (var file : files) {
+							var inDbDir = dbDir.resolve(file.getFileName());
+							if (java.nio.file.Files.exists(inDbDir, java.nio.file.LinkOption.NOFOLLOW_LINKS)) {
+								if (!java.nio.file.Files.isSameFile(inDbDir, file)) {
+									throw new IOException(inDbDir + " exists and is not " + file + ": remove it if a killed export left it");
+								}
+								continue;
+							}
+							java.nio.file.Files.createSymbolicLink(inDbDir, file);
+							placeholders.add(inDbDir);
+						}
+						try (var checkpoint = org.rocksdb.Checkpoint.create(db)) {
+							metadata = checkpoint.exportColumnFamily(col.cfh(), rocksExport.toString());
+						}
+					} finally {
+						for (var placeholder : placeholders) {
+							java.nio.file.Files.deleteIfExists(placeholder);
+						}
+					}
+					// What RocksDB listed is what was listed here: nothing was flushed or compacted in between.
+					var expected = new TreeSet<String>();
+					files.forEach(file -> expected.add(file.getFileName().toString()));
+					var exported = new TreeSet<String>();
+					try (var list = java.nio.file.Files.list(rocksExport)) {
+						list.forEach(file -> exported.add(file.getFileName().toString()));
+					}
+					if (!exported.equals(expected)) {
+						throw new IOException("The column's table files changed during the export: " + expected + " became "
+								+ exported);
+					}
+					for (var placeholder : placeholders) {
+						if (!java.nio.file.Files.isSymbolicLink(rocksExport.resolve(placeholder.getFileName()))) {
+							// A link() that follows symbolic links, or an export across file systems: correct, but slow.
+							edb.logger.warn("RocksDB copied {} instead of linking its symbolic link", placeholder.getFileName());
+						}
+					}
+					deleteLinks(rocksExport);
+					java.nio.file.Files.createDirectory(exportDir);
+					for (var file : files) {
+						var link = exportDir.resolve(file.getFileName());
+						try {
+							java.nio.file.Files.createLink(link, file);
+						} catch (java.nio.file.FileSystemException | UnsupportedOperationException crossDevice) {
+							java.nio.file.Files.copy(file, link);
+						}
+					}
+					java.nio.file.Files.createSymbolicLink(rocksExport, exportDir.toAbsolutePath());
+					done = true;
+					return new ExportedColumn(metadata, rocksExport, files.size());
+				} finally {
+					if (!done) {
+						if (metadata != null) {
+							metadata.close();
+						}
+						try {
+							deleteLinks(rocksExport);
+						} catch (IOException e) {
+							edb.logger.warn("Failed to delete {}", rocksExport, e);
+						}
+					}
+				}
+			}
+		} catch (org.rocksdb.RocksDBException | IOException e) {
+			throw RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, "Failed to export column " + columnId + ": "
+					+ e.getMessage(), e);
+		} finally {
+			edb.ops.endOp();
+		}
+	}
+
+	/** Deletes RocksDB's export directory (links only), or the symbolic link in its place; nothing it links to. */
+	static void deleteLinks(java.nio.file.Path rocksExport) throws IOException {
+		if (java.nio.file.Files.isDirectory(rocksExport, java.nio.file.LinkOption.NOFOLLOW_LINKS)) {
+			try (var list = java.nio.file.Files.list(rocksExport)) {
+				for (var entry : list.toList()) {
+					java.nio.file.Files.delete(entry);
+				}
+			}
+		}
+		java.nio.file.Files.deleteIfExists(rocksExport);
+		// RocksDB builds in <dir>.tmp and leaves it when it fails.
+		var building = rocksExport.resolveSibling(rocksExport.getFileName() + ".tmp");
+		if (java.nio.file.Files.isDirectory(building, java.nio.file.LinkOption.NOFOLLOW_LINKS)) {
+			try (var list = java.nio.file.Files.list(building)) {
+				for (var entry : list.toList()) {
+					java.nio.file.Files.delete(entry);
+				}
+			}
+			java.nio.file.Files.delete(building);
+		}
+	}
+
+	/** The live table files of the column, as RocksDB lists them now (memtables are not flushed first). */
+	public List<java.nio.file.Path> columnTableFiles(long columnId) {
+		edb.ops.beginOp();
+		try {
+			var files = new ArrayList<java.nio.file.Path>();
+			for (var level : edb.db.get().getColumnFamilyMetaData(edb.getColumn(columnId).cfh()).levels()) {
+				for (var file : level.files()) {
+					String fileName = file.fileName();
+					files.add(java.nio.file.Path.of(file.path(), fileName.startsWith("/") ? fileName.substring(1) : fileName));
+				}
+			}
+			return files;
+		} finally {
+			edb.ops.endOp();
+		}
+	}
+
+	/**
+	 * The class name of the operator that merges the column's values (the one a {@link DelegatingMergeOperator} wraps),
+	 * null without one: from the schema's registry entry or class, or from the column's {@code merge-operator-class}
+	 * in the config.
+	 */
+	public @Nullable String columnMergeOperatorClass(long columnId) {
+		FFMAbstractMergeOperator operator = edb.getColumn(columnId).mergeOperator();
+		while (operator instanceof DelegatingMergeOperator delegating) {
+			operator = delegating.getDelegate();
+		}
+		return operator == null ? null : operator.getClass().getName();
+	}
+
+	private long createColumn(String name, @NotNull ColumnSchema schema, @Nullable ExportImportFilesMetaData imported)
+			throws RocksDBException {
 		var nameBytes = name.getBytes(StandardCharsets.UTF_8);
 		if (EmbeddedDB.SYSTEM_COLUMNS.stream().anyMatch(system -> Arrays.equals(system, nameBytes))) {
 			throw RocksDBException.of(RocksDBErrorType.COLUMN_CREATE_FAIL, "Reserved column name: " + name);
@@ -323,6 +508,10 @@ final class EmbeddedDBColumns {
 			synchronized (edb.columnEditLock) {
 				var colId = getColumnIdOrNull(name);
 				var col = colId != null ? edb.getColumn(colId) : null;
+				if (imported != null && (col != null || edb.unconfiguredColumns.containsKey(name))) {
+					throw RocksDBException.of(RocksDBErrorType.COLUMN_EXISTS,
+							"Column exists, table files cannot be imported into it: " + name);
+				}
 				if (col != null) {
 					if (schema.equals(col.schema())) {
 						return colId;
@@ -410,7 +599,19 @@ final class EmbeddedDBColumns {
 							);
 						}
 						byte[] key = name.getBytes(StandardCharsets.UTF_8);
-						var cf = edb.db.get().createColumnFamily(new ColumnFamilyDescriptor(key, options.options()));
+						ColumnFamilyHandle cf;
+						if (imported == null) {
+							cf = edb.db.get().createColumnFamily(new ColumnFamilyDescriptor(key, options.options()));
+						} else {
+							try (var importOptions = new org.rocksdb.ImportColumnFamilyOptions().setMoveFiles(true)) {
+								cf = edb.db.get().createColumnFamilyWithImport(new ColumnFamilyDescriptor(key, options.options()),
+										importOptions, imported);
+							} catch (org.rocksdb.RocksDBException e) {
+								// Nothing was created: the name stays free.
+								edb.columnsConifg.remove(name, options.options());
+								throw e;
+							}
+						}
 						byte[] value = encodeColumnSchema(schema);
 						edb.db.get().put(edb.columnSchemasColumnDescriptorHandle, key, value);
 						return internalRegisterColumn(name, cf, schema, mergeOp);

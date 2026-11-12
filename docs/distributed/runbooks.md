@@ -157,6 +157,53 @@ the check of step 3 finds.
 If a node stops with "seeded with an existing database, but this replica's database is empty", it started without the
 copy: see "Membership" in the design document, and replace it as below.
 
+### Building the seed from some columns (`build-seed`)
+
+Use `build-seed` instead of copying the single node's `db/` when that database cannot be a seed as it is: its column
+volumes or its WAL are outside its directory (a node refuses a volume outside `db/`), or some of its columns must not
+go to the cluster. It builds a new database directory in the cluster's layout that holds only the chosen columns,
+with their schemas, by hard-linking their table files. It does not read the tables, so the time does not depend on
+their size when source volume, export directory and target are on one file system.
+
+```
+rs build-seed --source-db OLD-DB --source-config old-rockserver.conf --target /disk/seed \
+              --rockserver-config cluster-rockserver.conf --exclude-column big1 --exclude-column big2
+```
+
+- `--source-db` and `--source-config` are the stopped single node's database directory and config (step 1 above
+  applies). `--rockserver-config` is the config the cluster's nodes run with: the seed gets its volumes inside it,
+  and, when the cluster's `wal-path` is outside `db/`, a `wal.detached/` directory. `--column NAME` (repeatable)
+  takes only those columns, `--exclude-column NAME` all but those; not both.
+- The source is opened read-write, with its config but without automatic compactions: the open replays its WAL and
+  its memtables are flushed, as a start and stop of the single node would. No table file of it is rewritten or
+  deleted. It is refused while a Rockserver runs on it. Run it on a snapshot or clone of the volumes if the source
+  must stay untouched.
+- While a column is exported, the source database directory holds a symbolic link for each of the column's table
+  files that is in a volume outside it, and a `column-export.<pid>.<id>` entry; RocksDB's export finds table files
+  only in the database directory. They are removed before the command ends. If the command is killed, delete the
+  `*.sst` symbolic links and `column-export.*` in the source database directory, the `*.build-seed-export`
+  directory next to the volume (or `build-seed-*` in `--export-dir`) and `<target>.tmp`.
+- Hard links need one file system. The table files are first linked into an export directory, by default
+  `<volume>.build-seed-export` next to the column's volume (pass `--export-dir DIR` when the volume is a mount point,
+  whose sibling is on another file system), then into the target. Where a step crosses file systems, the files are
+  copied, and the command prints how many bytes before it copies them. Each column ends with a line
+  `column NAME: N files, B bytes, linked|copied` (`empty` for a column without table files), and the command with
+  `OK`. On a failure it prints `Not built: ...`, exits with 1 and leaves no target.
+- Refused: a column whose schema names a merge operator (an uploaded one, or a class): leave it out. A column merged
+  by the `merge-operator-class` of the source's config needs the same one in `--rockserver-config`. A column with
+  blob files. An existing target or `<target>.tmp`.
+- The linked seed shares its table files with the source. Copy it to the nodes before the single node runs again if
+  you want the three copies taken from one unchanging directory; the source deleting its own files later does not
+  change the seed.
+
+Then continue with steps 2 to 6 above, with the built seed as the database directory to copy. Build one seed and copy
+it to every node: two builds do not give the same files.
+
+Not tested: columns larger than a few megabytes (the time on terabytes is not measured), a column with several
+volumes, a source with a crashed (unreplayed) WAL, a kill of the command, and the source config's less common
+options (per-column table formats or comparators differing from the cluster's config are not compared: the seed's
+columns get the cluster's options, as columns created on the cluster do).
+
 ## Replacing a node
 
 For a node that is lost (dead disk, dead host) or that must move. One node at a time, and only while the others are a
