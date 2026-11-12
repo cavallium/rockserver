@@ -57,24 +57,36 @@ class Ipv6LeaderHintTest {
 	void clientOfBracketedIpv6NodesSendsLeaderCallsStraightToTheLeader() throws Exception {
 		assumeTrue(hasIpv6Loopback(), "no IPv6 loopback on this machine");
 		cluster = new InProcessCluster(temp, 3, "[::1]", c -> c).startAll();
-		var leader = cluster.awaitLeader(TIMEOUT);
+		cluster.awaitLeader(TIMEOUT);
 		var addresses = new java.util.ArrayList<Utils.HostAndPort>();
 		for (var node : cluster.runningNodes()) {
 			var self = node.config().self();
 			addresses.addAll(Utils.parseHostAndPorts("[::1]:" + self.apiPort()));
 		}
-		var leaderApi = leader.config().self().apiPort();
 		try (var connection = GrpcConnection.forHostsAndPorts("ipv6-client", addresses)) {
 			var api = connection.getAsyncApi(RequestContext.batch(TIMEOUT));
 			long column = api.createColumnAsync("c", SCHEMA).join();
-			InProcessCluster.await(TIMEOUT, () -> {
-				var key = new Keys(Buf.wrap(ByteBuffer.allocate(Long.BYTES).putLong(System.nanoTime()).array()));
-				api.putAsync(0, column, key, Buf.wrap(new byte[]{1}), RequestType.none()).join();
-				return connection.leaderChannelAddressForTesting() != null;
-			});
-			var channel = connection.leaderChannelAddressForTesting();
-			assertNotNull(channel);
-			assertEquals("[::1]:" + leaderApi, channel);
+			// Compared with the leader of the moment, in the wait: an election during the test moves both (review of R67).
+			var seen = new String[2];
+			try {
+				InProcessCluster.await(TIMEOUT, () -> {
+					var key = new Keys(Buf.wrap(ByteBuffer.allocate(Long.BYTES).putLong(System.nanoTime()).array()));
+					api.putAsync(0, column, key, Buf.wrap(new byte[]{1}), RequestType.none()).join();
+					var leader = cluster.awaitLeader(TIMEOUT);
+					if (leader == null) {
+						return false;
+					}
+					seen[0] = "[::1]:" + leader.config().self().apiPort();
+					seen[1] = connection.leaderChannelAddressForTesting();
+					return seen[0].equals(seen[1]);
+				});
+			} finally {
+				// On a timeout too: what the leader was and what the client had.
+				if (seen[0] != null && !seen[0].equals(seen[1])) {
+					assertNotNull(seen[1], "no leader channel; the leader is " + seen[0]);
+					assertEquals(seen[0], seen[1]);
+				}
+			}
 		}
 	}
 }
