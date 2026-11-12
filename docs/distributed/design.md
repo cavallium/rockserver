@@ -6164,8 +6164,8 @@ install it (`apt-get install gcc libc6-dev`) and run with `-Drockserver.test.req
      its last colon. `LeaderHintCache` now writes the hint with `Utils.formatHostAndPorts`, so an IPv6 host is always
      bracketed, whichever way the peer was configured. The Rust client has no leader hint (it never reads
      `rockserver-leader`), so there is nothing to fix there; its listed addresses are not compared with anything.
-     Tests: `LeaderHintRouterTest` (bracketed, other spellings, unbracketed, malformed, channel target) and
-     `LeaderHintCacheTest` fail on the old code; `Ipv6LeaderHintTest` (three in-process nodes on `[::1]`, a
+     Tests: `LeaderHintRouterTest` (bracketed, other spellings; the unbracketed, malformed and channel-target cases
+     pass on the old code too and pin what must stay) and `LeaderHintCacheTest` fail on the old code; `Ipv6LeaderHintTest` (three in-process nodes on `[::1]`, a
      `GrpcConnection` over the same list; skipped without an IPv6 loopback) times out waiting for a leader channel on the
      old code and finds one to the leader on the new. It reads the channel through the test-only
      `GrpcConnection.leaderChannelAddressForTesting()`; that writes go straight to the leader is shown by the channel
@@ -6251,10 +6251,18 @@ install it (`apt-get install gcc libc6-dev`) and run with `-Drockserver.test.req
      - That try is a heartbeat, which the node answers `INCONSISTENCY` (its log is shorter). Ratis counts that answer
        as an error (`errorCount` 29 to 31 in the log), so the appender sleeps again (0.5 to 1.5 s in the 10 runs), then sends a
        heartbeat at the new `nextIndex`, which succeeds (the node's commit index jumps to what it knows, 308 in one
-       run) but carries no entries. The error count is not cleared by it either, so the appender sleeps a third time
-       before it sends the entries (0.5 to 2.5 s in the 10 runs: the answers took the count past 30, where the step is 2 s, in some): in the run printed (leader log, seconds after the start): 2.15
-       first try, `INCONSISTENCY`, sleep 1444 ms, heartbeat `OK` at 3.60, sleep 2520 ms, 813 entries sent at 6.14 and
-       applied within 20 ms.
+       run) but carries no entries. The appender still sleeps a third time before it sends the entries (0.5 to 2.5 s
+       in the 10 runs), and not because the count survives that heartbeat (corrected in the review of R67, 3: a
+       successful answer sets the count to 0, `FollowerInfoImpl.ErrorStateImpl.updateErrorCount(false)` in the 3.3.1
+       bytecode). The first try is several requests (the heartbeat and what was queued behind it), each answered
+       `INCONSISTENCY`, so the count rises by two or three, the later ones while the appender already sleeps for the
+       first. The appender sleeps once for each count it has not slept for yet (`getErrorCountToDelay`): when it
+       wakes, it sends the heartbeat and, before the answer is back, sees a count it has not slept for and sleeps
+       again, with the step of that count (past 30 in some runs, where the step is 2 s). The answer arrives a few
+       milliseconds later and clears the count, but nothing wakes the sleep. In the run printed (leader log, seconds
+       after the start): 2.15 first try, three `INCONSISTENCY` answers within 4 ms (count 29, 30, 31), sleep 1444 ms
+       for 29, heartbeat sent at 3.60 and sleep 2520 ms for 31 begun in the same millisecond, heartbeat `OK` 3 ms
+       later, 813 entries sent at 6.14 and applied within 20 ms.
      - The ten runs, seconds after the node's start: `READY` 1.2 to 1.4; first answer 1.4 to 2.6; the first
        successful heartbeat 1.6 to 4.4; the entries acknowledged 1.7 to 6.1 (two runs had no `INCONSISTENCY` and so no
        second and third sleep: 1.7 and 2.2); the polling saw the node level 2.7 to 7.2. Sleeps after the first answer:
@@ -6271,9 +6279,73 @@ install it (`apt-get install gcc libc6-dev`) and run with `-Drockserver.test.req
      (twice the longest sleep, now 6 s, would be 3 s: a node that is cut off for a moment would be taken out of service
      sooner, so the gate's own tests need a re-run) and of twice as many failed tries against a node that is down
      (the 0.15% of a core of this policy's last step, see "ApiGate", would roughly double, and the warnings, batched every 5 s,
-     do not grow). Not changed here: this is a replication timing setting. A change in Ratis, clearing the error
-     state on the first successful reply (a heartbeat too, or an `INCONSISTENCY` that moves `nextIndex`), might remove
-     the second and third sleep for every setting (not tried: the Ratis code that resets the count was not read); "Upstream" is the place to note it if it is filed.
+     do not grow). Not changed here: this is a replication timing setting. A change in Ratis would remove the
+     last sleep for every setting: Ratis already clears the count on a successful answer, so what is missing is that
+     the answers of one burst count as one error, or that a successful answer ends a sleep under way (review of R67,
+     3; not tried). "Upstream" is the place to note it if it is filed.
+   - Review of R67 (4 findings: one regression of the round in the replicated server, one gap in the leader hints,
+     two in the docs; fixed here. Every new test of the round was run against the code before its fix and failed
+     there as its entry says, each code commit compiles on its own, and the touched classes pass):
+     1. (low, replicated server; a regression of R66-5 that no release had) A second signal during a start halted
+        the node. The handler thread of every signal after the first calls `Shutdown.exit` and waits behind the
+        first one's shutdown, so it has a frame of `java.lang.Shutdown` and none of `runHooks`: exactly what
+        `JvmExit.exitWaiting` took for a `System.exit` on another thread. A SIGTERM sent twice during a long start
+        (an operator repeating `kill`, Ctrl-C twice, the SIGHUP and SIGTERM of a closing terminal) therefore gave
+        the start 30 s and then
+        `Node <id> does not start: a System.exit on another thread waits behind the shutdown that a signal started ...; halting with 1`,
+        where before R66-5 the hook waited for the start however long (R28-4). Red:
+        `StartExitProcessTest.aSecondSignalDuringAStartStillWaitsForTheStart` (two SIGTERM 500 ms apart during a
+        start of 5 s, limit 2 s: exit 1 and "halting" after 2.9 s). Fixed: `exitWaiting` does not count a thread with
+        a frame of the signal handler (`java.lang.Terminator`); nothing waits for such a thread. The test now ends
+        with 143 after the start, the node stopped. The single-node server never asked this question (its hook looks
+        only at the thread of `run`), so nothing changes there.
+     2. (low, client) `LeaderHintRouter.normalize` wrote every host with a colon in brackets, also when the JDK reads
+        the literal as an IPv4 address: `::ffff:10.0.0.1` became `[10.0.0.1]:port`, which equals neither the listed
+        `10.0.0.1:port` nor anything else, so an IPv4-mapped spelling on one side and the plain one on the other was
+        dropped as "not one of the client's addresses" (the fault of R67-1, one spelling over). Red:
+        `LeaderHintRouterTest.anIpv4MappedIpv6HintIsTheIpv4Address`. Fixed: the brackets are written only when the
+        normalised host still has a colon. IPv4 literals and host names are compared as before R67-1 (lower case,
+        no lookup): `LeaderHintRouterTest`'s older cases and `ClientFailoverTest` pass unchanged.
+     3. (docs) R66-4 said that a successful heartbeat does not clear the appender's error count and proposed that
+        Ratis clear it. It does clear it (`ErrorStateImpl.updateErrorCount(false)` sets the count to 0; `isError` is
+        true for `INCONSISTENCY`, a timeout and a stream error only). The sleep after the successful heartbeat is for
+        the further `INCONSISTENCY` answers of the first burst and begins before the heartbeat's answer is back; the
+        entry above is corrected, with the lines of the leader's log it was read from
+        (`/var/tmp/rockserver-r67/r66-4/logs/1794448407066/stderr-2.log`). The measurements stand. The proposal to
+        shorten `APPENDER_RETRY_POLICY` is not taken: it halves `ApiGate`'s minimum pause and doubles the tries
+        against a dead follower to save 2 to 5 s once per node restart, and nothing waits on those seconds (the
+        runbook's rolling restart waits for the commit index anyway).
+     4. (docs) The runbook's exit-code row told the operator to read the member list of a node from `status` in the
+        R66-3 case. `status` prints the role, the applied and commit index and Ratis' commit infos of each member,
+        not its configuration: the row now says to replace the node in that case. And the R67-1 entry said all five
+        new `LeaderHintRouterTest` cases fail on the old code: two do (bracketed, other spellings), three pass on
+        both and are pins.
+     Judged and left as they are:
+     - R66-3's proposed start-time check (compare the index of the configuration Ratis starts with against
+       `InstalledConfiguration` and the committed-configuration history, exit 1 or rewrite the file) is not
+       implemented. The state it guards against needs the two-writer race, which no run has produced, and can only
+       be built by writing the file by hand; a check that is wrong in the other direction refuses the start of a
+       healthy node, and the two records it would trust are written at other moments than the file (a chunk's
+       configuration is recorded before Ratis sees the chunk, so an install that fails afterwards may leave the
+       record ahead of the file with nothing wrong; not run). The evidence of the entry stands: the sweep and the nine process cases
+       were run again here (green), and the worst case is a real, older configuration, the round-11 residual.
+       It needs a decision, and a way to produce the state through Ratis, before code.
+     - R67-1 changed what a server sends for an IPv6 `--peer` written without brackets (`::1:5333` before,
+       `[::1]:5333` now). A client older than R67-1 with such a list took the old form and drops the new one: its
+       leader-bound calls pay the forwarding hop until the client is upgraded (correct, slower). New clients read
+       both forms. Kept: one unambiguous form on the wire is worth more than that combination, which no deployment
+       has (the replicated server is not released).
+     - The single-node server at a normal start and stop does what it did: the hook's wait is the same latch, read
+       every 200 ms instead of once, with one stack trace of the thread of `run` per read; `_exit` is linked only on
+       the halt. `MainShutdownTest`, `GrpcShutdownTest`, `SafeShutdownTest`, `RocksDBStatisticsShutdownTest` and
+       the four non-exit cases of `MainStartProcessTest` pass; its two exit cases hang for 60 s on the old hook.
+       That a failed start of it ends with status 0 (R66-5, "found on the way") is still open and needs a decision.
+     - `Ipv6LeaderHintTest` compared the client's leader channel with the leader found before the client connected;
+       an election in between (400 to 800 ms timeouts) would have failed it. It now compares with the leader of the
+       moment inside its wait. Not seen failing; the bound and what is asserted are the same.
+     Not verified: the full core and distributed suites (only the classes named here and in the entries above);
+     another JDK than Temurin 27.0.1 for the frame names; a second signal of another kind than SIGTERM (SIGHUP and
+     SIGINT go through the same handler class, read in the JDK's source, not run).
    - Review of R46, 1 (low, docs): the R46-2 recipe ran `dependency:build-classpath` on `distributed/server/pom.xml`
      alone, so Maven resolved `rockserver-core:${revision}` and that version's pom from `~/.m2` (or the snapshot
      repository): `grep -v /rockserver-core/` dropped the jar but kept the third-party jars of that pom, from whichever
