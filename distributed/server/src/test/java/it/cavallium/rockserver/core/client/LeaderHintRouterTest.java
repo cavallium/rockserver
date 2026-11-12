@@ -80,6 +80,71 @@ class LeaderHintRouterTest {
 		return got;
 	}
 
+	/** A router whose own list is parsed as a client's is: {@code Utils.parseHostAndPorts} strips the brackets (R67-1). */
+	private LeaderHintRouter ipv6Router(String hosts) {
+		var router = new LeaderHintRouter(LeaderHintRouter.Mode.LISTED,
+				it.cavallium.rockserver.core.common.Utils.parseHostAndPorts(hosts), Set.of(), now::get);
+		router.start(address -> {
+			var channel = new FakeChannel(address.host() + ":" + address.port());
+			opened.add(channel);
+			return channel;
+		});
+		return router;
+	}
+
+	@Test
+	void bracketedIpv6HintOfAListedAddressIsTaken() {
+		var router = ipv6Router("[::1]:5001,[::1]:5002,[::1]:5003");
+		router.offer("[::1]:5002");
+		assertEquals(1, opened.size(), "the bracketed hint was dropped");
+		// The channel is opened to the host without brackets, as the listed addresses are.
+		assertEquals("::1:5002", opened.getFirst().name);
+		router.offer("[::1]:5009");
+		assertEquals(1, opened.size(), "an address that is not listed was taken");
+	}
+
+	@Test
+	void ipv6SpellingsOfOneAddressAreOne() {
+		var router = ipv6Router("[::1]:5001,[2001:DB8::1]:5002");
+		router.offer("[0:0:0:0:0:0:0:1]:5001");
+		assertEquals(1, opened.size());
+		// The same leader in another spelling is not a new leader: no second channel, the hint is kept.
+		router.offer("[::1]:5001");
+		router.offer("[0000:0000:0000:0000:0000:0000:0000:0001]:5001");
+		assertEquals(1, opened.size());
+		assertEquals("[0:0:0:0:0:0:0:1]:5001", router.currentAddress());
+		router.offer("[2001:db8:0:0:0:0:0:1]:5002");
+		assertEquals(2, opened.size(), "a case and zero spelling of a listed address was dropped");
+	}
+
+	@Test
+	void unbracketedIpv6HintIsStillTaken() {
+		var router = ipv6Router("[::1]:5001");
+		router.offer("::1:5001");
+		assertEquals(1, opened.size());
+		assertEquals("::1:5001", opened.getFirst().name);
+	}
+
+	@Test
+	void malformedBracketsAreIgnored() {
+		var router = ipv6Router("[::1]:5001");
+		router.offer("[::1:5001");
+		router.offer("::1]:5001");
+		router.offer("[]:5001");
+		router.offer("[::1]:0");
+		assertTrue(opened.isEmpty());
+	}
+
+	@Test
+	void theChannelOpenedForAnIpv6HintHasAValidTarget() throws Exception {
+		var channel = io.grpc.netty.NettyChannelBuilder.forAddress("::1", 5001).usePlaintext().build();
+		try {
+			assertEquals("[::1]:5001", channel.authority());
+		} finally {
+			channel.shutdownNow();
+		}
+	}
+
 	@Test
 	void withoutHintEverythingTakesTheOrdinaryChannel() {
 		var router = router(LeaderHintRouter.Mode.LISTED);

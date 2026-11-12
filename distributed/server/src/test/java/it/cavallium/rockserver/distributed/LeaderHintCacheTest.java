@@ -27,6 +27,16 @@ class LeaderHintCacheTest {
 	}
 
 	@Test
+	void ipv6HostsAreInBracketsWhetherOrNotTheConfigHadThem() {
+		addresses.put("n1", new HostAndPort("[::1]", 5001));
+		addresses.put("n2", new HostAndPort("::1", 5002));
+		addresses.put("n3", new HostAndPort("node-3", 5003));
+		assertEquals("[::1]:5001", hint("n1"));
+		assertEquals("[::1]:5002", hint("n2"));
+		assertEquals("node-3:5003", hint("n3"));
+	}
+
+	@Test
 	void theSameLeaderAndVersionAreNotLookedUpAgain() {
 		addresses.put("n1", new HostAndPort("10.0.0.1", 5001));
 		assertEquals("10.0.0.1:5001", hint("n1"));
