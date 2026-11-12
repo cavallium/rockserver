@@ -6103,6 +6103,28 @@ install it (`apt-get install gcc libc6-dev`) and run with `-Drockserver.test.req
         (`ReplicatedServerMain.logInfo`), not the leader's view. The new comparison is stricter than the old one
         (one comparison, no second try, and each database must hold the converged index), not a longer wait around a
         fault: a follower that never applied its log's tail now fails the wait after 30 s with every node's indices.
+   - R67-1 (low, client and server): in the default LISTED mode a leader hint whose host is a bracketed IPv6 literal
+     was dropped. The server sent `[::1]:5333` (`PeerConfig` keeps the brackets of a `--peer`), the client's listed
+     keys came from `Utils.parseHostAndPorts`, which strips them (`::1:5333`), and `LeaderHintRouter` compared the
+     texts, so a client of three nodes on `[::1]` never used a leader channel: every leader-bound call paid the
+     forwarding hop (correct, only slower). Fixed on both sides to one form. `LeaderHintRouter.normalize` strips the
+     brackets, lower-cases, and writes an IPv6 literal as the JDK prints it (`InetAddress.ofLiteral`, text only, no
+     lookup), so `::1`, `[::1]` and `[0:0:0:0:0:0:0:1]` are one address; the same key serves the listed check, the
+     "same hint again" check, the back-off after a failed channel, and the leader's own naming of itself in a response
+     (`Hint.names`), so another spelling of the same leader is not a new leader. The hint is parsed with its
+     brackets removed, and the channel is opened to the bare host, as `forHostAndPort` is for a listed address (checked:
+     `NettyChannelBuilder.forAddress("::1", port)` has the authority `[::1]:port`). A hint without brackets
+     (`::1:5333`, which an old server built from an unbracketed `--peer`, accepted by `PeerConfig`) is still read, by
+     its last colon. `LeaderHintCache` now writes the hint with `Utils.formatHostAndPorts`, so an IPv6 host is always
+     bracketed, whichever way the peer was configured. The Rust client has no leader hint (it never reads
+     `rockserver-leader`), so there is nothing to fix there; its listed addresses are not compared with anything.
+     Tests: `LeaderHintRouterTest` (bracketed, other spellings, unbracketed, malformed, channel target) and
+     `LeaderHintCacheTest` fail on the old code; `Ipv6LeaderHintTest` (three in-process nodes on `[::1]`, a
+     `GrpcConnection` over the same list; skipped without an IPv6 loopback) times out waiting for a leader channel on the
+     old code and finds one to the leader on the new. It reads the channel through the test-only
+     `GrpcConnection.leaderChannelAddressForTesting()`; that writes go straight to the leader is shown by the channel
+     being the leader's and taking leader-bound calls (`LeaderHintRouter` routing is covered by its own tests), not by a
+     count of forwarded calls, which the server does not keep.
    - Review of R46, 1 (low, docs): the R46-2 recipe ran `dependency:build-classpath` on `distributed/server/pom.xml`
      alone, so Maven resolved `rockserver-core:${revision}` and that version's pom from `~/.m2` (or the snapshot
      repository): `grep -v /rockserver-core/` dropped the jar but kept the third-party jars of that pom, from whichever
