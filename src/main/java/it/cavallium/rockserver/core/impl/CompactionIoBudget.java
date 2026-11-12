@@ -976,25 +976,27 @@ public final class CompactionIoBudget {
      * Starts a downward rate trial if one can be informative. A trial says something only while the limiter is the
      * bottleneck of background I/O, and it must never starve a memtable flush:
      * <ul>
-     * <li>a window that did not saturate the limiter (under 80% of the budget) starts none: the budget is not what
-     * background I/O ran at, and a rate under the measured demand would only throttle the next flush;</li>
      * <li>the trial rate is never under the flush floor (the seed);</li>
      * <li>a trial rate that is not at least 10% under the measured rate is not tried: it could never be kept (a kept
-     * trial needs the background rate to fall by 10%), so the limiter is as low as it can usefully go and the
-     * current latency becomes the reference.</li>
+     * trial needs the background rate to fall by 10%). The limiter is as low as it may go for this background
+     * (which includes every background at or under the flush floor), so the current latency becomes the
+     * reference and the next attempt is 12 windows later;</li>
+     * <li>a window above that which did not saturate the limiter (under 80% of the budget) starts none and learns
+     * nothing: the budget is not what background I/O ran at.</li>
      * </ul>
      * @return whether a trial started
      */
     private boolean beginProbe(double latency, double foregroundRate, double pointCallRate) {
-        if (!limiterBound()) return false;
+        long candidate = Math.max(seed, bound(Math.min(budget, lastAchieved) * .75));
+        // A healthy rate trial must fit the acknowledged reader cap. Safety cuts run first and remove this floor.
+        if (foregroundHealthy) candidate = Math.max(candidate, bound(Math.ceil(readaheadBytes * 12.5)));
+        boolean lowest = candidate >= budget || candidate > lastAchieved * .9;
+        if (!lowest && !limiterBound()) return false;
         pointReferenceWindows = 0; pointReferenceMax = 0;
         bulkReferenceWindows = 0;
         tailOffProbeHoldUntil = 0;
         resetTailBlocks();
-        long candidate = Math.max(seed, bound(Math.min(budget, lastAchieved) * .75));
-        // A healthy rate trial must fit the acknowledged reader cap. Safety cuts run first and remove this floor.
-        if (foregroundHealthy) candidate = Math.max(candidate, bound(Math.ceil(readaheadBytes * 12.5)));
-        if (candidate >= budget || candidate > lastAchieved * .9) {
+        if (lowest) {
             if (Double.isFinite(latency) && latency > 0) baseline = latency;
             cooldown = 12;
             return false;

@@ -155,19 +155,36 @@ class CompactionIoBudgetTest {
     }
     @Test void aDemandLimitedWindowNeverStartsATrial() {
         // It was probeTestsServiceWhenBudgetExceedsActualConsumption: 100 KB/s of background I/O under a 1 MB/s budget
-        // started a trial at 75 KB/s, the rate the next memtable flush was then throttled to.
+        // started a trial at 75 KB/s, the rate the next memtable flush was then throttled to. Here the background is
+        // 400 KB/s, above the 250 KB/s flush floor: a trial at 300 KB/s is allowed by the floor, but not by a limiter
+        // that is not the bottleneck.
         var t = new Trace(); t.window(10, 100, SEED);
         t.window(10, 100, SEED); t.window(10, 100, SEED); // restore prior budget
         assertEquals(SEED, t.policy.budget());
         for (int i = 0; i < 40; i++) {
             // Faster, equal and much slower point reads: none says anything about a limiter that limits nothing.
-            t.window(10, i % 3 == 0 ? 80 : i % 3 == 1 ? 100 : 300, 100_000);
+            t.window(10, i % 3 == 0 ? 80 : i % 3 == 1 ? 100 : 300, 400_000);
             assertEquals(CompactionIoBudget.State.TRACKING, t.policy.state(), "window " + i);
             assertEquals(SEED, t.policy.budget(), "window " + i);
         }
         t.window(10, 100, SEED);
         assertEquals(CompactionIoBudget.State.PROBE, t.policy.state(), "the limiter is the bottleneck again");
         assertEquals(750_000, t.policy.budget());
+    }
+    @Test void slowerPointReadsOverABackgroundUnderTheFlushFloorBecomeTheBaseline() {
+        // The limiter may not go under the seed, so it can do nothing about a background of a tenth of it: without
+        // an idle window and without a trial, the slower reads must still become the reference (within 13 windows).
+        var t = new Trace(SEED);
+        t.window(10, 100, 100_000);
+        assertEquals(100, t.policy.baselineReadMicros());
+        int accepted = -1;
+        for (int i = 0; i < 20 && accepted < 0; i++) {
+            t.window(10, 200, 100_000);
+            assertEquals(CompactionIoBudget.State.TRACKING, t.policy.state());
+            assertEquals(SEED, t.policy.budget());
+            if (200 <= t.policy.baselineReadMicros() * 1.2) accepted = i;
+        }
+        assertTrue(accepted >= 0 && accepted <= 13, "accepted at window " + accepted);
     }
     @Test void aTrialNeverGoesUnderTheSeed() {
         var t = new Trace(800_000);
