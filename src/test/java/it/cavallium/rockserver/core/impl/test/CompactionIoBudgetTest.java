@@ -216,6 +216,16 @@ class CompactionIoBudgetTest {
         t.window(10, 200, budget);
         assertEquals(budget, t.policy.budget(), "a saturated window with slow point reads must not grow");
     }
+    @Test void aDoublingFollowedBySlowPointReadsIsTakenBack() {
+        var t = new Trace(); t.window(10, 100, SEED); t.window(10, 100, SEED); t.window(10, 100, SEED);
+        assertEquals(SEED, t.policy.budget());
+        t.window(10, 100, SEED);
+        assertEquals(2 * SEED, t.policy.budget());
+        t.window(10, 200, 2 * SEED);
+        assertEquals(SEED, t.policy.budget(), "point reads at twice the baseline right after the step");
+        t.window(10, 100, SEED);
+        assertTrue(t.policy.budget() > SEED && t.policy.budget() <= SEED * 1.1, "budget " + t.policy.budget());
+    }
     @Test void healthyGrowthNeedsDemandAndStaysBoundedDespiteJitter() {
         var t = new Trace(); t.window(10, 100, SEED); t.window(10, 100, SEED); t.window(10, 100, SEED);
         long budget = t.policy.budget();

@@ -200,6 +200,7 @@ public final class CompactionIoBudget {
     private long preThrottle, probeBudget;
     private double probeLatency, probeAchieved, probeForegroundRate, probePointCallRate;
     private int settle, cooldown, healthyRecovery, probeBenefits, cautiousGrowth;
+    private long beforeGrowth;
     private double firstProbeBenefitLatency;
     private long bulkCalls, bulkTime, bulkKeys, readSaturatedNanos, readPendingNanos, readQueuedNanos, readCompleted;
     private boolean bulkEpochValid = true, bulkSeen, bulkIdle = true, bulkComparable, bulkHealthy,
@@ -283,6 +284,7 @@ public final class CompactionIoBudget {
             boolean tracking = state == State.TRACKING;
             state = State.RECOVERY;
             healthyRecovery = 0;
+            beforeGrowth = 0;
             queueReferenceWindows = 0; probeQueueProtected = false;
             double usefulService = Math.max(preThrottle, Math.max(recentAchieved, probeBudget));
             if (usefulService > 0 && tracking) usefulService = Math.max(usefulService, budget);
@@ -543,11 +545,15 @@ public final class CompactionIoBudget {
             beginProbe(latency, foregroundRate, pointCallRate);
         } else {
             if (cooldown > 0) cooldown--;
+            long undo = beforeGrowth;
+            beforeGrowth = 0;
             if (pointHealthy && growthAllowed) {
                 if (pointReliable) baseline = baseline * .9 + latency * .1;
                 if (achieved >= budget * .8) {
                     budget = grown(achieved);
                 }
+            } else if (unhealthyMean && undo > 0 && undo < budget) {
+                budget = undo; // The window after a growth step had slow reads: take the step back.
             }
         }
         return publishBudget();
@@ -925,7 +931,9 @@ public final class CompactionIoBudget {
             cautiousGrowth--;
             return bound(Math.max(budget, Math.min(budget * 1.1, recentAchieved * 1.25)));
         }
-        return bound(Math.max(budget, achieved * 2));
+        long next = bound(Math.max(budget, achieved * 2));
+        if (next > budget) beforeGrowth = budget;
+        return next;
     }
     private long publishBudget() {
         // A byte-rate probe may block growth, but never a latency-safety reduction.
@@ -969,6 +977,7 @@ public final class CompactionIoBudget {
             cooldown = 12;
             return;
         }
+        beforeGrowth = 0;
         probeQueueRemovals = 0;
         probeQueueProtected = queueReferenceWindows >= 2;
         queueReferenceWindows = 0;
