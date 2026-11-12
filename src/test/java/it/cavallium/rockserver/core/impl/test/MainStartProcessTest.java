@@ -65,7 +65,9 @@ public class MainStartProcessTest {
 
 	/**
 	 * The gRPC port is held by another socket: the start fails after the database opened and the Thrift server
-	 * started. The process ends by itself, having closed everything (it logs the cause, which this child does not show).
+	 * started. The process ends by itself, having closed everything (it logs the cause, which this child does not show),
+	 * with status 1: a supervisor that restarts on failure must see a failure. It ended with 0 before, the status of a
+	 * {@code main} that returned.
 	 */
 	@Test
 	void aTakenListeningPortEndsTheProcessWithTheDatabaseClosed() throws Exception {
@@ -78,21 +80,19 @@ public class MainStartProcessTest {
 			String log = awaitExit(child);
 			assertFalse(log.contains("halting"), log);
 			assertEquals("complete", Files.readString(shutdownComplete), log);
-			// What it has always done: the failure is in the log, the status is that of a main method that returned.
-			// Pinned as it is, not as it should be.
-			assertEquals(0, child.exitValue(), log);
+			assertEquals(1, child.exitValue(), log);
 		}
 		assertDatabaseOpens();
 	}
 
-	/** The start throws once the database is open: the same end as a taken port. */
+	/** The start throws once the database is open: the same end as a taken port, status 1 with everything closed. */
 	@Test
 	void aStartThatThrowsEndsTheProcessWithTheDatabaseClosed() throws Exception {
 		var child = start("fail", reserveLoopbackPort(), reserveLoopbackPort());
 		String log = awaitExit(child);
 		assertFalse(log.contains("halting"), log);
 		assertEquals("complete", Files.readString(shutdownComplete), log);
-		assertEquals(0, child.exitValue(), log);
+		assertEquals(1, child.exitValue(), log);
 		assertDatabaseOpens();
 	}
 
@@ -281,14 +281,15 @@ public class MainStartProcessTest {
 	}
 
 	/**
-	 * The child JVM: {@code Main.run} with a start that the test controls through {@code -Drockserver.test.mainStart},
-	 * run once the database is open and before the servers are built. Every mode but {@code none} prints
-	 * {@code STARTING} first.
+	 * The child JVM: {@code Main.runAndExit}, which is {@code Main.main} with callbacks, with a start that the test
+	 * controls through {@code -Drockserver.test.mainStart}, run once the database is open and before the servers are
+	 * built. Every mode but {@code none} prints {@code STARTING} first.
 	 * <ul>
 	 * <li>{@code none}: the start as it is.</li>
 	 * <li>{@code slow}: 5 s late. The test sends SIGTERM during the wait.</li>
 	 * <li>{@code fail}: throws.</li>
-	 * <li>{@code fail-then-exit}: throws, and the child calls {@code System.exit(7)} once {@code run} returned.</li>
+	 * <li>{@code fail-then-exit}: throws, and the child, which calls {@code Main.run} here as an embedding caller
+	 * would, calls {@code System.exit(7)} once {@code run} returned.</li>
 	 * <li>{@code exit}: calls {@code System.exit(9)}.</li>
 	 * <li>{@code exit-after-signal}: after 3 s, during which the test sends SIGTERM, calls {@code System.exit(9)}.</li>
 	 * </ul>
@@ -331,7 +332,8 @@ public class MainStartProcessTest {
 				}
 			};
 			var run = Class.forName("it.cavallium.rockserver.core.Main")
-					.getDeclaredMethod("run", String[].class, Runnable.class, Runnable.class);
+					.getDeclaredMethod(mode.equals("fail-then-exit") ? "run" : "runAndExit",
+							String[].class, Runnable.class, Runnable.class);
 			run.setAccessible(true);
 			try {
 				run.invoke(null, mainArgs, onShutdownComplete, onConnected);

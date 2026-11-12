@@ -33,7 +33,14 @@ public class Main {
 	private static final long SHUTDOWN_POLL_MILLIS = 200;
 
 	public static void main(String[] args) throws IOException, URISyntaxException {
-		run(args, () -> {});
+		runAndExit(args, () -> {}, () -> {});
+	}
+
+	/** What {@link #main} does, with the callbacks of {@link #run(String[], Runnable, Runnable)}. */
+	@VisibleForTesting
+	static void runAndExit(String[] args, Runnable shutdownCompleteCallback, Runnable connectedCallback)
+			throws IOException, URISyntaxException {
+		run(args, shutdownCompleteCallback, connectedCallback);
 	}
 
 	@VisibleForTesting
