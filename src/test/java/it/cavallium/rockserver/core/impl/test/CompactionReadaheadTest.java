@@ -141,7 +141,8 @@ class CompactionReadaheadTest {
         var state = CompactionIoBudget.class.getDeclaredField("state"); state.setAccessible(true);
         var prior = CompactionIoBudget.class.getDeclaredField("probeBudget"); prior.setAccessible(true);
         var rate = CompactionIoBudget.class.getDeclaredField("budget"); rate.setAccessible(true);
-        long restored = t.policy.budget(), reduced = restored * 3 / 4;
+        // The budget no longer follows a window that did not saturate the limiter, so the test states the rate itself.
+        long restored = t.in.rate, reduced = restored * 3 / 4;
         prior.setLong(t.policy, restored); rate.setLong(t.policy, reduced);
         state.set(t.policy, CompactionIoBudget.State.PROBE);
         t.step();

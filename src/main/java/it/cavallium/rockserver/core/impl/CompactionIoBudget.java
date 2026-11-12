@@ -199,7 +199,7 @@ public final class CompactionIoBudget {
     private double recentAchieved, lastAchieved;
     private long preThrottle, probeBudget;
     private double probeLatency, probeAchieved, probeForegroundRate, probePointCallRate;
-    private int settle, cooldown, healthyRecovery, probeBenefits;
+    private int settle, cooldown, healthyRecovery, probeBenefits, cautiousGrowth;
     private double firstProbeBenefitLatency;
     private long bulkCalls, bulkTime, bulkKeys, readSaturatedNanos, readPendingNanos, readQueuedNanos, readCompleted;
     private boolean bulkEpochValid = true, bulkSeen, bulkIdle = true, bulkComparable, bulkHealthy,
@@ -363,6 +363,7 @@ public final class CompactionIoBudget {
         boolean unhealthyMean = pointReliable && baseline > 0 && latency > baseline * 1.2
                 || bulkComparable && bulkBaseline > 0 && bulkLatency > bulkBaseline * 1.2;
         if (unhealthyMean || noForegroundProgress || bulkNoProgress) reduceReadahead(0);
+        if (unhealthyMean && active) cautiousGrowth = 12;
         boolean ownPointReliable = !pointTailActive || pointReliable && pointTailInWindow > 0;
         boolean ownBulkReliable = bulkIdle && !bulkTailActive
                 || bulkComparable && nativeBulks >= 32 && nativeBulkShapeInWindow > 0 && bulkTailInWindow > 0;
@@ -467,7 +468,7 @@ public final class CompactionIoBudget {
             if (achieved > 0) recentAchieved = recentAchieved == 0 ? achieved : recentAchieved * .5 + achieved * .5;
             if (pressureInWindow) {
                 healthyRecovery = 0;
-                if (achieved >= budget * .8) budget = bound(Math.max(budget, Math.min(budget * 1.1, recentAchieved * 1.25)));
+                if (achieved >= budget * .8) budget = bound(Math.max(budget, achieved * 2));
                 return publishBudget();
             }
             if (++healthyRecovery >= 2) { state = State.BOOTSTRAP; baseline = 0; }
@@ -514,9 +515,9 @@ public final class CompactionIoBudget {
         }
         recentAchieved = recentAchieved == 0 ? achieved : recentAchieved * .5 + achieved * .5;
         if (state == State.BOOTSTRAP) {
-            // One active window learns actual service; no device MB/s assumption.
-            budget = bound(achieved);
-            preThrottle = bound(achieved);
+            // A window the limiter did not saturate measured demand, not service: it must not lower the budget.
+            if (achieved >= budget * .8) budget = bound(achieved);
+            preThrottle = budget;
             state = State.TRACKING;
             if (pointReliable) baseline = latency;
             if ((pointReliable || bulkComparable) && bulkSafe) beginProbe(latency, foregroundRate, pointCallRate);
@@ -530,7 +531,7 @@ public final class CompactionIoBudget {
         // Cache hits/mutations or proven foreground idleness cannot conceal an active slow/sparse bulk lane.
         if (!pointReliable && !bulkComparable) {
             if (growthAllowed && (completedInWindow >= 32 || foregroundIdle) && achieved >= budget * .8) {
-                budget = bound(Math.max(budget, Math.min(budget * 1.1, recentAchieved * 1.25)));
+                budget = grown(achieved);
             } else if (noForegroundProgress && !noProgressProbeUsed && baseline > 0) {
                 noProgressProbeUsed = true;
                 beginProbe(baseline, foregroundRate, pointCallRate);
@@ -545,7 +546,7 @@ public final class CompactionIoBudget {
             if (pointHealthy && growthAllowed) {
                 if (pointReliable) baseline = baseline * .9 + latency * .1;
                 if (achieved >= budget * .8) {
-                    budget = bound(Math.max(budget, Math.min(budget * 1.1, recentAchieved * 1.25)));
+                    budget = grown(achieved);
                 }
             }
         }
@@ -916,6 +917,16 @@ public final class CompactionIoBudget {
             }
         } else reliableGrowthWindows = 0;
     }
+    /** Called only for a window that saturated the limiter (achieved >= 80% of budget) with a healthy foreground. */
+    private long grown(double achieved) {
+        // Measured foreground harm in the last 12 growth windows: +10% steps. Otherwise capacity is unknown and
+        // the limiter is the bottleneck, so search multiplicatively (40 KiB/s reaches 200 MB/s in 13 windows, not 90).
+        if (cautiousGrowth > 0) {
+            cautiousGrowth--;
+            return bound(Math.max(budget, Math.min(budget * 1.1, recentAchieved * 1.25)));
+        }
+        return bound(Math.max(budget, achieved * 2));
+    }
     private long publishBudget() {
         // A byte-rate probe may block growth, but never a latency-safety reduction.
         reduceReadahead(admissionReadaheadLimit());
@@ -925,6 +936,7 @@ public final class CompactionIoBudget {
     }
     private void finishProbe(boolean improved, double latency) {
         if (improved) {
+            cautiousGrowth = 12;
             if (Double.isFinite(latency) && latency > 0) baseline = latency;
             if (probeBulkProtected && bulkComparable) bulkBaseline = bulkLatency;
         }
@@ -947,9 +959,12 @@ public final class CompactionIoBudget {
         tailOffProbeHoldUntil = 0;
         resetTailBlocks();
         long candidate = bound(Math.min(budget * .75, lastAchieved > 0 ? lastAchieved * .75 : budget));
+        // Clamped up to the floor at or above the measured background rate: the trial cannot slow anything, it would
+        // only starve the next flush.
+        boolean floorNoOp = lastAchieved > 0 && candidate >= lastAchieved;
         // A healthy rate trial must fit the acknowledged reader cap. Safety cuts run first and remove this floor.
         if (foregroundHealthy) candidate = Math.max(candidate, bound(Math.ceil(readaheadBytes * 12.5)));
-        if (candidate >= budget) {
+        if (candidate >= budget || floorNoOp) {
             baseline = latency;
             cooldown = 12;
             return;

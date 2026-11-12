@@ -7,11 +7,12 @@ import static org.junit.jupiter.api.Assertions.*;
 class CompactionIoBudgetTest {
     private static final long SEED = 1_000_000;
     private static final class Trace {
-        final CompactionIoBudget policy = new CompactionIoBudget(SEED);
+        final CompactionIoBudget policy;
         long nanos, reads, micros, bytes, completions, nativePoints, nativeNanos;
         boolean point = true, timed = true;
         long pointMax;
-        Trace() { poll(0, 0, 0, false, false); }
+        Trace() { this(SEED); }
+        Trace(long seed) { policy = new CompactionIoBudget(seed); poll(0, 0, 0, false, false); }
         long poll(long count, long latency, long transferred, boolean pressure, boolean pending) {
             nanos += 1_000_000_000L; reads += count; micros += count * latency; bytes += transferred;
             if (point) { nativePoints += count; if (timed) nativeNanos += count * latency * 1000; }
@@ -185,14 +186,45 @@ class CompactionIoBudgetTest {
         }
         assertTrue(t.policy.budget() > initial);
     }
+    @Test void tinyFirstActiveWindowDoesNotCollapseTheBudget() {
+        // Production 2026-11-12: a few-KB flush right after start set the budget to the 40,960 B/s floor for 12 minutes.
+        var t = new Trace();
+        t.window(10, 100, 100);
+        assertEquals(SEED, t.policy.budget(), "100 B/s of demand says nothing about the device");
+        assertEquals(CompactionIoBudget.State.TRACKING, t.policy.state(), "a trial at the floor cannot slow 100 B/s");
+        t.window(0, 0, 100);
+        assertEquals(SEED, t.policy.budget());
+        t.window(10, 100, SEED);
+        assertTrue(t.policy.budget() >= SEED, "the first real flush runs at the seed or faster");
+    }
+    @Test void saturatedHealthyWindowsGrowMultiplicativelyFromTheFloor() {
+        var t = new Trace(CompactionIoBudget.MIN_BYTES_PER_SECOND);
+        t.window(10, 100, CompactionIoBudget.MIN_BYTES_PER_SECOND);
+        assertEquals(CompactionIoBudget.MIN_BYTES_PER_SECOND, t.policy.budget());
+        for (int window = 0; window < 12; window++) t.window(10, 100, t.policy.budget());
+        // 40,960 * 2^12 = 167 MB/s after one minute; +10% per window gave 40,960 * 1.1^12 = 128 KB/s.
+        assertTrue(t.policy.budget() >= 150_000_000, "budget " + t.policy.budget());
+    }
+    @Test void measuredForegroundHarmKeepsTheReductionAndSlowsGrowth() {
+        var t = new Trace();
+        t.window(10, 100, SEED);
+        t.window(10, 80, 750_000); t.window(10, 80, 750_000); t.window(10, 80, 750_000);
+        assertEquals(750_000, t.policy.budget(), "throttling measurably helped point reads: the reduction is kept");
+        t.window(10, 80, 750_000);
+        assertTrue(t.policy.budget() > 750_000 && t.policy.budget() <= 825_000, "budget " + t.policy.budget());
+        long budget = t.policy.budget();
+        t.window(10, 200, budget);
+        assertEquals(budget, t.policy.budget(), "a saturated window with slow point reads must not grow");
+    }
     @Test void healthyGrowthNeedsDemandAndStaysBoundedDespiteJitter() {
         var t = new Trace(); t.window(10, 100, SEED); t.window(10, 100, SEED); t.window(10, 100, SEED);
         long budget = t.policy.budget();
         t.window(10, 105, 100_000);
         assertEquals(budget, t.policy.budget());
         t.window(10, 95, budget);
-        assertTrue(t.policy.budget() <= budget * 1.1);
-        assertTrue(t.policy.budget() > 0);
+        // No measured foreground harm: a saturated window doubles at most (it was +10%, 90 windows from the floor).
+        assertTrue(t.policy.budget() > budget);
+        assertTrue(t.policy.budget() <= budget * 2);
         assertEquals(CompactionIoBudget.MIN_BYTES_PER_SECOND, new CompactionIoBudget(Long.MIN_VALUE).budget());
         assertEquals(CompactionIoBudget.MAX_BYTES_PER_SECOND, new CompactionIoBudget(Long.MAX_VALUE).budget());
     }
@@ -305,15 +337,17 @@ class CompactionIoBudgetTest {
                     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, false,
                     6000, 0, second * 100, 0, 0, second * 600_000_000L));
         }
-        assertEquals(SEED / 4, p.budget(), "an ineffective latency probe must restore observed useful service");
+        assertEquals(SEED, p.budget(), "an ineffective latency probe must restore the budget it lowered"
+                + " (a quarter-seed window did not saturate the limiter, so it never lowered the budget)");
         assertEquals(CompactionIoBudget.State.TRACKING, p.state());
     }
     @Test void urgentEntryRestoresKnownServiceInsteadOfAnUnrelatedStartupSeed() {
         var t = new Trace();
         t.window(10, 100, SEED / 4);
         assertEquals(CompactionIoBudget.State.PROBE, t.policy.state());
+        assertEquals(SEED / 4 * 3 / 4, t.policy.budget());
         t.policy.sample(new CompactionIoBudget.Sample(t.nanos + 1, 0, 0, 0, false, true, true, false));
-        assertEquals(SEED / 4, t.policy.budget());
+        assertEquals(SEED, t.policy.budget(), "the budget in force before the probe, not the demand of one window");
         assertEquals(CompactionIoBudget.State.RECOVERY, t.policy.state());
     }
 
@@ -334,7 +368,7 @@ class CompactionIoBudgetTest {
         t.window(10, 100, SEED / 4);
         t.policy.sample(new CompactionIoBudget.Sample(t.nanos + 1, 0, 0, 0,
                 false, false, false, false, true, 0, false, true));
-        assertEquals(SEED / 4, t.policy.budget());
+        assertEquals(SEED, t.policy.budget());
         assertEquals(CompactionIoBudget.State.RECOVERY, t.policy.state());
         var p = new CompactionIoBudget(SEED);
         p.sample(new CompactionIoBudget.Sample(0, 0, 0, 0, false, true, true, true));
