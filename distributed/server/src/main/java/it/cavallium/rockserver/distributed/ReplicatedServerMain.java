@@ -272,7 +272,59 @@ public final class ReplicatedServerMain {
 			case "repair-log" -> repairLog(new Options(rest));
 			case "export-seed" -> exportSeed(new Options(rest));
 			case "restore-backup" -> restoreBackup(new Options(rest));
+			case "copy-columns" -> copyColumns(new Options(rest));
 			default -> usage("unknown command " + args[0]);
+		}
+	}
+
+	/**
+	 * {@code copy-columns}: copies columns from a running Rockserver to another through the client API; see
+	 * {@link CopyColumns}. Wrong usage ends with 2, a failed copy or verification with 1.
+	 */
+	private static void copyColumns(Options options) {
+		var from = hostAndPorts("--from", options.required("--from"));
+		if (from.size() != 1) {
+			usage("--from takes one address");
+		}
+		var target = new ArrayList<it.cavallium.rockserver.core.common.Utils.HostAndPort>();
+		for (var entry : options.required("--to").split(",", -1)) {
+			// Either HOST:PORT or, as of --peer, ID=RAFTHOST:PORT/APIHOST:PORT (its API address is the target).
+			if (entry.contains("=")) {
+				try {
+					var peer = PeerConfig.parse(entry.strip());
+					target.add(new it.cavallium.rockserver.core.common.Utils.HostAndPort(peer.apiHost(), peer.apiPort()));
+				} catch (IllegalArgumentException ex) {
+					usage("invalid --to " + entry + ": " + ex.getMessage());
+				}
+			} else {
+				target.addAll(hostAndPorts("--to", entry));
+			}
+		}
+		long batchBytes = options.longValue("--batch-bytes", CopyColumns.DEFAULT_BATCH_BYTES);
+		if (batchBytes <= 0) {
+			usage("invalid value for --batch-bytes: " + batchBytes + " (not positive)");
+		}
+		var config = new CopyColumns.Config(from.getFirst(), List.copyOf(target), options.values("--column"),
+				options.values("--exclude-column"), options.flag("--verify"), options.flag("--dry-run"), batchBytes,
+				options.flag("--allow-non-empty"));
+		options.requireConsumed();
+		try {
+			CopyColumns.run(config, System.out, System.err);
+		} catch (CopyColumns.UsageException ex) {
+			usage(ex.getMessage());
+		} catch (CopyColumns.CopyException ex) {
+			fail(ex.getMessage());
+		} catch (IOException | RuntimeException ex) {
+			fail(String.valueOf(ex));
+		}
+	}
+
+	private static List<it.cavallium.rockserver.core.common.Utils.HostAndPort> hostAndPorts(String option, String value) {
+		try {
+			return it.cavallium.rockserver.core.common.Utils.parseHostAndPorts(value);
+		} catch (IllegalArgumentException ex) {
+			usage("invalid " + option + " " + value + ": " + ex.getMessage());
+			throw new AssertionError(ex);
 		}
 	}
 
@@ -2366,7 +2418,13 @@ public final class ReplicatedServerMain {
 				  repair-log --data-dir DIR [--group-id UUID] [--dry-run]
 				  export-seed --data-dir DIR --target DIR [--rockserver-config FILE] [--group-id UUID]
 				              [--without-damaged-snapshot]
-				  restore-backup --backup DIR --data-dir DIR [--rockserver-config FILE]""");
+				  restore-backup --backup DIR --data-dir DIR [--rockserver-config FILE]
+				  copy-columns --from HOST:PORT --to HOST:PORT[,HOST:PORT...] [--column NAME]...
+				               [--exclude-column NAME]... [--verify] [--dry-run] [--batch-bytes N] [--allow-non-empty]
+				        copies columns (default: all user columns) from the running Rockserver at --from to the one
+				        at --to (a cluster's API addresses, or ID=RAFTHOST:PORT/APIHOST:PORT as in --peer), while
+				        nothing writes to them. Refuses a target column that holds data unless --allow-non-empty;
+				        --verify compares count and a hash of every column afterwards; --dry-run writes nothing.""");
 		exit(2);
 	}
 
@@ -2374,7 +2432,7 @@ public final class ReplicatedServerMain {
 	private static final class Options {
 		private static final List<String> FLAGS = List.of("--pipelined-updates", "--join", "--dry-run",
 				"--allow-without-exit-on-oom", "--allow-skipped", UNSAFE_MULTI_VOTER_CHANGE, CHANGE_ADDRESSES,
-				"--without-damaged-snapshot");
+				"--without-damaged-snapshot", "--verify", "--allow-non-empty");
 
 		private final List<String[]> pairs = new ArrayList<>();
 		private final List<String> positional = new ArrayList<>();
@@ -2421,6 +2479,12 @@ public final class ReplicatedServerMain {
 		String value(String name, String fallback) {
 			var result = value(name);
 			return result != null ? result : fallback;
+		}
+
+		/** Every value given for {@code name}, in order (a repeatable option such as {@code --column}). */
+		List<String> values(String name) {
+			consumed.add(name);
+			return pairs.stream().filter(p -> p[0].equals(name)).map(p -> p[1]).toList();
 		}
 
 		/** The value of {@code name} as a number, {@code fallback} if not given; a value that is not one is wrong usage. */
