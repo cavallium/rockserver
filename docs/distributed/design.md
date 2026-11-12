@@ -3386,6 +3386,7 @@ hook: the test cuts the leader's links, lets clients write to it directly, and k
 | `LaggingInstallTest` (processes) | An existing member that lags past what the leader still holds catches up through a snapshot install. With the production settings no node purges past a member that lags (see "Log retention"), so the nodes run with a test-only setting (`rockserver.test.purgeUpToSnapshot`, set through `CrashPointMain`) that purges up to each snapshot. The lagging follower is cut off, and the link heals only once the leader's log, read from its segment files, starts past the follower's last entry. The nodes run with log segments of 4 MiB (R62-6): Ratis purges whole closed segments, and the default segment of 64 MiB takes this workload over 3 minutes to fill, so the log started at 0 for the whole wait. Variants: the lagging member halted after receiving the snapshot (`INSTALL_RECEIVED`) and while restoring it (`INSTALL_RESTORING`) restarts and catches up; the sending leader killed as soon as the lagging member starts receiving files leaves it to the next leader. The test fails if the lagging member caught up without an install. The leader-kill variant stays timed by the receiver's first file, without a crash point in the sender (R3-G4b-3): Ratis' snapshot sender (`GrpcLogAppender` reading the snapshot files) calls nothing of the state machine between the chunks, so a hook there means patching Ratis. What the kill does to the receiver, which is what Rockserver code handles, is pinned exactly by `INSTALL_RECEIVED` and `INSTALL_RESTORING` on the receiving side, and a sender that dies between chunks only breaks the stream, which a receiver sees the same way at any chunk; the timed kill lands somewhere in the transfer, which is the one case left, and prints where. |
 | `HungDiskTest` (processes) | R3-G2a-3 (DD-9): the shim's `HANG sync` on the leader and on a follower. The node does not exit, stops listening on its API port once its disk probe has not ended for the request timeout (3 s here), and the other two keep acknowledging writes; a leader on that disk is replaced (its log stops flushing, `LeaderStall`). Once the trigger goes, the node listens again and catches up; every acknowledged write is readable and the replicas are identical. Skipped without `gcc`. Written in round 6 and first run in the review of R62, after R62-2 gave the Raft watch a stop that reads the log writer's stack: the node whose disk hangs stays up, pauses its API 3.4 s (leader) and 3.7 s (follower) after the hang, a leader on it is replaced within the phase timeout, and the teardown is clean. The condition `-Drockserver.test.hungDisk=true` is gone, and the class runs with the other process suites. `DiskProbeTest` checks the API pause in process, with a test hook that holds one node's probe (`DiskProbe.HANGS_FOR_TESTING`): that node stops listening, a client given every address goes on writing, and it listens again once the probe ends. |
 | `DiskFaultTest` (processes) | A full disk and failing fsyncs, with the shim above preloaded into every node: ENOSPC on every write, and EIO on every fsync, of the leader and of a follower (and EIO on everything, of a follower). The node stops as a failed replica with exit code 3, the other two keep acknowledging writes, and once the trigger is gone the node starts again (after `repair-log` if Ratis refuses a torn tail of its open segment; safe here, since the write or fsync of that entry failed, so this node never acknowledged it) and catches up; every acknowledged write is readable and the replicas are identical. A write is acknowledged only once a majority fsynced it, so the node whose fsync failed never counted. The node stops because its replica failed to apply, or because its Raft log failed (R62-2: a leader's log is closed by Ratis, a follower's writer fails every task; before the fix 5 of the 6 cases stayed up for the whole minute). DD-7h: a follower's disk starts failing right after a SIGCONT, and a SIGTERM follows either as soon as its log shows the failure (`replica failed to`, `the Raft log failed`, `Raft closed`, `hit exception`) or after 0-30 ms; whenever the failure showed before the signal the exit code is 3, never the 143 of a graceful stop (the JVM's status after SIGTERM), and at least one round must signal a node that was failing and still alive. A disk error that first shows during a graceful stop (the stop's own flush hits the failed disk) may exit 143: the stop was asked for, nothing acknowledged depends on that flush (an entry is acknowledged only once a majority fsynced it to its Raft log, and the database is rebuilt from the log), and the next start on that disk fails at its first write. Skipped without `gcc`. |
+| `ConfigurationFileWriteFailureTest` (processes) | Review of R66, 1. Ratis' state machine updater fails to write `raft-meta.conf` for a configuration entry on a follower of three (a directory stands at `raft-meta.conf.tmp`; in production the cause would be the stock Ratis race with a snapshot chunk's write of the same file, see "Upstream"): the node exits with 3 and `Raft closed`, the other two serve, and after a restart it serves and applies everything. |
 | `RaftLogFailureTest`, `LogWriterWatchTest` | R62-2. In process, three nodes: the next task of one node's log writer fails with an `IOException` (`LogWorkerGate.fail`), under writes through another node. The leader stops within a second (Ratis closed its log) and a follower after the 3 s of `LogWriterWatch`, both with a failure that names the Raft log and exit status 3, and the two others go on (red at `1fc44e1`: both stayed up for the 30 s of the test). `LogWriterWatchTest`: the rule (nothing to flush, a log that flushes, a busy writer starts the time over, the writer is asked only while entries wait behind a standing flush index), and against the Ratis in use that the writer thread is found by its name, waits in `DataBlockingQueue.poll` when idle and does not count as idle while a task of its log runs. Review of R62: a pause of the process between two checks starts the time over and the writer is not asked at the check after it, checks further apart than 1 s never add up, and fewer than 5 checks are not a failed log whatever the time (`aPauseOfTheProcessBetweenTwoChecksStartsTheTimeOver`, `checksFurtherApartThanTheGapNeverAddUp`, `fewerChecksThanTheLeastNumberAreNotAFailedLogWhateverTheTime`); `RaftLogFailureTest.aFollowerWhoseLogFailedIsNeverCountedForAnEntryItDidNotStore` (two loads): the leader's match index for the follower whose log failed never passes that follower's flush index until it stops. |
 | `ProcessHaltTest` (a process) | R62-1. A JVM of its own merges into a RocksDB database with the FFM merge operator from four threads (1 MiB write buffer, so flushes and compactions call the operator in Java all the time) and halts after 3 s as a crash point does. It must be gone within 15 s with the status asked for, 3 times (red at `00afe5b`, 3 of 3: with `Runtime.halt` the process stayed until killed; about 0.3 s with `_exit`). |
 | `RefusedPermitsTest`, `RatisContractTest` (R62-3) | `RefusedPermitsTest`: on one leader, 4296 transactions whose commit conflicts, with a write between each two; every write is accepted, the term is the same at the end, and 4296 permits were given back (red at `45cf7ac`: "the write after 4096 conflicts was not accepted"). `RatisContractTest`, with a limit of one request: stock Ratis refuses the next write after one refusal in `preAppendTransaction` (`aRequestRefusedBeforeTheAppendKeepsItsPendingRequestPermit`: a Ratis that releases the permit fails here, and `RefusedPermits` goes); with `RefusedPermits`, a write is accepted after each of 50 refusals, local and through the client, and the limit still holds exactly one request (`aRefusedRequestGivesItsPermitBackThroughRefusedPermits`); the permit objects left in Ratis' map are removed once 7 sweeps, 10 s apart, found them, the first 60 s ago (`thePermitObjectsOfRefusedRequestsAreRemovedOnceStale`, on a clock of the test's: none after 6 sweeps, the first refusal's at the 7th, the next 20 at the 8th). Review of R62: a write that waits for the server's monitor, which the test holds, keeps its permit through a jump of the clock by 120 s between two sweeps and through every sweep short of the 7th, while the permit a refusal left behind is removed, and the write is then accepted (`thePermitOfARequestThatWaitsForTheMonitorSurvivesAPauseOfTheProcess`; with the time alone both were removed at the sweep after the jump); the bytes, with a limit of 3 MiB: stock Ratis refuses the sixth refused request of 700 KiB for lack of a permit (`aRequestRefusedBeforeTheAppendKeepsItsBytes`), and with `RefusedPermits` a write of 2.9 MiB is accepted after 50 of them while one of 1.5 MiB beside it is refused, so neither too little nor too much came back (`aRefusedRequestGivesItsBytesBackThroughRefusedPermits`). |
@@ -6028,9 +6029,9 @@ install it (`apt-get install gcc libc6-dev`) and run with `-Drockserver.test.req
      failed once in the full suite of `40cb407` (`NoSuchFileException` on `raft-meta.conf.tmp` at the
      `installSnapshot` call). Cause: a stock Ratis race, the test's own call and the state machine updater both write
      `raft-meta.conf` through one temporary name with no lock (see "Upstream", R66). The test installed a chunk as
-     soon as its single node led, while the leader's start configuration entry was still being applied. It has no
-     Rockserver code in it, so no product fault is hidden. The test now waits until the entry is applied before it
-     installs. Reproduction with the test method looped in one JVM (4 JVMs in parallel under 28 busy loops, 32
+     soon as its single node led, while the leader's start configuration entry was still being applied. The test has
+     no Rockserver code in it, but a node runs the same two writers: see "Review of R66", 1, for what the race does
+     to a node. The test now waits until the entry is applied before it installs. Reproduction with the test method looped in one JVM (4 JVMs in parallel under 28 busy loops, 32
      cores): 7 failures in 90 runs before (some runs hang, the updater being dead), 0 in 600 runs after; and 5 in 20
      runs before on an idle machine, 0 in 20 after.
    - R66-2 (test): `ColdRestartTest.everyAcknowledgedWriteSurvivesRepeatedColdRestarts` failed once in the full suite
@@ -6049,14 +6050,59 @@ install it (`apt-get install gcc libc6-dev`) and run with `-Drockserver.test.req
      of this method and in 7 of 10 of `twoNodesServeAfterAColdRestartAndTheThirdConverges` (there the returned node
      was also still catching up), the second in 1 of those 10; every stop was a graceful one (exit 143, no exit 3),
      and each lagging node's last request from the leader carried entries past the `leaderCommit` it stopped at (for
-     example `previous=(t:7, i:1418),leaderCommit=1418,entry=(t:7, i:1419)`, database at 1418). So about one run in
-     thirty failed all three tries. Fix, in the test: before the offline comparison it waits until `admin status`
+     example `previous=(t:7, i:1418),leaderCommit=1418,entry=(t:7, i:1419)`, database at 1418). A run in which
+     all three tries differ was not reproduced in those 10; from the counts above it is rare (a rough estimate, a few
+     runs in a hundred). Fix, in the test: before the offline comparison it waits until `admin status`
      shows, twice in a row, one leader and the same applied and commit index on every node (at most 30 s; measured
-     1.5 to 6.9 s on an idle machine and 2.3 to 7.6 s under 28 busy loops on 32 cores, most of it the two `admin`
+     1.5 to 6.9 s without added load (builds of other sessions ran on the machine) and 2.3 to 7.6 s under 28 busy loops on 32 cores, most of it the two `admin`
      JVMs and, in the two-of-three scenario, the returned node's catch-up), then stops the nodes and compares once,
      with no second try; it also asserts that each database holds at least that index after its graceful stop. A
      failure prints each node's role, applied and commit index, whether its process runs, the exit code of its stop
-     and its log tail. After the change: 30 runs of the class (16 idle, 14 under that load), 0 failures.
+     and its log tail. After the change: 30 runs of the class (16 without added load, 14 under that load), 0 failures.
+   - Review of R66 (2 findings, in the docs and the tests; no product code changed):
+     1. (medium, docs and a missing test) R66-1 called the `raft-meta.conf` race a matter of the test alone ("no
+        Rockserver code in it, so no product fault is hidden"). The classification of the failure is right, and
+        the verdict on the product was not shown: a node has the same two writers, and chunked installs are on
+        (`RaftSettings`). Read again in the 3.3.1 bytecode: `RaftStorageImpl.writeRaftConfiguration` is not
+        synchronized and throws its `IOException`; its only callers are `RaftServerImpl.applyLogToStateMachine` (the
+        updater, outside the server's monitor) and `SnapshotInstallationHandler.installSnapshotImpl` (only when the
+        chunk's configuration differs from the node's, index included, so once per install); `AtomicFileOutputStream`
+        opens `<name>.tmp` with truncation, and its close fsyncs, then renames. On a node the two overlap only when the
+        first chunk of an install arrives while the updater is inside the write for a configuration entry of the
+        node's own log, a window of one fsync: a node back after a long stop that still applies its log's tail, with
+        a leader change in that tail. Three outcomes:
+        - The chunk's rename loses: `installSnapshot` fails with the `IOException`, and the leader sends the install
+          again. The configuration is already in memory, the second request does not write it, and
+          `InstalledConfiguration` recorded the chunk before Ratis saw it.
+        - The updater's rename loses: the updater ends ("caught a Throwable") and closes the division. The node
+          stops as a failed replica (exit 3, `Raft closed`), and a restart applies the entry again. Not tested
+          before: `ConfigurationFileWriteFailureTest` forces the updater's write to fail (a directory at
+          `raft-meta.conf.tmp`, the same `IOException` from the same call) on a follower of three and expects exit 3
+          with those lines, the other two serving, and the node serving and converging after a restart. It passes on
+          the unchanged code: 7 runs, exit 3 within 0.7 to 1.4 s of the leader change. (R66-1 wrote that the
+          division's close "then waits" for the dead updater: runs of the plain-Ratis loop hung, and the cause was not
+          examined; `StateMachineUpdater.stopAndJoin` does not join an updater in state `EXCEPTION`. A node does not
+          wait for that close, as the test shows.)
+        - Both open the temporary file before either writes (microseconds), or the machine loses power between one
+          writer's rename and the other's write: `raft-meta.conf` can be left empty, cut short, or one
+          configuration followed by the end of a longer one (only when the two differ in length, as after a
+          membership change). Not reproduced. Tried by hand on a stopped follower of three (an empty file, a file cut
+          by 9 bytes, a file with 17 bytes repeated at its end): the node exits 1 at its start, every time
+          (`RaftServerProxy has failed`, with `IllegalStateException` or `InvalidProtocolBufferException`), and
+          starts again with the file put back. No data is lost and nothing diverges: the node does not run, the
+          other two serve, and it is replaced like a lost node (runbooks, "Exit codes" and "Replacing a node").
+          Whether a mixed file can parse as a valid configuration was not examined; it needs the same two
+          coincidences and a length difference.
+        No acknowledged write is at risk in any of the three. Not fixed here: the lock belongs in Ratis (see
+        "Upstream"), and delaying chunks until the updater is idle would add a wait to every install for a window
+        never seen in a cluster run.
+     2. (low, docs) R66-2 gave "about one run in thirty" for three differing tries in a row as if measured, and
+        "idle machine" for runs during which other sessions' builds ran; both reworded. The cause stands: checked
+        against the failed run's report (the key node 1 lacked, `puts` key `13e`, is the third try's probe, at the
+        last index) and against `admin status`, whose applied index is each member's own answer
+        (`ReplicatedServerMain.logInfo`), not the leader's view. The new comparison is stricter than the old one
+        (one comparison, no second try, and each database must hold the converged index), not a longer wait around a
+        fault: a follower that never applied its log's tail now fails the wait after 30 s with every node's indices.
    - Review of R46, 1 (low, docs): the R46-2 recipe ran `dependency:build-classpath` on `distributed/server/pom.xml`
      alone, so Maven resolved `rockserver-core:${revision}` and that version's pom from `~/.m2` (or the snapshot
      repository): `grep -v /rockserver-core/` dropped the jar but kept the third-party jars of that pom, from whichever
@@ -6140,8 +6186,9 @@ install it (`apt-get install gcc libc6-dev`) and run with `-Drockserver.test.req
      `SnapshotInstallationHandler.installSnapshotImpl` on the thread that handles an install request, in both cases
      without a lock shared with the other. Two overlapping writes open the same temporary file, the first rename
      takes it, and the second fails with `NoSuchFileException: .../current/raft-meta.conf.tmp -> .../raft-meta.conf`:
-     the install request fails, or the updater dies with `RaftLogIOException` ("caught a Throwable") and the division's
-     close then waits for it. Read in the 3.3.1 bytecode (callers found with `javap -c`); reproduced with a plain
+     the install request fails, or the updater dies with `RaftLogIOException` ("caught a Throwable") and closes the
+     division (a node then stops with exit 3, `ConfigurationFileWriteFailureTest`); two writers that open the file
+     before either writes can also leave mixed contents, with which a node does not start (review of R66, 1). Read in the 3.3.1 bytecode (callers found with `javap -c`); reproduced with a plain
      Ratis server and no Rockserver code. The product does not write that file itself, and a node installs a snapshot
      only after it has joined a group whose entries it applies, so the window is a follower that applies a
      configuration entry while an install request arrives; not seen in a cluster run, and not avoidable from here
