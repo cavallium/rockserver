@@ -331,7 +331,6 @@ public final class CompactionIoBudget {
         if (sample.stopped) reduceReadahead(0);
         if (nativePressure && state != State.RECOVERY) {
             // Restore useful measured service once; repeated stalled polls must not ramp.
-            boolean tracking = state == State.TRACKING;
             state = State.RECOVERY;
             healthyRecovery = 0;
             beforeGrowth = 0;
@@ -339,8 +338,9 @@ public final class CompactionIoBudget {
             ceiling = 0; // Urgent pressure wins: what harm taught is learned again after it.
             queueReferenceWindows = 0; probeQueueProtected = false;
             double usefulService = Math.max(preThrottle, Math.max(recentAchieved, probeBudget));
-            if (usefulService > 0 && tracking) usefulService = Math.max(usefulService, budget);
-            budget = bound(Math.max(seed, usefulService)); // Writes are delayed or stopped: never under the flush floor.
+            // Writes are delayed or stopped: never under the flush floor, and never under the budget in force (in
+            // PROBE that is the reduced one, and probeBudget the one before it).
+            budget = bound(Math.max(Math.max(seed, usefulService), budget));
             probeBudget = 0;
             clearWindow();
         }

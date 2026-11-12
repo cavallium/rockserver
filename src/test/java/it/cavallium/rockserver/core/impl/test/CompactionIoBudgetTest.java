@@ -391,6 +391,43 @@ class CompactionIoBudgetTest {
             }
         }
     }
+    @Test void urgentPressureAlwaysWins() {
+        // Whatever the controller was doing (growing, testing a reduction after slow reads, waiting after RECOVERY):
+        // a poll with delayed or stopped writes puts it in RECOVERY with a budget not under the one in force, and
+        // nothing lowers the budget while the pressure lasts.
+        for (long seed : new long[]{CompactionIoBudget.MIN_BYTES_PER_SECOND, 300_000, SEED, 64 * SEED}) {
+            var random = new java.util.Random(seed + 1);
+            var t = new Trace(seed);
+            long rate = seed, latency = 100;
+            boolean pressure = false;
+            int entries = 0, fromReduced = 0;
+            for (int second = 0; second < 40_000; second++) {
+                if (random.nextInt(5) == 0) {
+                    rate = switch (random.nextInt(5)) {
+                        case 0 -> 0;
+                        case 1 -> t.policy.budget() / 3;
+                        case 2 -> t.policy.budget() * 9 / 10;
+                        default -> t.policy.budget();
+                    };
+                    latency = random.nextInt(3) == 0 ? 400 : 100;
+                    pressure = random.nextInt(pressure ? 3 : 60) == 0 ? !pressure : pressure;
+                }
+                long before = t.policy.budget();
+                var stateBefore = t.policy.state();
+                t.completions += 10;
+                if (random.nextInt(100) == 0) {
+                    t.policy.sample(new CompactionIoBudget.Sample(t.nanos + 1, 0, 0, 0, false, pressure, pressure, false));
+                } else t.poll(10, latency, rate, pressure, true);
+                if (!pressure) continue;
+                String at = "seed " + seed + " second " + second + " from " + stateBefore;
+                assertEquals(CompactionIoBudget.State.RECOVERY, t.policy.state(), at);
+                assertTrue(t.policy.budget() >= before, at + ": " + before + " -> " + t.policy.budget());
+                if (stateBefore != CompactionIoBudget.State.RECOVERY) entries++;
+                if (stateBefore == CompactionIoBudget.State.PROBE) fromReduced++;
+            }
+            assertTrue(entries > 50 && fromReduced > 0, "entries " + entries + ", from a reduced budget " + fromReduced);
+        }
+    }
     @Test void insufficientResetAndStaleCountersHoldAndAbortProbeSafely() {
         var t = new Trace(); t.window(0, 0, SEED);
         long budget = t.policy.budget();
