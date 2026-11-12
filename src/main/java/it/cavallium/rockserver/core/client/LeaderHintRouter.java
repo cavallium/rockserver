@@ -13,6 +13,7 @@ import io.grpc.MethodDescriptor;
 import io.grpc.Status;
 import it.cavallium.rockserver.core.common.LeaderHint;
 import it.cavallium.rockserver.core.common.Utils.HostAndPort;
+import java.net.InetAddress;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -104,6 +105,8 @@ final class LeaderHintRouter implements AutoCloseable {
 	 */
 	static final class Hint {
 		private final String address;
+		/** {@link #canonicalAddress} of {@link #address}: what two spellings of one address have in common. */
+		private final String key;
 		private final ManagedChannel channel;
 		/**
 		 * Calls handed out on {@link #channel} and not started (nor cancelled) yet. A call that is never started nor
@@ -113,13 +116,23 @@ final class LeaderHintRouter implements AutoCloseable {
 		/** No longer the current hint: shut down once {@link #unstarted} is 0. */
 		private volatile boolean retired;
 
-		Hint(String address, ManagedChannel channel) {
+		Hint(String address, String key, ManagedChannel channel) {
 			this.address = address;
+			this.key = key;
 			this.channel = channel;
+		}
+
+		/** True if {@code value}, an address from a response, names this hint's leader (in any spelling). */
+		boolean names(@Nullable String value) {
+			return value != null && (address.equals(value) || key.equals(canonicalAddress(value)));
 		}
 
 		String address() {
 			return address;
+		}
+
+		String key() {
+			return key;
 		}
 
 		ManagedChannel channel() {
@@ -506,7 +519,7 @@ final class LeaderHintRouter implements AutoCloseable {
 			/** A node that no longer names itself as the leader is not one: back to the ordinary channel. */
 			private void checkNamesItself(Metadata metadata) {
 				var named = metadata.get(KEY);
-				if (named == null || !named.equals(hint.address())) {
+				if (!hint.names(named)) {
 					// A new name, if any, was taken by the leader channel's own hint reader already.
 					drop(hint);
 				}
@@ -548,15 +561,14 @@ final class LeaderHintRouter implements AutoCloseable {
 		if (hint != null && hint.address().equals(value)) {
 			return;
 		}
-		int colon = value.lastIndexOf(':');
-		HostAndPort address;
-		try {
-			address = new HostAndPort(value.substring(0, colon), Integer.parseInt(value.substring(colon + 1)));
-		} catch (RuntimeException e) {
+		var parsed = parseAddress(value);
+		if (parsed == null) {
 			LOG.debug("Ignoring a malformed leader address: {}", value);
 			return;
 		}
-		if (mode == Mode.LISTED && !listed.contains(normalize(address.host(), address.port()))) {
+		var address = parsed.address();
+		var key = normalize(address.host(), address.port());
+		if (mode == Mode.LISTED && !listed.contains(key)) {
 			LOG.debug("Ignoring the leader address {}: not one of the client's addresses", value);
 			return;
 		}
@@ -564,12 +576,12 @@ final class LeaderHintRouter implements AutoCloseable {
 		ManagedChannel created;
 		synchronized (lock) {
 			hint = current;
-			if (closed || (hint != null && hint.address().equals(value)) || backingOff(value)) {
+			if (closed || (hint != null && hint.names(value)) || backingOff(key)) {
 				return;
 			}
 			created = channels.apply(address);
 			previous = hint;
-			current = new Hint(value, created);
+			current = new Hint(value, key, created);
 			if (previous != null) {
 				keepUntilClose(previous);
 			}
@@ -600,7 +612,7 @@ final class LeaderHintRouter implements AutoCloseable {
 			long now = nanoTime.getAsLong();
 			// Small: only addresses that failed within the backoff stay.
 			failedAt.values().removeIf(at -> now - at >= FAILED_HINT_BACKOFF_NANOS);
-			failedAt.put(hint.address(), now);
+			failedAt.put(hint.key(), now);
 			keepUntilClose(hint);
 		}
 		hint.retire();
@@ -683,7 +695,59 @@ final class LeaderHintRouter implements AutoCloseable {
 		}
 	}
 
-	private static String normalize(String host, int port) {
-		return host.toLowerCase(Locale.ROOT) + ":" + port;
+	private record Parsed(HostAndPort address) {}
+
+	/**
+	 * Reads {@code host:port} as a server sends it: an IPv6 literal in brackets ({@code [::1]:5333}), though one
+	 * without ({@code ::1:5333}, the last colon starts the port) is taken too. The host of the result has no brackets,
+	 * as {@code Utils.parseHostAndPorts} gives the client's own addresses, and is what a channel is opened to.
+	 */
+	static @Nullable Parsed parseAddress(String value) {
+		try {
+			int colon = value.lastIndexOf(':');
+			var host = value.substring(0, colon);
+			if (host.startsWith("[") && host.endsWith("]")) {
+				host = host.substring(1, host.length() - 1);
+			} else if (host.startsWith("[") || host.endsWith("]")) {
+				return null;
+			}
+			if (host.isEmpty()) {
+				return null;
+			}
+			int port = Integer.parseInt(value.substring(colon + 1));
+			if (port < 1 || port > 65535) {
+				return null;
+			}
+			return new Parsed(new HostAndPort(host, port));
+		} catch (RuntimeException e) {
+			return null;
+		}
+	}
+
+	/** The comparable form of a response's address, or null if it is malformed. */
+	private static @Nullable String canonicalAddress(String value) {
+		var parsed = parseAddress(value);
+		return parsed == null ? null : normalize(parsed.address().host(), parsed.address().port());
+	}
+
+	/**
+	 * The one spelling of an address that listed and hinted addresses are compared in: no brackets, lower case, and an
+	 * IP literal as the JDK prints it, so that {@code ::1}, {@code [::1]} and {@code 0:0:0:0:0:0:0:1} are one host. Only
+	 * the text is read: a name is never looked up. IPv6 hosts are written in brackets before the port. An IPv4-mapped
+	 * IPv6 literal ({@code ::ffff:10.0.0.1}) is the IPv4 address it holds, as the JDK reads it, and is written as one.
+	 */
+	static String normalize(String host, int port) {
+		var lower = host.toLowerCase(Locale.ROOT);
+		if (lower.startsWith("[") && lower.endsWith("]")) {
+			lower = lower.substring(1, lower.length() - 1);
+		}
+		if (lower.indexOf(':') >= 0) {
+			try {
+				lower = InetAddress.ofLiteral(lower).getHostAddress();
+			} catch (RuntimeException notAnAddress) {
+				// kept as written
+			}
+		}
+		return lower.indexOf(':') >= 0 ? "[" + lower + "]:" + port : lower + ":" + port;
 	}
 }

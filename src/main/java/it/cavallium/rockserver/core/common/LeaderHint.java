@@ -10,7 +10,7 @@ import org.jetbrains.annotations.Nullable;
  */
 public interface LeaderHint {
 
-	/** Response metadata key: the leader's API address, {@code host:port}. */
+	/** Response metadata key: the leader's API address, {@code host:port}, an IPv6 host in brackets ({@code [::1]:5333}). */
 	String METADATA_KEY = "rockserver-leader";
 
 	/** The current leader's API address, {@code host:port}, as the members reach it; null if no leader is known. */

@@ -325,6 +325,11 @@ public final class GrpcConnection extends BaseConnection {
 		return delegate.requestAsync(context, request);
 	}
 
+	/** Tests only: the address of the leader channel that leader-bound calls use now, or null if they use the ordinary one. */
+	public @Nullable String leaderChannelAddressForTesting() {
+		return delegate.leaderChannelAddressForTesting();
+	}
+
 	@Override
 	public void close() {
 		var writes = sessionWrites;
@@ -2334,6 +2339,10 @@ final class GrpcConnectionDelegate extends BaseConnection implements RocksDBAPI 
 		// ordinary channel would retry again on that channel instead, which fails over to a live node.
 		builder.disableRetry().defaultServiceConfig(Map.of("loadBalancingConfig", PICK_FIRST_IN_ORDER));
 		return builder.intercept(new RetryLoggingInterceptor(), router.hintReader()).build();
+	}
+
+	@Nullable String leaderChannelAddressForTesting() {
+		return leaderRouter == null ? null : leaderRouter.currentAddress();
 	}
 
 	/**

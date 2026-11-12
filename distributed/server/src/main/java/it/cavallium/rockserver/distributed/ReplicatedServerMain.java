@@ -244,7 +244,7 @@ public final class ReplicatedServerMain {
 	static volatile JvmExit.Probe exitProbe = JvmExit.JVM;
 	/**
 	 * How long the shutdown hook waits for a start still running when a {@code System.exit} on another thread, not a
-	 * signal, started the shutdown ({@link #awaitStart}). A start that can still end does within it or is a crash away
+	 * signal, started the shutdown, or called it behind a signal's shutdown ({@link #awaitStart}). A start that can still end does within it or is a crash away
 	 * from the same state: it has served nothing yet.
 	 */
 	static volatile Duration startAfterExitTimeout = Duration.ofSeconds(30);
@@ -478,6 +478,10 @@ public final class ReplicatedServerMain {
 	 * supervisor asks for.</li>
 	 * <li>Anything else, which is a {@code System.exit} on another thread: the start may wait for that thread, which
 	 * never returns, and nothing here can tell. Wait {@link #startAfterExitTimeout} for the start, then halt.</li>
+	 * <li>A signal started the shutdown and another thread then called {@code System.exit}
+	 * ({@link JvmExit.Probe#exitWaiting}): that thread waits behind the signal's shutdown and never returns either, so
+	 * the same holds (R66-5). The wait for the start gets the same limit, counted from when the hook first saw that
+	 * thread.</li>
 	 * </ul>
 	 *
 	 * <p>The halt is {@link ProcessHalt#halt}, not a return from the hook: the start is still running and holds what it
@@ -491,6 +495,8 @@ public final class ReplicatedServerMain {
 		boolean interrupted = false;
 		// Asked once: the thread that runs the hooks is the same until the JVM ends.
 		Boolean bySignal = null;
+		// When the hook first saw another thread inside System.exit behind a signal's shutdown; 0: not seen.
+		long exitWaitingSince = 0;
 		try {
 			while (true) {
 				try {
@@ -522,6 +528,18 @@ public final class ReplicatedServerMain {
 					haltUnstarted(nodeId, starting, "a System.exit on another thread started the shutdown, and the start did"
 							+ " not end within " + startAfterExitTimeout + " of it (below is where the start stands)");
 					return null;
+				}
+				if (bySignal) {
+					long now = System.nanoTime();
+					if (exitWaitingSince == 0 && probe.exitWaiting()) {
+						exitWaitingSince = now == 0 ? 1 : now;
+					}
+					if (exitWaitingSince != 0 && now - exitWaitingSince >= startAfterExitTimeout.toNanos()) {
+						haltUnstarted(nodeId, starting, "a System.exit on another thread waits behind the shutdown that a signal"
+								+ " started, and the start did not end within " + startAfterExitTimeout
+								+ " of it (below is where the start stands)");
+						return null;
+					}
 				}
 			}
 		} finally {

@@ -72,6 +72,81 @@ class StartExitProcessTest {
 		assertTrue(output.contains("Node a does not start: a System.exit on another thread started the shutdown"), output);
 	}
 
+	/**
+	 * R66-5: a signal started the shutdown, then another thread calls {@code System.exit} and the start waits for that
+	 * thread. The exit waits behind the signal's shutdown for good, so the start cannot end: the hook's wait for a start
+	 * after a signal, which has no limit otherwise, gets the limit of an exit on another thread.
+	 */
+	@Test
+	void anExitOnAnotherThreadAfterASignalThatTheStartWaitsForEndsWithOne() throws Exception {
+		var ports = ProcessCluster.freePorts(2, List.of());
+		var process = start("exit-elsewhere-after-signal", ports);
+		awaitStarting(process);
+		process.destroy();
+		var output = awaitExit(process);
+		assertEquals(1, process.exitValue(), output);
+		assertTrue(output.contains("Node a does not start: a System.exit on another thread waits behind the shutdown"
+				+ " that a signal started"), output);
+	}
+
+	/**
+	 * Review of R67: a second signal during a start (SIGTERM twice, or the SIGHUP and SIGTERM of a closing terminal) is
+	 * no {@code System.exit} on another thread. Its handler thread waits behind the first signal's shutdown in
+	 * {@code Shutdown.exit}, as an exit would, but nothing waits for it: the hook still waits for the start, longer
+	 * than the limit of an exit (2 s here, the start takes 5 s more), and stops the node it returned.
+	 */
+	@Test
+	void aSecondSignalDuringAStartStillWaitsForTheStart() throws Exception {
+		var ports = ProcessCluster.freePorts(2, List.of());
+		var process = start("slow", ports);
+		awaitStarting(process);
+		long signalled = System.nanoTime();
+		process.destroy();
+		// The second one once the first runs the hooks: it then waits behind it.
+		Thread.sleep(500);
+		process.destroy();
+		var output = awaitExit(process);
+		assertFalse(output.contains("halting"), output);
+		assertEquals(143, process.exitValue(), output);
+		assertTrue(System.nanoTime() - signalled >= TimeUnit.SECONDS.toNanos(4), "it did not wait for the start: " + output);
+		assertTrue(output.contains("a: started, Raft"), output);
+	}
+
+	/**
+	 * The same with the other signals the JVM handles: the SIGHUP and then the SIGTERM of a closing terminal. The
+	 * status is that of the first signal, whose handler runs the hooks.
+	 */
+	@Test
+	void aHangupThenATermDuringAStartStillWaitsForTheStart() throws Exception {
+		assertASecondSignalWaitsForTheStart("HUP", "TERM", 128 + 1);
+	}
+
+	/** And Ctrl-C followed by a SIGHUP. */
+	@Test
+	void anInterruptThenAHangupDuringAStartStillWaitsForTheStart() throws Exception {
+		assertASecondSignalWaitsForTheStart("INT", "HUP", 128 + 2);
+	}
+
+	private void assertASecondSignalWaitsForTheStart(String first, String second, int status) throws Exception {
+		var ports = ProcessCluster.freePorts(2, List.of());
+		var process = start("slow", ports);
+		awaitStarting(process);
+		long signalled = System.nanoTime();
+		signal(process, first);
+		Thread.sleep(500);
+		signal(process, second);
+		var output = awaitExit(process);
+		assertFalse(output.contains("halting"), output);
+		assertEquals(status, process.exitValue(), output);
+		assertTrue(System.nanoTime() - signalled >= TimeUnit.SECONDS.toNanos(4), "it did not wait for the start: " + output);
+		assertTrue(output.contains("a: started, Raft"), output);
+	}
+
+	private static void signal(Process process, String name) throws Exception {
+		var kill = new ProcessBuilder("kill", "-" + name, String.valueOf(process.pid())).inheritIO().start();
+		assertEquals(0, kill.waitFor(), "kill -" + name);
+	}
+
 	private Process start(String mode, List<Integer> ports) throws Exception {
 		var command = PortInUseProcessTest.command(tempDir, StartExitMain.class, ports.get(0), ports.get(1),
 				List.of("-Drockserver.test.startExit=" + mode));

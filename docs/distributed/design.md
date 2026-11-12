@@ -3387,6 +3387,7 @@ hook: the test cuts the leader's links, lets clients write to it directly, and k
 | `HungDiskTest` (processes) | R3-G2a-3 (DD-9): the shim's `HANG sync` on the leader and on a follower. The node does not exit, stops listening on its API port once its disk probe has not ended for the request timeout (3 s here), and the other two keep acknowledging writes; a leader on that disk is replaced (its log stops flushing, `LeaderStall`). Once the trigger goes, the node listens again and catches up; every acknowledged write is readable and the replicas are identical. Skipped without `gcc`. Written in round 6 and first run in the review of R62, after R62-2 gave the Raft watch a stop that reads the log writer's stack: the node whose disk hangs stays up, pauses its API 3.4 s (leader) and 3.7 s (follower) after the hang, a leader on it is replaced within the phase timeout, and the teardown is clean. The condition `-Drockserver.test.hungDisk=true` is gone, and the class runs with the other process suites. `DiskProbeTest` checks the API pause in process, with a test hook that holds one node's probe (`DiskProbe.HANGS_FOR_TESTING`): that node stops listening, a client given every address goes on writing, and it listens again once the probe ends. |
 | `DiskFaultTest` (processes) | A full disk and failing fsyncs, with the shim above preloaded into every node: ENOSPC on every write, and EIO on every fsync, of the leader and of a follower (and EIO on everything, of a follower). The node stops as a failed replica with exit code 3, the other two keep acknowledging writes, and once the trigger is gone the node starts again (after `repair-log` if Ratis refuses a torn tail of its open segment; safe here, since the write or fsync of that entry failed, so this node never acknowledged it) and catches up; every acknowledged write is readable and the replicas are identical. A write is acknowledged only once a majority fsynced it, so the node whose fsync failed never counted. The node stops because its replica failed to apply, or because its Raft log failed (R62-2: a leader's log is closed by Ratis, a follower's writer fails every task; before the fix 5 of the 6 cases stayed up for the whole minute). DD-7h: a follower's disk starts failing right after a SIGCONT, and a SIGTERM follows either as soon as its log shows the failure (`replica failed to`, `the Raft log failed`, `Raft closed`, `hit exception`) or after 0-30 ms; whenever the failure showed before the signal the exit code is 3, never the 143 of a graceful stop (the JVM's status after SIGTERM), and at least one round must signal a node that was failing and still alive. A disk error that first shows during a graceful stop (the stop's own flush hits the failed disk) may exit 143: the stop was asked for, nothing acknowledged depends on that flush (an entry is acknowledged only once a majority fsynced it to its Raft log, and the database is rebuilt from the log), and the next start on that disk fails at its first write. Skipped without `gcc`. |
 | `ConfigurationFileWriteFailureTest` (processes) | Review of R66, 1. Ratis' state machine updater fails to write `raft-meta.conf` for a configuration entry on a follower of three (a directory stands at `raft-meta.conf.tmp`; in production the cause would be the stock Ratis race with a snapshot chunk's write of the same file, see "Upstream"): the node exits with 3 and `Raft closed`, the other two serve, and after a restart it serves and applies everything. |
+| `MixedConfigurationFileTest` (processes, plus a parse-only sweep) | R66-3. `raft-meta.conf` of a stopped follower of three written with what two overlapping writers of Ratis 3.3.1 can leave (empty, cut, two entries one after the other, the later writer's entry followed by the rest of a longer one): a file that does not parse stops the start with exit 1 (`RaftServerProxy has failed`); one that parses is exactly the later writer's entry, and the node serves and converges, also with a configuration without the node at an index above its log. The sweep (182,439 overlays of real-shaped entries) finds only unparsable files or the entry written over, never a third configuration. |
 | `RaftLogFailureTest`, `LogWriterWatchTest` | R62-2. In process, three nodes: the next task of one node's log writer fails with an `IOException` (`LogWorkerGate.fail`), under writes through another node. The leader stops within a second (Ratis closed its log) and a follower after the 3 s of `LogWriterWatch`, both with a failure that names the Raft log and exit status 3, and the two others go on (red at `1fc44e1`: both stayed up for the 30 s of the test). `LogWriterWatchTest`: the rule (nothing to flush, a log that flushes, a busy writer starts the time over, the writer is asked only while entries wait behind a standing flush index), and against the Ratis in use that the writer thread is found by its name, waits in `DataBlockingQueue.poll` when idle and does not count as idle while a task of its log runs. Review of R62: a pause of the process between two checks starts the time over and the writer is not asked at the check after it, checks further apart than 1 s never add up, and fewer than 5 checks are not a failed log whatever the time (`aPauseOfTheProcessBetweenTwoChecksStartsTheTimeOver`, `checksFurtherApartThanTheGapNeverAddUp`, `fewerChecksThanTheLeastNumberAreNotAFailedLogWhateverTheTime`); `RaftLogFailureTest.aFollowerWhoseLogFailedIsNeverCountedForAnEntryItDidNotStore` (two loads): the leader's match index for the follower whose log failed never passes that follower's flush index until it stops. |
 | `ProcessHaltTest` (a process) | R62-1. A JVM of its own merges into a RocksDB database with the FFM merge operator from four threads (1 MiB write buffer, so flushes and compactions call the operator in Java all the time) and halts after 3 s as a crash point does. It must be gone within 15 s with the status asked for, 3 times (red at `00afe5b`, 3 of 3: with `Runtime.halt` the process stayed until killed; about 0.3 s with `_exit`). |
 | `RefusedPermitsTest`, `RatisContractTest` (R62-3) | `RefusedPermitsTest`: on one leader, 4296 transactions whose commit conflicts, with a write between each two; every write is accepted, the term is the same at the end, and 4296 permits were given back (red at `45cf7ac`: "the write after 4096 conflicts was not accepted"). `RatisContractTest`, with a limit of one request: stock Ratis refuses the next write after one refusal in `preAppendTransaction` (`aRequestRefusedBeforeTheAppendKeepsItsPendingRequestPermit`: a Ratis that releases the permit fails here, and `RefusedPermits` goes); with `RefusedPermits`, a write is accepted after each of 50 refusals, local and through the client, and the limit still holds exactly one request (`aRefusedRequestGivesItsPermitBackThroughRefusedPermits`); the permit objects left in Ratis' map are removed once 7 sweeps, 10 s apart, found them, the first 60 s ago (`thePermitObjectsOfRefusedRequestsAreRemovedOnceStale`, on a clock of the test's: none after 6 sweeps, the first refusal's at the 7th, the next 20 at the 8th). Review of R62: a write that waits for the server's monitor, which the test holds, keeps its permit through a jump of the clock by 120 s between two sweeps and through every sweep short of the 7th, while the permit a refusal left behind is removed, and the write is then accepted (`thePermitOfARequestThatWaitsForTheMonitorSurvivesAPauseOfTheProcess`; with the time alone both were removed at the sweep after the jump); the bytes, with a limit of 3 MiB: stock Ratis refuses the sixth refused request of 700 KiB for lack of a permit (`aRequestRefusedBeforeTheAppendKeepsItsBytes`), and with `RefusedPermits` a write of 2.9 MiB is accepted after 50 of them while one of 1.5 MiB beside it is refused, so neither too little nor too much came back (`aRefusedRequestGivesItsBytesBackThroughRefusedPermits`). |
@@ -6091,8 +6092,8 @@ install it (`apt-get install gcc libc6-dev`) and run with `-Drockserver.test.req
           (`RaftServerProxy has failed`, with `IllegalStateException` or `InvalidProtocolBufferException`), and
           starts again with the file put back. No data is lost and nothing diverges: the node does not run, the
           other two serve, and it is replaced like a lost node (runbooks, "Exit codes" and "Replacing a node").
-          Whether a mixed file can parse as a valid configuration was not examined; it needs the same two
-          coincidences and a length difference.
+          Whether a mixed file can parse as a valid configuration: examined in R66-3 (below). It can, and it is then
+          exactly the entry of one of the two writers.
         No acknowledged write is at risk in any of the three. Not fixed here: the lock belongs in Ratis (see
         "Upstream"), and delaying chunks until the updater is idle would add a wait to every install for a window
         never seen in a cluster run.
@@ -6103,6 +6104,314 @@ install it (`apt-get install gcc libc6-dev`) and run with `-Drockserver.test.req
         (`ReplicatedServerMain.logInfo`), not the leader's view. The new comparison is stricter than the old one
         (one comparison, no second try, and each database must hold the converged index), not a longer wait around a
         fault: a follower that never applied its log's tail now fails the wait after 30 s with every node's indices.
+   - R66-3 (low, docs and a test; no product code changed): can a `raft-meta.conf` that holds bytes of both writers
+     (review of R66, 1, case (c)) parse as a valid but wrong configuration instead of failing the start? Read in the
+     3.3.1 bytecode (`javap`, no sources in `~/.m2`): `RaftStorageImpl.writeRaftConfiguration` writes one bare
+     `LogEntryProto` (`writeTo`, no length prefix; how many `write` calls it makes was not checked, one is assumed for entries this small) through `AtomicFileOutputStream`;
+     `readRaftConfiguration` reads it back with `LogEntryProto.Builder.mergeFrom(InputStream)` and
+     `LogProtoUtils.toRaftConfiguration`. Two writers that both opened `raft-meta.conf.tmp` before either wrote each write
+     from offset 0 of the same inode, so the file ends as the later writer's bytes B followed by the rest of the earlier
+     writer's entry A, from offset |B|, when A is longer (when A is not longer, B overwrites all of it and the file is B).
+     Answer: it can parse, and what it parses to is always B exactly, never a third configuration. The tail of A starts
+     inside A's configuration message, and the parser either fails on it (a field cut at the end, a length that runs past
+     the end) or skips it (fields of a wire type the top-level message does not use for that number are unknown fields). Checked by sweep, not proved:
+     `MixedConfigurationFileTest.anOverlayOfTwoEntriesIsNeverAThirdConfiguration` builds 182,439 overlays of real-shaped
+     entries (terms 1 to 200, indexes of 1 to 4 varint bytes, voter sets of 1 to 5, joint halves, a listener in the longer
+     entry's halves) and asserts each is unparsable (123,882) or equal to B (58,557), never A and never another
+     configuration. Two entries one after the other (which neither writer produces) fail in Ratis' configuration builder
+     (a peer id twice: `IllegalArgumentException`), so no merge of two peer lists is possible either.
+     What a node does with the file (`MixedConfigurationFileTest.aMixOfTwoConfigurationEntriesEitherStopsTheNodeAtItsStartOrIsOneOfThem`,
+     processes, a follower of three with a real term and index in its file, nine files in turn, the original put back
+     between them): an empty file, a file cut in the middle or by 9 bytes, two entries one after the other, and an
+     overlay that does not parse: exit 1, `RaftServerProxy has failed`, as in review of R66. An overlay that parses: the
+     node starts, serves, and converges with the others, whether B is the node's own configuration, two voters without
+     the node at an index below its log, or two voters without the node at an index far above it.
+     Is the file authoritative? Not alone: `ServerState.initialize` sets the configuration from the file, then replays
+     the configuration entries of the log past the snapshot, and the one with the highest index is current (see "Ratis'
+     configuration of a node is not always the entry at its index" above). Three cases for a parsed B:
+     (1) B is the writer's later and newer entry: right. (2) B is older than the other writer's entry A and A is in the
+     log past the snapshot: the log replaces B at the start (the low-index run). (3) B is older and A is not in the log:
+     the node starts with B, a real earlier configuration of the group, until a configuration entry with a higher index
+     reaches it (the high-index run keeps a configuration that no log entry replaces: the node served, and what it would
+     do when it had to stand for an election or count a quorum was not run). Case (3) is possible in the very
+     situation of the race: the writer that is a snapshot chunk carries the leader's latest configuration, often at or
+     below the snapshot index, and the log after an install starts at that index, so the newer entry is not in the log;
+     if the updater's older entry (from the node's own log tail) is the one left in the file, the restart reads that.
+     **So, yes: a node can act on a valid configuration that is older than the group's.** It is never an invented one.
+     The consequence is the one of a stale `raft-meta.conf` that the round-11 residuals describe: a voter set behind by
+     one change overlaps the current one in every quorum, one behind by two or more may not (a candidate that counts
+     votes against it, or a node that is not in it and stops standing for election). Not seen in a cluster run: it
+     needs the race (never seen), A longer than B, and the newer entry missing from the log. Severity stays low.
+     Proposed, not implemented (needs a decision): a start-time check in `ReplicatedNode`, after Ratis has read the file,
+     that compares the index of the configuration Ratis starts with against the highest configuration index the node
+     knows from its own records (`InstalledConfiguration` keeps the index and halves of every chunk's configuration,
+     recorded before Ratis sees the chunk, and the committed-configuration history holds the ones it applied) and, if the
+     records hold a higher index that the log past the snapshot does not, stops with exit 1 and a message that names the
+     file (the node is then replaced, as for an unparsable one) or rewrites the file from the record. Closing the race
+     itself still belongs in Ratis (a lock around `writeRaftConfiguration`, or a temporary name per writer).
+   - R67-1 (low, client and server): in the default LISTED mode a leader hint whose host is a bracketed IPv6 literal
+     was dropped. The server sent `[::1]:5333` (`PeerConfig` keeps the brackets of a `--peer`), the client's listed
+     keys came from `Utils.parseHostAndPorts`, which strips them (`::1:5333`), and `LeaderHintRouter` compared the
+     texts, so a client of three nodes on `[::1]` never used a leader channel: every leader-bound call paid the
+     forwarding hop (correct, only slower). Fixed on both sides to one form. `LeaderHintRouter.normalize` strips the
+     brackets, lower-cases, and writes an IPv6 literal as the JDK prints it (`InetAddress.ofLiteral`, text only, no
+     lookup), so `::1`, `[::1]` and `[0:0:0:0:0:0:0:1]` are one address; the same key serves the listed check, the
+     "same hint again" check, the back-off after a failed channel, and the leader's own naming of itself in a response
+     (`Hint.names`), so another spelling of the same leader is not a new leader. The hint is parsed with its
+     brackets removed, and the channel is opened to the bare host, as `forHostAndPort` is for a listed address (checked:
+     `NettyChannelBuilder.forAddress("::1", port)` has the authority `[::1]:port`). A hint without brackets
+     (`::1:5333`, which an old server built from an unbracketed `--peer`, accepted by `PeerConfig`) is still read, by
+     its last colon. `LeaderHintCache` now writes the hint with `Utils.formatHostAndPorts`, so an IPv6 host is always
+     bracketed, whichever way the peer was configured. The Rust client has no leader hint (it never reads
+     `rockserver-leader`), so there is nothing to fix there; its listed addresses are not compared with anything.
+     Tests: `LeaderHintRouterTest` (bracketed, other spellings; the unbracketed, malformed and channel-target cases
+     pass on the old code too and pin what must stay) and `LeaderHintCacheTest` fail on the old code; `Ipv6LeaderHintTest` (three in-process nodes on `[::1]`, a
+     `GrpcConnection` over the same list; skipped without an IPv6 loopback) times out waiting for a leader channel on the
+     old code and finds one to the leader on the new. It reads the channel through the test-only
+     `GrpcConnection.leaderChannelAddressForTesting()`; that writes go straight to the leader is shown by the channel
+     being the leader's and taking leader-bound calls (`LeaderHintRouter` routing is covered by its own tests), not by a
+     count of forwarded calls, which the server does not keep.
+   - R66-5 (low, single-node server and replicated server; availability at a stop): the shutdown hook of the
+     single-node server (`it.cavallium.rockserver.core.Main`, what production runs) had the shape R61-13 fixed in the
+     replicated one. The hook asks the thread of `run` to stop and waits, without limit, for a latch that only that
+     thread releases once it closed the servers and the database. `System.exit` runs the hooks on the thread that
+     called it and waits for them, so an exit on that thread, between the registration of the hook and the end of
+     `run`, left the two waiting for each other. Reproduced with a real process (`MainStartProcessTest`, red: still
+     running after 60 s, the thread dump showing `main` in `Shutdown.runHooks` under `System.exit` and
+     `DB shutdown hook` in `CountDownLatch.await`), for an exit during the start and for one after a SIGTERM (which
+     waits behind the signal's shutdown instead of running the hooks, with the same end). The process kept its database
+     open, served nothing and ignored SIGTERM. No caller is known: the core's main code has no `System.exit` after the
+     hook is registered (its three are in the argument handling before it), and a taken port there throws; it would
+     take a library, or code loaded into the server, that exits on that thread. So this closes a shape, not a failure
+     that was seen.
+     - The rule now, as in R61-13: the hook never waits for something only an exiting thread can do. While it waits,
+       it looks at the thread of `run` every 200 ms (`Main.awaitShutdownComplete`); if that thread has a frame of
+       `java.lang.Shutdown` and the latch is not released, it prints
+       `Rockserver cannot shut down: the thread that runs it called System.exit ...; halting with 1` with that thread's
+       stack and ends the process with 1 through libc's `_exit`. The database is open at that point and only that
+       thread could close it, so this leaves what a crash leaves; the test opens the database again afterwards. The
+       latch is read again after the look at the thread, so a caller that exits once `run` returned (inside
+       `System.exit` too, with everything closed) is not halted and keeps its status.
+     - Nothing else changed for the single-node server, and these are pinned with real processes: a SIGTERM while
+       serving (`MainShutdownTest`, as before) and a SIGTERM during a start (5 s more of start, then the close) end
+       with 143, the marker `run` writes after its last close present and the database free; a start that fails (a
+       taken gRPC port; a start that throws) ends by itself with everything closed.
+     - Left as it is, on purpose: the single-node hook has no time limit for a `System.exit` on *another* thread
+       (case 3 of R61-13). Such an exit while serving is an ordinary stop there (the thread of `run` closes everything
+       and the exit completes), the hook's wait covers the close and the rest of a start, which have no bound by
+       design (a large database opens for minutes), and a limit would turn a slow clean stop into a halt. What stays
+       without limit is therefore a start, or a close, that itself waits for a thread inside `System.exit`: no caller
+       known, a SIGKILL ends it, as before.
+     - Found on the way and not changed (it needs a decision): a start of the single-node server that fails after the
+       database opened (a taken Thrift or gRPC port, any exception there) logs `Unexpected error`, closes everything,
+       logs `Shut down successfully` and ends with status 0, the status of a `main` that returned. A supervisor that
+       restarts on failure only does not restart it. `MainStartProcessTest` pinned the 0 as what it did, with a
+       comment that said so. Changed since: it ends with 1 (see "Residuals of the review of R67", 1).
+     - `JvmExit` (what is read in the stack traces) and `ProcessHalt` (`_exit`) moved to
+       `it.cavallium.rockserver.core.impl`, public; the replicated server's classes of those names stay and delegate,
+       so its code, its tests' probe and its answers are the same. The single-node server links `_exit` only when it
+       halts (nothing new runs at a normal start or stop). It was written here that without
+       `--enable-native-access` the halt falls back to the JVM's halt, which can hang a database that is writing
+       (R62-1): not so on Java 27, see "Residuals of the review of R67", 2.
+     - The residual of R61-13 that the review of R65 left, in the replicated server: after a signal the hook waits for
+       a start still running without limit, also when another thread then calls `System.exit` and the start waits for
+       that thread. That exit waits behind the signal's shutdown for good, so the start never ends. Reproduced
+       (`StartExitProcessTest.anExitOnAnotherThreadAfterASignalThatTheStartWaitsForEndsWithOne`, red: still running
+       after 60 s, `SIGTERM handler` in `Shutdown.runHooks`, the exiting thread blocked in `Shutdown.exit`, `main`
+       joining it). Bounded: after a signal the hook also asks whether a thread is inside `System.exit` without being
+       the one that runs the hooks (`JvmExit.exitWaiting`: a frame of `java.lang.Shutdown`, none of `runHooks`), and
+       from when it first sees one the start gets the 30 s of case 3 (`startAfterExitTimeout`), then
+       `Node <id> does not start: a System.exit on another thread waits behind the shutdown that a signal started ...;
+       halting with 1`. Whether the start waits for that thread cannot be told, as in case 3, and the cost is the same:
+       a start that would have ended later than 30 s after such an exit is halted before it serves. A signal during a
+       start with no such thread waits without limit, as before
+       (`StartExitProcessTest.aSignalDuringAStartStillStopsTheNodeCleanly`, unchanged, passes). The question costs one
+       dump of all stack traces per 200 ms, only in a hook that waits for a start after a signal.
+     - What is read are JDK implementation classes, seen on Temurin 27.0.1 and pinned by the process tests: a JDK where
+       an exit is not recognised fails the two exit cases of `MainStartProcessTest` with the hang.
+   - R66-4 (low, docs; no code changed): in `ColdRestartTest.twoNodesServeAfterAColdRestartAndTheThirdConverges` the
+     node that was down for about 10 s applied nothing 3.5 s after its return in several runs, and was level with the
+     leader after about 7 s. Expected, from stock Ratis' appender back-off, and already shorter than with Ratis'
+     defaults. Measured with the real processes of the test (a scratch copy of the test printing, every 100 ms, the
+     returned node's applied and commit index from `admin status`, with `DEBUG` for `org.apache.ratis.server.leader`,
+     `.server.impl` and `.grpc` and timestamps in every node's log). 23 runs, 0 failures: the returned node had
+     applied everything the leader committed 2.4 s at the least, 4.8 s at the median and 9.7 s at the most after its
+     process was started, and in 16 of the 23 more than 3.5 s. (The two sets: 12 runs without the logging, 11 with;
+     the polling is one `admin` JVM per answer, about 0.8 s, so the times are rounded up by up to that.)
+     Where the time goes, from the 10 runs with the leader's log (seconds after the start of the node's process):
+     - Process start, RocksDB open and the log read: 1.1 to 1.6 s until `READY` (the first `INFO` lines: the database
+       open takes 0.35 s, 310 entries of log read in 0.03 s). Nothing there is slow, and nothing waits for the
+       election timeout: the node, a follower that heard no leader for its 544 to 661 ms election timeout, started a
+       pre-vote, which the leader rejected ("still has leadership"), and went back to follower. Harmless.
+     - The leader's appender for that follower is asleep from the failed tries of the downtime. Each failure adds to
+       `errorCount` (about 2 per sleep in the logs), and the sleep is a step of the policy
+       (`RaftSettings.APPENDER_RETRY_POLICY`, `1ms,10, 1s,20, 2s,...`) times Ratis' random factor of 0.5 to 1.5: 1 ms up
+       to a count of 10, 0.5 to 1.5 s up to 30, 1 to 3 s past it (Ratis' default has 5 s there: 2.5 to 7.5 s). In the 10
+       runs the leader's count was 12 to 28 when the node came back, so the first try that reached it came 1.4 to 2.6 s
+       after its start (the leader's `nextIndex` for it was 1120, the node's log 310 entries long).
+     - That try is a heartbeat, which the node answers `INCONSISTENCY` (its log is shorter). Ratis counts that answer
+       as an error (`errorCount` 29 to 31 in the log), so the appender sleeps again (0.5 to 1.5 s in the 10 runs), then sends a
+       heartbeat at the new `nextIndex`, which succeeds (the node's commit index jumps to what it knows, 308 in one
+       run) but carries no entries. The appender still sleeps a third time before it sends the entries (0.5 to 2.5 s
+       in the 10 runs), and not because the count survives that heartbeat (corrected in the review of R67, 3: a
+       successful answer sets the count to 0, `FollowerInfoImpl.ErrorStateImpl.updateErrorCount(false)` in the 3.3.1
+       bytecode). The first try is several requests (the heartbeat and what was queued behind it), each answered
+       `INCONSISTENCY`, so the count rises by two or three, the later ones while the appender already sleeps for the
+       first. The appender sleeps once for each count it has not slept for yet (`getErrorCountToDelay`): when it
+       wakes, it sends the heartbeat and, before the answer is back, sees a count it has not slept for and sleeps
+       again, with the step of that count (past 30 in some runs, where the step is 2 s). The answer arrives a few
+       milliseconds later and clears the count, but nothing wakes the sleep. In the run printed (leader log, seconds
+       after the start): 2.15 first try, three `INCONSISTENCY` answers within 4 ms (count 29, 30, 31), sleep 1444 ms
+       for 29, heartbeat sent at 3.60 and sleep 2520 ms for 31 begun in the same millisecond, heartbeat `OK` 3 ms
+       later, 813 entries sent at 6.14 and applied within 20 ms.
+     - The ten runs, seconds after the node's start: `READY` 1.2 to 1.4; first answer 1.4 to 2.6; the first
+       successful heartbeat 1.6 to 4.4; the entries acknowledged 1.7 to 6.1 (two runs had no `INCONSISTENCY` and so no
+       second and third sleep: 1.7 and 2.2); the polling saw the node level 2.7 to 7.2. Sleeps after the first answer:
+       none (2 runs), one (1 run), two (5 runs) or three (2 runs).
+     So the catch-up of a returned node is the appender's sleeps (up to three, 0.5 to 3 s each), not the node: its own
+     apply of 813 entries takes 20 ms, no snapshot is installed ("installed a snapshot: false" in all 12 runs that
+     printed it, the log being kept), and the test's own polling adds up to 0.8 s. These sleeps are stock Ratis' and
+     no `sleep` or back-off of ours is in the way: below a count of 30 the policy equals Ratis' default, and past it
+     the sleeps are 2.5 times shorter than the default's (2.5 to 7.5 s, which is why the last step was lowered, see
+     "ApiGate"). The test's 30 s bound (`CONVERGENCE_TIMEOUT`) holds the worst case (three sleeps of 3 s plus the
+     start, 10.5 s) with room, so the test is unchanged.
+     Not done, a proposal: shorter steps of the policy (the 1 s step to 0.5 s and the last to 1 s, so sleeps of 0.25 to
+     0.75 s and 0.5 to 1.5 s) would cut the catch-up of a returned node to about 2 to 4 s, at the price of `ApiGate`'s minimum pause
+     (twice the longest sleep, now 6 s, would be 3 s: a node that is cut off for a moment would be taken out of service
+     sooner, so the gate's own tests need a re-run) and of twice as many failed tries against a node that is down
+     (the 0.15% of a core of this policy's last step, see "ApiGate", would roughly double, and the warnings, batched every 5 s,
+     do not grow). Not changed here: this is a replication timing setting. A change in Ratis would remove the
+     last sleep for every setting: Ratis already clears the count on a successful answer, so what is missing is that
+     the answers of one burst count as one error, or that a successful answer ends a sleep under way (review of R67,
+     3; not tried). "Upstream" is the place to note it if it is filed.
+   - Review of R67 (4 findings: one regression of the round in the replicated server, one gap in the leader hints,
+     two in the docs; fixed here. Every new test of the round was run against the code before its fix and failed
+     there as its entry says, each code commit compiles on its own, and the touched classes pass):
+     1. (low, replicated server; a regression of R66-5 that no release had) A second signal during a start halted
+        the node. The handler thread of every signal after the first calls `Shutdown.exit` and waits behind the
+        first one's shutdown, so it has a frame of `java.lang.Shutdown` and none of `runHooks`: exactly what
+        `JvmExit.exitWaiting` took for a `System.exit` on another thread. A SIGTERM sent twice during a long start
+        (an operator repeating `kill`, Ctrl-C twice, the SIGHUP and SIGTERM of a closing terminal) therefore gave
+        the start 30 s and then
+        `Node <id> does not start: a System.exit on another thread waits behind the shutdown that a signal started ...; halting with 1`,
+        where before R66-5 the hook waited for the start however long (R28-4). Red:
+        `StartExitProcessTest.aSecondSignalDuringAStartStillWaitsForTheStart` (two SIGTERM 500 ms apart during a
+        start of 5 s, limit 2 s: exit 1 and "halting" after 2.9 s). Fixed: `exitWaiting` does not count a thread with
+        a frame of the signal handler (`java.lang.Terminator`); nothing waits for such a thread. The test now ends
+        with 143 after the start, the node stopped. The single-node server never asked this question (its hook looks
+        only at the thread of `run`), so nothing changes there.
+     2. (low, client) `LeaderHintRouter.normalize` wrote every host with a colon in brackets, also when the JDK reads
+        the literal as an IPv4 address: `::ffff:10.0.0.1` became `[10.0.0.1]:port`, which equals neither the listed
+        `10.0.0.1:port` nor anything else, so an IPv4-mapped spelling on one side and the plain one on the other was
+        dropped as "not one of the client's addresses" (the fault of R67-1, one spelling over). Red:
+        `LeaderHintRouterTest.anIpv4MappedIpv6HintIsTheIpv4Address`. Fixed: the brackets are written only when the
+        normalised host still has a colon. IPv4 literals and host names are compared as before R67-1 (lower case,
+        no lookup): `LeaderHintRouterTest`'s older cases and `ClientFailoverTest` pass unchanged.
+     3. (docs) R66-4 said that a successful heartbeat does not clear the appender's error count and proposed that
+        Ratis clear it. It does clear it (`ErrorStateImpl.updateErrorCount(false)` sets the count to 0; `isError` is
+        true for `INCONSISTENCY`, a timeout and a stream error only). The sleep after the successful heartbeat is for
+        the further `INCONSISTENCY` answers of the first burst and begins before the heartbeat's answer is back; the
+        entry above is corrected, with the lines of the leader's log it was read from
+        (`/var/tmp/rockserver-r67/r66-4/logs/1794448407066/stderr-2.log`). The measurements stand. The proposal to
+        shorten `APPENDER_RETRY_POLICY` is not taken: it halves `ApiGate`'s minimum pause and doubles the tries
+        against a dead follower to save 2 to 5 s once per node restart, and nothing waits on those seconds (the
+        runbook's rolling restart waits for the commit index anyway).
+     4. (docs) The runbook's exit-code row told the operator to read the member list of a node from `status` in the
+        R66-3 case. `status` prints the role, the applied and commit index and Ratis' commit infos of each member,
+        not its configuration: the row now says to replace the node in that case. And the R67-1 entry said all five
+        new `LeaderHintRouterTest` cases fail on the old code: two do (bracketed, other spellings), three pass on
+        both and are pins.
+     Judged and left as they are:
+     - R66-3's proposed start-time check (compare the index of the configuration Ratis starts with against
+       `InstalledConfiguration` and the committed-configuration history, exit 1 or rewrite the file) is not
+       implemented. The state it guards against needs the two-writer race, which no run has produced, and can only
+       be built by writing the file by hand; a check that is wrong in the other direction refuses the start of a
+       healthy node, and the two records it would trust are written at other moments than the file (a chunk's
+       configuration is recorded before Ratis sees the chunk, so an install that fails afterwards may leave the
+       record ahead of the file with nothing wrong; not run). The evidence of the entry stands: the sweep and the nine process cases
+       were run again here (green), and the worst case is a real, older configuration, the round-11 residual.
+       It needs a decision, and a way to produce the state through Ratis, before code.
+     - R67-1 changed what a server sends for an IPv6 `--peer` written without brackets (`::1:5333` before,
+       `[::1]:5333` now). A client older than R67-1 with such a list took the old form and drops the new one: its
+       leader-bound calls pay the forwarding hop until the client is upgraded (correct, slower). New clients read
+       both forms. Kept: one unambiguous form on the wire is worth more than that combination, which no deployment
+       has (the replicated server is not released).
+     - The single-node server at a normal start and stop does what it did: the hook's wait is the same latch, read
+       every 200 ms instead of once, with one stack trace of the thread of `run` per read; `_exit` is linked only on
+       the halt. `MainShutdownTest`, `GrpcShutdownTest`, `SafeShutdownTest`, `RocksDBStatisticsShutdownTest` and
+       the four non-exit cases of `MainStartProcessTest` pass; its two exit cases hang for 60 s on the old hook.
+       That a failed start of it ends with status 0 (R66-5, "found on the way") was left open here; it ends with 1
+       now ("Residuals of the review of R67", 1).
+     - `Ipv6LeaderHintTest` compared the client's leader channel with the leader found before the client connected;
+       an election in between (400 to 800 ms timeouts) would have failed it. It now compares with the leader of the
+       moment inside its wait. Not seen failing; the bound and what is asserted are the same.
+     Not verified: the full core and distributed suites (only the classes named here and in the entries above);
+     another JDK than Temurin 27.0.1 for the frame names; a second signal of another kind than SIGTERM (SIGHUP and
+     SIGINT go through the same handler class, read in the JDK's source, not run).
+   - Residuals of the review of R67 (what that review left "not fixed" or "not verified", each taken up: one
+     product change in the single-node server, three checks that end a question, one left for a decision):
+     1. (low, single-node server; availability after a failed start) R66-5, "found on the way": a start of
+        `it.cavallium.rockserver.core.Main` that failed after the database opened (a taken Thrift or gRPC port, any
+        exception while the servers are built, started or closed) closed everything and ended with status 0, because
+        `run` caught the exception, logged it and returned. A supervisor that restarts on failure (`Restart=on-failure`)
+        then leaves the server down, and one that restarts always cannot tell this end from a stop it asked for. A
+        database that does not open ended with 1 already (that exception is thrown outside the `catch` and leaves
+        `main`), so the status depended on how far the start got. Red:
+        `MainStartProcessTest.aTakenListeningPortEndsTheProcessWithTheDatabaseClosed` and
+        `aStartThatThrowsEndsTheProcessWithTheDatabaseClosed`, `expected: <1> but was: <0>`. Fixed: `run` returns
+        whether it ended without an exception, and `main` (`Main.runAndExit`, `main` with the test's callbacks)
+        calls `System.exit(1)` if not, after everything is closed, the marker of the last close is written and the
+        hook's latch is released, so the hook of R66-5 does not take it for an exit inside the start. The log then
+        ends with `Shut down after the error above` instead of `Shut down successfully`. Unchanged: a stop by
+        SIGTERM ends with 143 (if a close throws during it, the exit waits behind the signal's shutdown and the
+        status is still the signal's; reasoned from `Shutdown`, not run); `--print-default-config` ends with 0; a
+        caller of `run` that is not `main` gets the boolean and decides
+        (`MainStartProcessTest.anExitOnceRunReturnedKeepsItsStatus`, 7 as before). What it changes for a deployment:
+        a unit with `Restart=on-failure` now restarts a server whose port was taken, as it does one whose database
+        did not open; when the port's holder is the previous process still stopping, the next start passes. A
+        permanent cause makes a restart loop at the supervisor's pace (each try opens and closes the database
+        cleanly), which the supervisor's start limit bounds and its status shows; before, the same cause left the
+        server down with a status that said success. Production's supervisor settings were not read (production is
+        not touched from here): this is the one thing to look at before this version is deployed there.
+     2. (no change; a claim of R66-5 corrected) "Without `--enable-native-access` the halt falls back to
+        `Runtime.halt`" is not what Java 27 does. Without the flag the JDK prints its warning for the restricted
+        call and links `_exit` all the same (JEP 472's default, `--illegal-native-access=warn`). The fallback is
+        taken only where native access is denied (`--illegal-native-access=deny`, announced as a later default), and
+        there `System.loadLibrary` is refused too (`IllegalCallerException`), so the RocksDB library does not load
+        and the server never opens a database: the case R62-1 is about, a halt while RocksDB writes, cannot be
+        reached that way. Pinned by `ProcessHaltNativeAccessTest` (a process each: no flag, the flag, denied). So
+        whether production's launch command has the flag does not decide how a halt ends on Java 27; the flag is
+        still what README asks for (no warning, and required on the day a JDK denies by default, when the first case
+        of that test fails). The replicated server prints `WARNING: libc's _exit could not be linked` at its start
+        when the fallback is in use; the single-node server links only when it halts and prints nothing.
+     3. (test only) A second signal of another kind during a start, which the review had read in `Terminator.java`
+        and not run: `StartExitProcessTest.aHangupThenATermDuringAStartStillWaitsForTheStart` (SIGHUP, then SIGTERM
+        500 ms later: 129 after the start, no halt) and `anInterruptThenAHangupDuringAStartStillWaitsForTheStart`
+        (SIGINT, then SIGHUP: 130). Both fail, with the halt after 2.9 s, when `JvmExit.exitWaiting` is put back to
+        what it was before the review's fix, as the SIGTERM case does.
+     4. (no change; R67-1's kept incompatibility has no one to meet) "A client older than R67-1 that lists an
+        unbracketed IPv6 peer drops the new hint": leader hints exist since `c21b2a5` (2026-11-06), on the branches
+        of this rewrite only. No tag and no remote branch contains that commit, and none of the 193 `rockserver*`
+        jars in the local Maven repository (what Yotsuba builds against) has `LeaderHintRouter`. A client that reads
+        hints and is older than R67-1 was never built outside this branch, so nothing has to keep the old form.
+     5. (no change; R66-4's mechanism checked in every log) The review corrected why the appender sleeps once more
+        after the returned node answered, from one leader log. The other ten kept logs
+        (`/var/tmp/rockserver-r67/r66-4/logs/*/stderr-*.log`) say the same: every sleep after the first answer of
+        the returned node is preceded by one more `INCONSISTENCY` answer that arrives 1 to 3 ms after the sleep
+        before it began (the rest of the same burst, or an answer to a heartbeat), and
+        the error count only rises between them (for example 29, 31; or 31, 33, 34), so no success had cleared it.
+        7 of the 11 runs have a second such sleep and 2 a third; 3 have one and 1 none. The proposal to shorten
+        `APPENDER_RETRY_POLICY` stays declined, for the review's reasons.
+     6. (open, needs a decision; R66-3) No start-time check of `raft-meta.conf` against `InstalledConfiguration` was
+        written, and none is recommended: the state needs Ratis' two-writer race, which no run produced, so a check
+        could only be tested against a file written by hand; the records it would compare are written at other
+        moments than the file, so it can refuse a healthy node; and what it would catch is a real, older
+        configuration of the same group, with which the process cases of `MixedConfigurationFileTest` serve and
+        converge. The fix belongs in Ratis (a lock or a temporary name per writer in
+        `RaftStorageImpl.writeRaftConfiguration`, see "Upstream").
+     Not verified: the full core and distributed suites (the classes named here: `MainStartProcessTest` 6,
+     `MainShutdownTest` 1, `ProcessHaltNativeAccessTest` 3, `StartExitProcessTest` 7); production's supervisor and
+     launch command; another JDK than Temurin 27.0.1.
    - Review of R46, 1 (low, docs): the R46-2 recipe ran `dependency:build-classpath` on `distributed/server/pom.xml`
      alone, so Maven resolved `rockserver-core:${revision}` and that version's pom from `~/.m2` (or the snapshot
      repository): `grep -v /rockserver-core/` dropped the jar but kept the third-party jars of that pom, from whichever
@@ -6188,7 +6497,8 @@ install it (`apt-get install gcc libc6-dev`) and run with `-Drockserver.test.req
      takes it, and the second fails with `NoSuchFileException: .../current/raft-meta.conf.tmp -> .../raft-meta.conf`:
      the install request fails, or the updater dies with `RaftLogIOException` ("caught a Throwable") and closes the
      division (a node then stops with exit 3, `ConfigurationFileWriteFailureTest`); two writers that open the file
-     before either writes can also leave mixed contents, with which a node does not start (review of R66, 1). Read in the 3.3.1 bytecode (callers found with `javap -c`); reproduced with a plain
+     before either writes can also leave mixed contents, with which a node does not start or, when the bytes parse, starts with
+     the later writer's complete entry (review of R66, 1; R66-3). Read in the 3.3.1 bytecode (callers found with `javap -c`); reproduced with a plain
      Ratis server and no Rockserver code. The product does not write that file itself, and a node installs a snapshot
      only after it has joined a group whose entries it applies, so the window is a follower that applies a
      configuration entry while an install request arrives; not seen in a cluster run, and not avoidable from here
