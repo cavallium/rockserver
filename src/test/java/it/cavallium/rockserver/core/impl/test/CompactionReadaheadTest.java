@@ -372,6 +372,77 @@ class CompactionReadaheadTest {
         } finally { registry.close(); }
     }
 
+    @Test void limiterIsNotRewrittenForBudgetChangesUnderFivePercent() throws Exception {
+        var worth = Class.forName("it.cavallium.rockserver.core.impl.CompactionIoController")
+                .getDeclaredMethod("worthApplying", long.class, long.class, boolean.class);
+        worth.setAccessible(true);
+        assertEquals(false, worth.invoke(null, 1_000_000L, 1_000_000L, true));
+        assertEquals(false, worth.invoke(null, 1_000_000L, 1_049_999L, false));
+        assertEquals(false, worth.invoke(null, 1_000_000L, 950_001L, false));
+        assertEquals(true, worth.invoke(null, 1_000_000L, 1_050_000L, false));
+        assertEquals(true, worth.invoke(null, 1_000_000L, 700_000L, false));
+        assertEquals(true, worth.invoke(null, 1_000_000L, 1_000_001L, true), "under urgent pressure every change counts");
+
+        // A real limiter under the controller: background I/O at 8 MB/s, three decreases after slow reads, then
+        // compaction debt that rises by 0.2% per poll and takes the floor (and the budget) up a little every second.
+        RocksDBLoader.loadLibrary();
+        long seed = 1_000_000;
+        var registry = new SimpleMeterRegistry();
+        var script = new Object() {
+            long nanos = System.nanoTime(), bytes, points, pointNanos, rate, latency = 100;
+            double debt;
+            CompactionIoBudget.Sample next() {
+                nanos += 1_000_000_000L; bytes += rate; points += 40; pointNanos += 40 * latency * 1000;
+                return new CompactionIoBudget.Sample(nanos, 0, 0, bytes, rate > 0, false, false, true, true, points, true, false,
+                        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, false, latency, 0, points, 0, 0, pointNanos).withCompactionDebt(debt);
+            }
+        };
+        var constructor = Class.forName("it.cavallium.rockserver.core.impl.CompactionIoController")
+                .getDeclaredConstructor(String.class, RateLimiter.class, java.util.function.Supplier.class,
+                        io.micrometer.core.instrument.MeterRegistry.class, long.class,
+                        java.util.function.LongUnaryOperator.class, boolean.class);
+        constructor.setAccessible(true);
+        try (var limiter = new RateLimiter(seed, 100_000, RateLimiter.DEFAULT_FAIRNESS, org.rocksdb.RateLimiterMode.ALL_IO, false);
+             var controller = (AutoCloseable) constructor.newInstance("dead-band", limiter,
+                     (java.util.function.Supplier<CompactionIoBudget.Sample>) script::next, registry, 0L,
+                     (java.util.function.LongUnaryOperator) size -> size, false)) {
+            var executorField = controller.getClass().getDeclaredField("executor"); executorField.setAccessible(true);
+            var executor = (ScheduledExecutorService) executorField.get(controller);
+            var pollField = controller.getClass().getDeclaredField("poll"); pollField.setAccessible(true);
+            var poll = (Runnable) pollField.get(controller);
+            var budget = registry.get("rockserver.compaction.io.budget").gauge();
+            var state = registry.get("rockserver.compaction.io.state").gauge();
+            executor.submit(poll).get(5, TimeUnit.SECONDS);
+            for (int window = 0; window < 30; window++) {
+                boolean reduction = state.value() == CompactionIoBudget.State.PROBE.ordinal();
+                if (window > 6 && !reduction && budget.value() < 3 * seed) break; // the third decrease was kept
+                script.rate = Math.min(8 * seed, limiter.getBytesPerSecond());
+                script.latency = window < 6 || script.rate <= 3 * seed ? 100 : reduction ? 150 : 200;
+                for (int i = 0; i < 5; i++) executor.submit(poll).get(5, TimeUnit.SECONDS);
+            }
+            assertEquals(CompactionIoBudget.State.TRACKING.ordinal(), state.value());
+            assertEquals(2_744_000, budget.value(), 2);
+            assertEquals(budget.value(), limiter.getBytesPerSecond(), "every step so far was over 5%");
+            script.rate = seed; script.latency = 100;
+            int writes = 0, steps = 0;
+            for (int i = 0; i <= 250; i++) {
+                script.debt = .5 + i * .002;
+                long before = limiter.getBytesPerSecond();
+                double budgetBefore = budget.value();
+                executor.submit(poll).get(5, TimeUnit.SECONDS);
+                long after = limiter.getBytesPerSecond();
+                if (budget.value() != budgetBefore) steps++;
+                if (after != before) { writes++; assertTrue(after >= before * 1.05, before + " -> " + after); }
+                assertTrue(after <= budget.value() && budget.value() < after * 1.05 + 1,
+                        "the limiter is at most 5% under the budget: " + after + " for " + budget.value());
+            }
+            // The floor passes the 2.744 MB/s budget at about a quarter of the way; from there the budget moves every poll.
+            assertTrue(steps >= 150, "the budget moved at " + steps + " polls");
+            assertTrue(writes >= 10 && writes <= 30, "the limiter was written " + writes + " times");
+            assertEquals(0, registry.get("rockserver.compaction.io.adjustment.failures").gauge().value());
+        } finally { registry.close(); }
+    }
+
     @Test void closeWaitsForOwnedActuatorBeforeNativeDisposal() throws Exception {
         RocksDBLoader.loadLibrary();
         var input = new Input(); var entered = new CountDownLatch(1); var release = new CountDownLatch(1);

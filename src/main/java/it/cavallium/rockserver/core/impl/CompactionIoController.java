@@ -75,7 +75,8 @@ final class CompactionIoController implements AutoCloseable {
         poll = () -> {
                 try {
                     long next = budget.sample(sample.get());
-                    if (next != limiter.getBytesPerSecond()) limiter.setBytesPerSecond(next);
+                    if (worthApplying(limiter.getBytesPerSecond(), next,
+                            budget.state() == CompactionIoBudget.State.RECOVERY)) limiter.setBytesPerSecond(next);
                     long target = budget.readaheadBytes();
                     if (readaheadDirty || target != appliedReadahead.get()) {
                         readaheadDirty = true;
@@ -118,6 +119,16 @@ final class CompactionIoController implements AutoCloseable {
             close();
             throw failure;
         }
+    }
+
+    /**
+     * Dead band of the limiter: a budget within 5% of the rate in force is not written to it. The comparison is
+     * with the limiter's own rate, so small steps add up until they pass 5%. Every decrease of the control law is
+     * 10% or more; what this holds back is slow upward movement (the +5% steps past a harmful rate, the floor
+     * following compaction debt poll by poll), by at most 5%. Under urgent pressure every change is written.
+     */
+    static boolean worthApplying(long current, long next, boolean urgent) {
+        return next != current && (urgent || Math.abs(next - current) >= current / 20);
     }
 
     @Override public synchronized void close() {
