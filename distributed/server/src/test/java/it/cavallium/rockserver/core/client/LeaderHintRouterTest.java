@@ -117,6 +117,18 @@ class LeaderHintRouterTest {
 		assertEquals(2, opened.size(), "a case and zero spelling of a listed address was dropped");
 	}
 
+	/** Review of R67: an IPv4 address written as an IPv4-mapped IPv6 literal is that IPv4 address, in a hint and in a list. */
+	@Test
+	void anIpv4MappedIpv6HintIsTheIpv4Address() {
+		var router = ipv6Router("127.0.0.1:5001,[::ffff:127.0.0.1]:5002");
+		router.offer("[::ffff:127.0.0.1]:5001");
+		assertEquals(1, opened.size(), "the IPv4-mapped spelling of a listed IPv4 address was dropped");
+		router.offer("127.0.0.1:5001");
+		assertEquals(1, opened.size(), "another spelling of the same leader opened a second channel");
+		router.offer("127.0.0.1:5002");
+		assertEquals(2, opened.size(), "the IPv4 spelling of a listed IPv4-mapped address was dropped");
+	}
+
 	@Test
 	void unbracketedIpv6HintIsStillTaken() {
 		var router = ipv6Router("[::1]:5001");

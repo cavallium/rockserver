@@ -89,6 +89,29 @@ class StartExitProcessTest {
 				+ " that a signal started"), output);
 	}
 
+	/**
+	 * Review of R67: a second signal during a start (SIGTERM twice, or the SIGHUP and SIGTERM of a closing terminal) is
+	 * no {@code System.exit} on another thread. Its handler thread waits behind the first signal's shutdown in
+	 * {@code Shutdown.exit}, as an exit would, but nothing waits for it: the hook still waits for the start, longer
+	 * than the limit of an exit (2 s here, the start takes 5 s more), and stops the node it returned.
+	 */
+	@Test
+	void aSecondSignalDuringAStartStillWaitsForTheStart() throws Exception {
+		var ports = ProcessCluster.freePorts(2, List.of());
+		var process = start("slow", ports);
+		awaitStarting(process);
+		long signalled = System.nanoTime();
+		process.destroy();
+		// The second one once the first runs the hooks: it then waits behind it.
+		Thread.sleep(500);
+		process.destroy();
+		var output = awaitExit(process);
+		assertFalse(output.contains("halting"), output);
+		assertEquals(143, process.exitValue(), output);
+		assertTrue(System.nanoTime() - signalled >= TimeUnit.SECONDS.toNanos(4), "it did not wait for the start: " + output);
+		assertTrue(output.contains("a: started, Raft"), output);
+	}
+
 	private Process start(String mode, List<Integer> ports) throws Exception {
 		var command = PortInUseProcessTest.command(tempDir, StartExitMain.class, ports.get(0), ports.get(1),
 				List.of("-Drockserver.test.startExit=" + mode));
