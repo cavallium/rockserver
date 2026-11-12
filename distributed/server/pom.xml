@@ -7,7 +7,7 @@
   <version>${revision}</version>
 
   <properties>
-    <revision>2.0.3-SNAPSHOT</revision>
+    <revision>3.0.0</revision>
     <maven.compiler.release>27</maven.compiler.release>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
     <ratis.version>3.3.1</ratis.version>
@@ -21,6 +21,31 @@
     <repository><id>gitea</id><url>https://git.tgdb.org/api/packages/andreacavalli/maven</url></repository>
     <repository><id>mchv-release</id><url>https://mvn.mchv.eu/repository/mchv</url></repository>
   </repositories>
+
+  <distributionManagement>
+    <repository>
+      <id>mchv-release-distribution</id>
+      <name>MCHV Release Apache Maven Packages Distribution</name>
+      <url>https://mvn.mchv.eu/repository/mchv</url>
+      <releases>
+        <enabled>true</enabled>
+      </releases>
+      <snapshots>
+        <enabled>false</enabled>
+      </snapshots>
+    </repository>
+    <snapshotRepository>
+      <id>mchv-snapshot-distribution</id>
+      <name>MCHV Snapshot Apache Maven Packages Distribution</name>
+      <url>https://mvn.mchv.eu/repository/mchv-snapshot</url>
+      <releases>
+        <enabled>false</enabled>
+      </releases>
+      <snapshots>
+        <enabled>true</enabled>
+      </snapshots>
+    </snapshotRepository>
+  </distributionManagement>
 
   <dependencies>
     <dependency>
