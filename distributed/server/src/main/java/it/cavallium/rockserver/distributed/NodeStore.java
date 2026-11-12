@@ -159,10 +159,16 @@ final class NodeStore implements Closeable {
 	 */
 	private static final String METRICS_NODE_NAME = "database.metrics.node-name";
 
+	// adaptive-compaction-io is off whatever the config says: core's limiter takes the rate of its first active
+	// window as its budget (a small first flush leaves it at 40 KiB/s) and then grows it by a tenth every five
+	// seconds, and a replica's checkpoint flushes on the apply path, so the first snapshot of three production nodes
+	// took 206 to 229 s with their applies stopped (2026-11-12; NodeStoreTest
+	// aCheckpointIsNotThrottledByTheAdaptiveCompactionIoLimiter).
 	private static final String REPLICA_OVERRIDES = """
 			database.global.absolute-consistency = false
 			database.global.atomic-flush = true
 			database.global.optimistic = true
+			database.global.adaptive-compaction-io = false
 			""";
 
 	/**

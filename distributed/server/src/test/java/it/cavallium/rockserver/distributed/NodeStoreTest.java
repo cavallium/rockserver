@@ -1997,6 +1997,57 @@ class NodeStoreTest {
 		assertTrue(Files.exists(wal.resolve("000012.log")));
 	}
 
+	/**
+	 * Production, 2026-11-12: with {@code adaptive-compaction-io = true} (copied from a single node's config) core's
+	 * compaction I/O limiter sat at its floor, 40 KiB/s, on a replica that had not flushed yet, and the flush inside the
+	 * first snapshot took 206 to 229 s on each of three nodes while their applies waited. A replica runs without that
+	 * limiter whatever the config says: its checkpoints flush on the apply path.
+	 */
+	@Test
+	void aCheckpointIsNotThrottledByTheAdaptiveCompactionIoLimiter() throws Exception {
+		Path config = Files.writeString(tempDir.resolve("adaptive.conf"), "database.global.adaptive-compaction-io = true\n");
+		try (var store = NodeStore.open(tempDir.resolve("adaptive").resolve("db"), config, "adaptive")) {
+			long column = store.db().createColumn(DATA_COLUMN, DATA_SCHEMA);
+			// A first, tiny flush: the limiter takes the rate of its first active window as its budget (here a few
+			// bytes a second, so its floor), and then grows it by a tenth per window.
+			// After the limiter's first poll (it counts bytes between polls, one a second, in windows of five).
+			Thread.sleep(2500);
+			put(store, column, 100_000, "small");
+			store.db().flush();
+			Thread.sleep(8000);
+			var random = new java.util.Random(7);
+			var chars = new char[64 * 1024];
+			for (int i = 0; i < 256; i++) {
+				for (int c = 0; c < chars.length; c++) {
+					chars[c] = (char) ('a' + random.nextInt(26));
+				}
+				put(store, column, i, new String(chars));
+			}
+			setApplied(store, TermIndex.valueOf(1, 256));
+			// The limiter's controller polls in the background: give it time to settle where it would.
+			Thread.sleep(3000);
+			assertEquals("none", limiterState(store), "a replica must run without core's compaction I/O limiter");
+			long start = System.nanoTime();
+			store.checkpoint(tempDir.resolve("adaptive-checkpoint"));
+			long millis = (System.nanoTime() - start) / 1_000_000;
+			assertTrue(millis < 10_000, "a checkpoint of 16 MiB of memtables took " + millis + " ms");
+		}
+	}
+
+	/** The budget and state of core's compaction I/O limiter, "none" without one (read by reflection: core hides it). */
+	private static String limiterState(NodeStore store) throws ReflectiveOperationException {
+		var controllerField = store.db().getClass().getDeclaredField("compactionIoController");
+		controllerField.setAccessible(true);
+		Object controller = controllerField.get(store.db());
+		if (controller == null) {
+			return "none";
+		}
+		var budgetField = controller.getClass().getDeclaredField("budget");
+		budgetField.setAccessible(true);
+		var budget = (it.cavallium.rockserver.core.impl.CompactionIoBudget) budgetField.get(controller);
+		return budget.budget() + " B/s, " + budget.state();
+	}
+
 	static String mode(Path file) throws IOException {
 		Set<PosixFilePermission> permissions = Files.getPosixFilePermissions(file);
 		return PosixFilePermissions.toString(permissions);

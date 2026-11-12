@@ -199,18 +199,18 @@ rs build-seed --source-db OLD-DB --source-config old-rockserver.conf --target /d
   you want the three copies taken from one unchanging directory; the source deleting its own files later does not
   change the seed.
 
-**After the first start of a seeded cluster.** Every node takes an automatic snapshot at the same log entry
-(`--snapshot-every`, 500,000 entries by default), and applies wait while a node takes one. On the cluster seeded on
-2026-11-12 (30 GB, 39 columns built with `build-seed`, about 600 writes/s) that first snapshot took 206 to 229 s on
-each of the three nodes at once, 17 minutes after the start, and writes timed out for four minutes. Later snapshots
-of the same nodes under more load took 1.1 to 2.5 s. Why the first one was slow was not established (the RocksDB
-info log had nothing after the open; a thread dump was not taken). Until it is, on a newly seeded cluster:
+**Do not carry `adaptive-compaction-io` over from a single node's config.** A replica runs without core's
+compaction I/O limiter whatever its config says (since 3.0.1; in 3.0.0 set `adaptive-compaction-io: false` in the
+cluster's config). The limiter takes the write rate of its first active five-second window as its budget, so a small
+first flush leaves it at its floor of 40 KiB/s, and it then grows by a tenth per window. A replica's snapshot flushes
+its memtables while its applies wait: on the cluster seeded on 2026-11-12 with a config copied from the single node
+(`adaptive-compaction-io: true`), the first snapshot took 206 to 229 s on each of the three nodes at once, and writes
+timed out for four minutes. Later snapshots took 1 to 3 s only because the budget had grown by then; every restart
+starts the limiter again. Reproduced by `NodeStoreTest.aCheckpointIsNotThrottledByTheAdaptiveCompactionIoLimiter`
+(125 s for 16 MiB with the limiter, under a second without).
 
-- give each node its own thresholds so that they never snapshot together, for example `--snapshot-every` 2000000,
-  2500000 and 3000000 with `--snapshot-every-bytes` 6, 7 and 8 GiB;
-- before clients connect, or in a quiet moment, take one snapshot per node, one node at a time, followers first
-  (`rs admin $PEERS snapshot <id>`), and check its time in the node's log (`snapshot taken at ... in N ms`). If one
-  is slow, take a thread dump of the node meanwhile (`jstack`, the thread named `...-StateMachineUpdater`).
+Give each node its own snapshot thresholds all the same, so that they never snapshot together: for example
+`--snapshot-every` 2000000, 2500000 and 3000000 with `--snapshot-every-bytes` 6, 7 and 8 GiB.
 
 Then continue with steps 2 to 6 above, with the built seed as the database directory to copy. Build one seed and copy
 it to every node: two builds do not give the same files.
