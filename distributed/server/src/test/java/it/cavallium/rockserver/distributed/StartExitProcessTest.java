@@ -112,6 +112,41 @@ class StartExitProcessTest {
 		assertTrue(output.contains("a: started, Raft"), output);
 	}
 
+	/**
+	 * The same with the other signals the JVM handles: the SIGHUP and then the SIGTERM of a closing terminal. The
+	 * status is that of the first signal, whose handler runs the hooks.
+	 */
+	@Test
+	void aHangupThenATermDuringAStartStillWaitsForTheStart() throws Exception {
+		assertASecondSignalWaitsForTheStart("HUP", "TERM", 128 + 1);
+	}
+
+	/** And Ctrl-C followed by a SIGHUP. */
+	@Test
+	void anInterruptThenAHangupDuringAStartStillWaitsForTheStart() throws Exception {
+		assertASecondSignalWaitsForTheStart("INT", "HUP", 128 + 2);
+	}
+
+	private void assertASecondSignalWaitsForTheStart(String first, String second, int status) throws Exception {
+		var ports = ProcessCluster.freePorts(2, List.of());
+		var process = start("slow", ports);
+		awaitStarting(process);
+		long signalled = System.nanoTime();
+		signal(process, first);
+		Thread.sleep(500);
+		signal(process, second);
+		var output = awaitExit(process);
+		assertFalse(output.contains("halting"), output);
+		assertEquals(status, process.exitValue(), output);
+		assertTrue(System.nanoTime() - signalled >= TimeUnit.SECONDS.toNanos(4), "it did not wait for the start: " + output);
+		assertTrue(output.contains("a: started, Raft"), output);
+	}
+
+	private static void signal(Process process, String name) throws Exception {
+		var kill = new ProcessBuilder("kill", "-" + name, String.valueOf(process.pid())).inheritIO().start();
+		assertEquals(0, kill.waitFor(), "kill -" + name);
+	}
+
 	private Process start(String mode, List<Integer> ports) throws Exception {
 		var command = PortInUseProcessTest.command(tempDir, StartExitMain.class, ports.get(0), ports.get(1),
 				List.of("-Drockserver.test.startExit=" + mode));
