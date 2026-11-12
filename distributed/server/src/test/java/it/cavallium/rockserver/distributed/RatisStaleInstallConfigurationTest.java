@@ -64,6 +64,18 @@ class RatisStaleInstallConfigurationTest {
 				Thread.sleep(20);
 			}
 			assertTrue(division.getInfo().isLeader(), "the single node leads");
+			// A new leader appends its start configuration entry, and the state machine updater persists the
+			// configuration of every entry it applies to raft-meta.conf through the same raft-meta.conf.tmp that
+			// installSnapshot uses, with no lock between the two (stock Ratis 3.3.1, round 66): an install that
+			// overlaps that apply loses the rename and fails, in either thread. Install only once that entry applied.
+			while ((division.getRaftLog().getNextIndex() < 1
+					|| division.getInfo().getLastAppliedIndex() < division.getRaftLog().getNextIndex() - 1)
+					&& System.nanoTime() - deadline < 0) {
+				Thread.sleep(5);
+			}
+			assertTrue(division.getRaftLog().getNextIndex() >= 1
+					&& division.getInfo().getLastAppliedIndex() >= division.getRaftLog().getNextIndex() - 1,
+					"the start configuration entry is applied");
 			long term = division.getInfo().getCurrentTerm();
 			assertTrue(term >= 1, "term " + term);
 			long index = division.getRaftLog().getNextIndex() + 100;

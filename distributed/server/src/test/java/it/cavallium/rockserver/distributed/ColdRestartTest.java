@@ -57,8 +57,9 @@ import org.junit.jupiter.api.io.TempDir;
  * missing), puts of unique keys, blocks of puts followed by a {@code deleteRange} over part of the block, and one
  * {@code createColumn} under load. After every restart the test checks, through the cluster, that every
  * acknowledged write is present exactly once, that writes with an unknown outcome are present at most once, that
- * writes known to have failed are absent, and that each writer's acknowledged merges keep their order. At the end
- * every node is stopped and the replicas are compared byte for byte, offline.</p>
+ * writes known to have failed are absent, and that each writer's acknowledged merges keep their order. At the end,
+ * once every node has applied the whole log, every node is stopped and the replicas are compared byte for byte,
+ * offline.</p>
  *
  * <p>Losing the un-synced RocksDB WAL tail, in two ways. With a positive {@code delay-wal-flush-duration} (5 seconds
  * by default, 1 second here) RocksDB buffers its WAL inside the process (manual WAL flush), so a SIGKILL drops the
@@ -101,7 +102,17 @@ class ColdRestartTest {
 	private static final Duration SERVE_BOUND = Duration.ofSeconds(30);
 	private static final Duration LOAD_TIMEOUT = Duration.ofSeconds(60);
 	private static final Duration WRITER_STOP_TIMEOUT = Duration.ofSeconds(90);
-	private static final int CONVERGENCE_ATTEMPTS = 3;
+	/**
+	 * From the end of the load until every node has applied everything the leader committed, before the offline
+	 * comparison. A follower learns that an entry is committed from the leader's next request, at the latest the next
+	 * heartbeat (half the smallest election timeout: 200 ms here); the node that was down in the two-of-three scenario
+	 * first has to receive and apply the {@link #CATCH_UP_WRITES} it missed. Measured: see the R66 entry of
+	 * design.md.
+	 */
+	private static final Duration CONVERGENCE_TIMEOUT = Duration.ofSeconds(30);
+	/** A member's line of {@code admin status}: id, role, applied index, commit index. */
+	private static final Pattern STATUS_LINE =
+			Pattern.compile("^(\\S+): (\\w+), applied index (\\d+), commit index (\\d+)");
 	/**
 	 * Acknowledged writes while one node is down in the two-of-three scenario, over the snapshot interval. The others
 	 * keep the log it misses: Ratis purges only closed log segments, which hold 64 MB, so it catches up from the log;
@@ -273,41 +284,113 @@ class ColdRestartTest {
 	}
 
 	/**
-	 * Stops every node gracefully and compares their databases offline: same columns with the same ids, same keys
-	 * and values. Replicas stopped at different applied positions may differ only because one of them had not
-	 * applied the latest entries yet; the cluster then runs again for a while and is compared again.
+	 * Waits until every node has applied the whole log ({@link #awaitConverged}), then stops every node gracefully and
+	 * compares their databases offline: same columns with the same ids, same keys and values. The applied positions
+	 * may still differ, by entries without content: a leader that stops hands leadership over, and the new leader's
+	 * first entry reaches only the nodes still running.
+	 *
+	 * <p>Without the wait the comparison raced the leader's next heartbeat (R66): {@code verify} reads through the
+	 * leader, and a follower stopped right after it had the last entries in its log without knowing them committed, so
+	 * it stopped a few entries behind. Starting the cluster again for another try raced the same way, as each try
+	 * wrote a probe ({@link #awaitServing}) and stopped the nodes within milliseconds of its acknowledgement.</p>
 	 */
 	private void assertReplicasIdentical(ProcessCluster cluster, Workload workload) throws Exception {
-		for (int attempt = 1; ; attempt++) {
-			for (var id : cluster.nodeIds()) {
-				cluster.stop(id);
-			}
-			var replicas = new LinkedHashMap<String, Replica>();
-			for (var id : cluster.nodeIds()) {
-				replicas.put(id, readReplica(cluster.dataDir(id).resolve("db"), id));
-			}
-			var reference = replicas.values().iterator().next();
-			boolean identical = replicas.values().stream()
-					.allMatch(replica -> replica.content.equals(reference.content));
-			boolean samePosition = replicas.values().stream()
-					.allMatch(replica -> replica.applied.getIndex() == reference.applied.getIndex());
-			if (identical) {
-				assertEquals(workload.columnId(LATE), reference.columnIds.get(LATE), "late column id");
-				System.out.println("ColdRestartTest: replicas identical at applied positions "
-						+ replicas.values().stream().map(replica -> replica.applied.toString()).toList()
-						+ ", " + reference.size() + " keys");
-				return;
-			}
-			if (samePosition || attempt == CONVERGENCE_ATTEMPTS) {
-				fail("Replicas differ" + (samePosition ? " at the same applied position" : " after " + attempt
-						+ " attempts to converge") + ": " + describeDifferences(replicas));
-			}
-			for (var id : cluster.nodeIds()) {
-				cluster.start(id);
-			}
-			cluster.waitReady(READY_TIMEOUT);
-			awaitServing(cluster, workload, System.nanoTime());
+		var converged = awaitConverged(cluster);
+		var exitCodes = new LinkedHashMap<String, Integer>();
+		for (var id : cluster.nodeIds()) {
+			cluster.stop(id);
+			exitCodes.put(id, cluster.exitCode(id));
 		}
+		var replicas = new LinkedHashMap<String, Replica>();
+		for (var id : cluster.nodeIds()) {
+			replicas.put(id, readReplica(cluster.dataDir(id).resolve("db"), id));
+		}
+		var reference = replicas.values().iterator().next();
+		boolean identical = replicas.values().stream()
+				.allMatch(replica -> replica.content.equals(reference.content));
+		if (!identical) {
+			fail("Replicas differ, although every node had applied index " + converged.index() + " "
+					+ converged.elapsed().toMillis() + " ms after the load: " + describeDifferences(replicas)
+					+ "\nstatus before the stop:\n" + converged.status()
+					+ "exit codes of the graceful stop (143 is SIGTERM): " + exitCodes + "\n" + allLogTails(cluster));
+		}
+		for (var replica : replicas.entrySet()) {
+			assertTrue(replica.getValue().applied.getIndex() >= converged.index(), "Node " + replica.getKey()
+					+ " had applied index " + converged.index() + " while running, and its database holds "
+					+ replica.getValue().applied + " after a graceful stop (exit code " + exitCodes.get(replica.getKey())
+					+ ")\n" + cluster.logTail(replica.getKey()));
+		}
+		assertEquals(workload.columnId(LATE), reference.columnIds.get(LATE), "late column id");
+		System.out.println("ColdRestartTest: replicas identical at applied positions "
+				+ replicas.values().stream().map(replica -> replica.applied.toString()).toList()
+				+ ", " + reference.size() + " keys; every node had applied index " + converged.index() + " "
+				+ converged.elapsed().toMillis() + " ms after the load");
+	}
+
+	/** The index every node had applied, how long after the call, and the {@code status} output that showed it. */
+	private record Converged(long index, Duration elapsed, String status) {}
+
+	/**
+	 * Waits, with no load running, until {@code admin status} shows twice in a row one leader and the same applied
+	 * and commit index on every node: nothing is left to commit or to apply, so replicas stopped now hold the same
+	 * entries. Fails after {@link #CONVERGENCE_TIMEOUT} with the last status (role, applied and commit index of each
+	 * node, or why it did not answer) and the nodes' log tails.
+	 */
+	private static Converged awaitConverged(ProcessCluster cluster) throws Exception {
+		long started = System.nanoTime();
+		Long previous = null;
+		while (true) {
+			var result = cluster.adminResult(cluster.nodeIds(), "status");
+			var index = result.exitCode() == 0 ? convergedIndex(cluster.nodeIds(), result.output()) : null;
+			var elapsed = Duration.ofNanos(System.nanoTime() - started);
+			if (index != null && index.equals(previous)) {
+				return new Converged(index, elapsed, memberLines(cluster.nodeIds(), result.output()));
+			}
+			if (elapsed.compareTo(CONVERGENCE_TIMEOUT) > 0) {
+				var running = new TreeMap<String, String>();
+				for (var id : cluster.nodeIds()) {
+					running.put(id, cluster.isRunning(id) ? "running" : "exited with " + cluster.exitCode(id));
+				}
+				return fail("The nodes did not reach the same applied index within " + CONVERGENCE_TIMEOUT
+						+ " without load; processes " + running + "; last status (exit code " + result.exitCode() + "):\n"
+						+ memberLines(cluster.nodeIds(), result.output()) + allLogTails(cluster));
+			}
+			previous = index;
+			Thread.sleep(50);
+		}
+	}
+
+	/** The lines of {@code status} about the members {@code ids}, without their commit infos; all of it if none. */
+	private static String memberLines(List<String> ids, String status) {
+		var lines = status.lines()
+				.filter(line -> ids.stream().anyMatch(id -> line.startsWith(id + ": ")))
+				.map(line -> line.replaceFirst(", commit infos .*$", "") + "\n")
+				.collect(Collectors.joining());
+		return lines.isEmpty() ? status : lines;
+	}
+
+	/**
+	 * The index that every one of {@code ids} has both applied and committed according to {@code status}, null if
+	 * they differ, a node did not answer, or there is not exactly one leader.
+	 */
+	static Long convergedIndex(List<String> ids, String status) {
+		var indexes = new HashMap<String, Long>();
+		int leaders = 0;
+		for (var line : status.lines().toList()) {
+			var matcher = STATUS_LINE.matcher(line);
+			if (!matcher.find() || !ids.contains(matcher.group(1))) {
+				continue;
+			}
+			if (!matcher.group(3).equals(matcher.group(4)) || indexes.put(matcher.group(1),
+					Long.parseLong(matcher.group(3))) != null) {
+				return null;
+			}
+			if (matcher.group(2).equals("LEADER")) {
+				leaders++;
+			}
+		}
+		var distinct = new HashSet<>(indexes.values());
+		return leaders == 1 && indexes.size() == ids.size() && distinct.size() == 1 ? distinct.iterator().next() : null;
 	}
 
 	/** One replica's database: user column ids and contents (hex keys and values), and its applied position. */
