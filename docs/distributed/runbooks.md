@@ -186,9 +186,9 @@ rs build-seed --source-db OLD-DB --source-config old-rockserver.conf --target /d
   copied, and the command prints how many bytes before it copies them. Each column ends with a line
   `column NAME: N files, B bytes, linked|copied` (`empty` for a column without table files), and the command with
   `OK`. On a failure it prints `Not built: ...`, exits with 1 and leaves no target.
-- Pass a `--rockserver-config` without the per-column `column-options` stanzas of the columns being built (keep
-  `default` and the internal ones): a stanza makes the new database create that column when it opens, and the import
-  then refuses it (`Column exists, table files cannot be imported into it`). The nodes run with the full config.
+- `--rockserver-config` can be the config the nodes run with, `column-options` stanzas included: an imported column is
+  created with the options of its stanza (its volume too), and the stanza of a column that is not imported creates
+  that column, empty, as on a node.
 - Refused: a column whose schema names a merge operator (an uploaded one, or a class): leave it out. A column merged
   by the `merge-operator-class` of the source's config needs the same one in `--rockserver-config`. A column with
   blob files. An existing target or `<target>.tmp`.

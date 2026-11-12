@@ -317,6 +317,68 @@ class BuildSeedTest {
 		}
 	}
 
+	/**
+	 * The config that the cluster's nodes run with has a stanza for each column: the seed is built with it as it is. The
+	 * imported columns get the options of their stanzas (a volume of their own inside the seed, auto compactions off),
+	 * the stanza of a column left out is still created, and the other column keeps the fallback options.
+	 */
+	@Test
+	void theConfigOfTheClusterWithTheStanzasOfTheImportedColumnsIsAccepted() throws Exception {
+		Path clusterConfig = root.resolve("stanzas.conf");
+		Files.writeString(clusterConfig, """
+				database.global.column-options = [
+				  { name: "fixed", levels: [], disable-auto-compactions: true, volumes: [ { volume-path: "./vol-fixed", target-size: "10TiB" } ] }
+				  { name: "bucketed", levels: [], disable-auto-compactions: true, volumes: [ { volume-path: "./volume", target-size: "10TiB" } ] }
+				  { name: "huge", levels: [], disable-auto-compactions: true, volumes: [ { volume-path: "./volume", target-size: "10TiB" } ] }
+				]
+				""");
+		Path seed = root.resolve("seed");
+		var built = buildSeed(seed, "--rockserver-config", clusterConfig.toString(), "--exclude-column", "huge");
+		assertEquals(0, built.code(), built.toString());
+		assertTrue(built.out().lines().anyMatch(line -> line.startsWith("column fixed: ") && line.endsWith(", linked")),
+				built.out());
+		assertTrue(built.out().lines().anyMatch(line -> line.startsWith("column bucketed: ") && line.endsWith(", linked")),
+				built.out());
+		assertNothingLeft(seed);
+
+		// The imported column's files are in its stanza's volume, and are links to the source's.
+		var sourceInodes = tableInodes(sourceVolume);
+		assertFalse(tableInodes(seed.resolve("vol-fixed")).isEmpty());
+		assertTrue(sourceInodes.containsAll(tableInodes(seed.resolve("vol-fixed"))));
+
+		// The options of each column of the seed, as RocksDB recorded them in its latest OPTIONS file.
+		Path optionsFile;
+		try (Stream<Path> list = Files.list(seed)) {
+			optionsFile = list.filter(path -> path.getFileName().toString().startsWith("OPTIONS-"))
+					.max(java.util.Comparator.comparing(path -> path.getFileName().toString())).orElseThrow();
+		}
+		var disabled = new java.util.TreeMap<String, String>();
+		String column = null;
+		for (String line : Files.readAllLines(optionsFile)) {
+			line = line.strip();
+			if (line.startsWith("[CFOptions \"")) {
+				column = line.substring("[CFOptions \"".length(), line.length() - 2);
+			} else if (line.startsWith("[")) {
+				column = null;
+			} else if (column != null && line.startsWith("disable_auto_compactions=")) {
+				disabled.put(column, line.substring(line.indexOf('=') + 1));
+			}
+		}
+		assertEquals("true", disabled.get("fixed"), disabled.toString());
+		assertEquals("true", disabled.get("bucketed"), disabled.toString());
+		assertEquals("true", disabled.get("huge"), "the stanza of a column left out is still created: " + disabled);
+		assertEquals("false", disabled.get("default"), disabled.toString());
+
+		try (var store = NodeStore.open(seed, clusterConfig, "seed")) {
+			var api = store.connection().getSyncApi(RequestContext.batch(TIMEOUT));
+			assertEquals(expected.get("fixed"), contents(api, "fixed"));
+			assertEquals(expected.get("bucketed"), contents(api, "bucketed"));
+			var definitions = new java.util.TreeMap<>(store.db().getAllColumnDefinitions());
+			definitions.remove(NodeStore.META_COLUMN);
+			assertEquals(Map.of("fixed", FIXED, "bucketed", BUCKETED), definitions);
+		}
+	}
+
 	/** The cluster's config has its WAL outside the database: the seed keeps its own in wal.detached. */
 	@Test
 	void aSeedForAClusterWithAnOutsideWalOpensWithThatConfig() throws Exception {

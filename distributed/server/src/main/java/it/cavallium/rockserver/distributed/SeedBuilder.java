@@ -269,6 +269,11 @@ final class SeedBuilder {
 					if (exported.files() != files.size()) {
 						throw new BuildException("Column " + name + " changed while it was exported");
 					}
+					// A stanza of the config (the cluster's, whole) made the seed's open create this column, empty and
+					// without a schema, and an import is refused into an existing column. The seed is new and nothing
+					// wrote to it: drop that empty column, so that the import creates it again with the options of
+					// its stanza, which createColumn reads from the config, volumes included.
+					seed.deleteColumnIfExists(name);
 					seedId = seed.createColumnFromExport(name, schema, exported);
 				} catch (BuildException e) {
 					throw e;
