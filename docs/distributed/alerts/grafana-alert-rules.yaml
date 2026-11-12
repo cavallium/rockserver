@@ -223,6 +223,8 @@ groups:
         labels: {severity: critical, team: rockserver}
         annotations:
           summary: "Less than 10% free on the disk of the database or of the Raft log. A snapshot keeps the files that compactions replaced, and a full disk stops writes: runbooks.md, \"Disk space\"."
+        # One query per disk: both measurements in one query give two series with the same labels for a node, which
+        # Grafana refuses ("frame cannot uniquely be identified by its labels").
         data:
           - refId: A
             relativeTimeRange: {from: 3600, to: 0}
@@ -232,13 +234,25 @@ groups:
               rawQuery: true
               resultFormat: time_series
               query: >-
-                SELECT last("value") FROM /^rockserver_replication_disk_(data|raft)_usable_percent$/ WHERE "database-name" = 'CLUSTER' AND time > now() - 5m GROUP BY "node"
+                SELECT last("value") FROM "rockserver_replication_disk_data_usable_percent" WHERE "database-name" = 'CLUSTER' AND time > now() - 5m GROUP BY "node"
+          - refId: D
+            relativeTimeRange: {from: 3600, to: 0}
+            datasourceUid: INFLUX_UID
+            model:
+              refId: D
+              rawQuery: true
+              resultFormat: time_series
+              query: >-
+                SELECT last("value") FROM "rockserver_replication_disk_raft_usable_percent" WHERE "database-name" = 'CLUSTER' AND time > now() - 5m GROUP BY "node"
           - refId: B
             datasourceUid: __expr__
             model: {refId: B, type: reduce, expression: A, reducer: last, settings: {mode: dropNN}}
+          - refId: E
+            datasourceUid: __expr__
+            model: {refId: E, type: reduce, expression: D, reducer: last, settings: {mode: dropNN}}
           - refId: C
             datasourceUid: __expr__
-            model: {refId: C, type: threshold, expression: B, conditions: [{evaluator: {type: lt, params: [10]}}]}
+            model: {refId: C, type: math, expression: "$B < 10 || $E < 10"}
       - uid: rockserver-write-stopped
         title: RocksDB stopped writes
         condition: C
