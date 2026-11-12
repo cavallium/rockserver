@@ -234,6 +234,8 @@ public final class CompactionIoBudget {
     /** Windows until measured harm may lower the budget again (set when a decrease did not help or was at the floor). */
     private int harmCooldown;
     private int hold, ceilingWindows, harmFreeWindows;
+    /** Whether the last doubling that raised the background rate was taken back after one slow window. */
+    private boolean doublingTakenBack;
     /**
      * The background rate at which foreground harm was last measured (0: none known). While it is known, growth is
      * gentle (see {@link #grown}); it is forgotten after {@link #CEILING_MEMORY_WINDOWS} harm-free windows and when
@@ -335,7 +337,7 @@ public final class CompactionIoBudget {
             healthyRecovery = 0;
             beforeGrowth = 0;
             harmWindows = harmCooldown = hold = 0;
-            ceiling = 0; // Urgent pressure wins: what harm taught is learned again after it.
+            ceiling = 0; doublingTakenBack = false; // Urgent pressure wins: what harm taught is learned again after it.
             queueReferenceWindows = 0; probeQueueProtected = false;
             double usefulService = Math.max(preThrottle, Math.max(recentAchieved, probeBudget));
             // Writes are delayed or stopped: never under the flush floor, and never under the budget in force (in
@@ -610,11 +612,16 @@ public final class CompactionIoBudget {
         boolean reductionAllowed = !rateProbeBlocked() && (bulkIdle || bulkComparable);
         if (harm && undo > 0 && undo < budget) {
             // The window after a doubling had slow reads: take the step back at once (it is the likely cause, and
-            // the budget before it was healthy). If the step did raise the background rate, that rate harms.
-            if (achieved > undo) rememberHarm(achieved);
+            // the budget before it was healthy). One slow window is not yet harm: the doubling is tried again after
+            // the hold, and only if that one is taken back too is its rate remembered as harmful.
+            if (achieved > undo) {
+                if (doublingTakenBack) rememberHarm(achieved);
+                doublingTakenBack = true;
+            }
             budget = undo;
             hold = HOLD_WINDOWS;
         } else {
+            if (undo > 0) doublingTakenBack = false; // The doubling stood its first window.
             // Slow reads in HARM_WINDOWS consecutive windows: HARM_DECREASE of the achieved rate, kept or undone by
             // the next windows. Healthy reads: a trial from a window that saturated the limiter, only while the
             // baseline is not calibrated or the read pool is saturated (a distress no baseline measures).

@@ -528,13 +528,32 @@ class CompactionIoBudgetTest {
         assertEquals(2 * SEED, t.policy.budget());
         t.window(10, 200, 2 * SEED);
         assertEquals(SEED, t.policy.budget(), "point reads at twice the baseline right after the step");
-        assertEquals(2 * SEED, t.policy.harmCeilingBytesPerSecond());
+        assertEquals(0, t.policy.harmCeilingBytesPerSecond(), "one slow window is not yet a harmful rate");
         for (int i = 0; i < 2; i++) {
             t.window(10, 100, SEED);
             assertEquals(SEED, t.policy.budget(), "no growth in the 3 windows after a decrease (the slow one was the first)");
         }
         t.window(10, 100, SEED);
+        assertEquals(2 * SEED, t.policy.budget(), "the doubling is tried again");
+        t.window(10, 200, 2 * SEED);
+        assertEquals(SEED, t.policy.budget());
+        assertEquals(2 * SEED, t.policy.harmCeilingBytesPerSecond(), "taken back twice in a row: 2 MB/s harms");
+        t.window(10, 100, SEED); t.window(10, 100, SEED);
+        assertEquals(SEED, t.policy.budget());
+        t.window(10, 100, SEED);
         assertEquals(1_200_000, t.policy.budget(), "then +10% of the rate that harmed, not a doubling back to it");
+    }
+    @Test void aDoublingThatStoodItsFirstWindowIsNotTheFirstOfTwoTakenBack() {
+        var t = new Trace(); t.window(10, 100, SEED); t.window(10, 100, SEED); t.window(10, 100, SEED);
+        t.window(10, 100, SEED);
+        t.window(10, 200, 2 * SEED); // taken back
+        t.window(10, 100, SEED); t.window(10, 100, SEED); t.window(10, 100, SEED);
+        assertEquals(2 * SEED, t.policy.budget());
+        t.window(10, 100, 2 * SEED); // this doubling stands, and the next one follows
+        assertEquals(4 * SEED, t.policy.budget());
+        t.window(10, 200, 4 * SEED);
+        assertEquals(2 * SEED, t.policy.budget());
+        assertEquals(0, t.policy.harmCeilingBytesPerSecond(), "a single slow window again");
     }
     @Test void aDoublingThatDidNotRaiseTheBackgroundRateTeachesNoCeiling() {
         var t = new Trace(); t.window(10, 100, SEED); t.window(10, 100, SEED); t.window(10, 100, SEED);
