@@ -189,12 +189,28 @@ rs build-seed --source-db OLD-DB --source-config old-rockserver.conf --target /d
   copied, and the command prints how many bytes before it copies them. Each column ends with a line
   `column NAME: N files, B bytes, linked|copied` (`empty` for a column without table files), and the command with
   `OK`. On a failure it prints `Not built: ...`, exits with 1 and leaves no target.
+- Pass a `--rockserver-config` without the per-column `column-options` stanzas of the columns being built (keep
+  `default` and the internal ones): a stanza makes the new database create that column when it opens, and the import
+  then refuses it (`Column exists, table files cannot be imported into it`). The nodes run with the full config.
 - Refused: a column whose schema names a merge operator (an uploaded one, or a class): leave it out. A column merged
   by the `merge-operator-class` of the source's config needs the same one in `--rockserver-config`. A column with
   blob files. An existing target or `<target>.tmp`.
 - The linked seed shares its table files with the source. Copy it to the nodes before the single node runs again if
   you want the three copies taken from one unchanging directory; the source deleting its own files later does not
   change the seed.
+
+**After the first start of a seeded cluster.** Every node takes an automatic snapshot at the same log entry
+(`--snapshot-every`, 500,000 entries by default), and applies wait while a node takes one. On the cluster seeded on
+2026-11-12 (30 GB, 39 columns built with `build-seed`, about 600 writes/s) that first snapshot took 206 to 229 s on
+each of the three nodes at once, 17 minutes after the start, and writes timed out for four minutes. Later snapshots
+of the same nodes under more load took 1.1 to 2.5 s. Why the first one was slow was not established (the RocksDB
+info log had nothing after the open; a thread dump was not taken). Until it is, on a newly seeded cluster:
+
+- give each node its own thresholds so that they never snapshot together, for example `--snapshot-every` 2000000,
+  2500000 and 3000000 with `--snapshot-every-bytes` 6, 7 and 8 GiB;
+- before clients connect, or in a quiet moment, take one snapshot per node, one node at a time, followers first
+  (`rs admin $PEERS snapshot <id>`), and check its time in the node's log (`snapshot taken at ... in N ms`). If one
+  is slow, take a thread dump of the node meanwhile (`jstack`, the thread named `...-StateMachineUpdater`).
 
 Then continue with steps 2 to 6 above, with the built seed as the database directory to copy. Build one seed and copy
 it to every node: two builds do not give the same files.
