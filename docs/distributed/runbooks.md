@@ -820,7 +820,8 @@ status for a signal (128 plus its number), since the shutdown hook halts with a 
 failure (then 3, 4 or 5, as in the table). A halt ends the process through libc's `_exit` (R62-1): with the JVM's
 own halt a node whose database was still writing could stay forever, not serving and deaf to SIGTERM, until a
 SIGKILL. A node prints `WARNING: libc's _exit could not be linked` at its start if it has to fall back to the JVM's
-halt (it needs `--enable-native-access=ALL-UNNAMED`, which the node is started with anyway). The hook is registered before the node starts: a SIGTERM while it is still
+halt (that is where native access is denied, `--illegal-native-access=deny`; without
+`--enable-native-access=ALL-UNNAMED` Java 27 only warns and still links it). The hook is registered before the node starts: a SIGTERM while it is still
 starting (opening its database, loading its log, checking its membership) waits for the start to end and then stops
 the node as above, so a stop during a long start takes as long as the rest of the start, which `TimeoutStopSec`
 must cover for a large node (or it ends with SIGKILL, a crash for the node). Such a node does not print `READY`.
@@ -843,7 +844,10 @@ start did not end within 30 s of that (R66-5; without such an exit a SIGTERM dur
 however long). The single-node server (`it.cavallium.rockserver.core.Main`) has one line of this kind:
 `Rockserver cannot shut down: the thread that runs it called System.exit ...; halting with 1`, with exit code 1 and
 its database left as after a crash (the next start recovers it); the stack below the line shows what called the
-exit. A node that is killed (SIGKILL, 137 in a shell) or crashes in native code
+exit. The single-node server also ends with 1, after closing everything, when its start fails: a database that does
+not open (the exception ends `main`), or a failure after it opened, such as a listening port that is taken
+(`Unexpected error` with the cause, then `Shut down after the error above`). The second kind ended with 0 until R67,
+so a unit with `Restart=on-failure` did not restart it and now does. A stop by SIGTERM is 143 there too. A node that is killed (SIGKILL, 137 in a shell) or crashes in native code
 (SIGABRT, 134) ends by a signal, and any other failure before the node serves (a malformed option value ends with 2
 instead) ends with 1, as in the table. A supervisor restarts all of these except a stop it asked for. So the codes a
 supervisor must not restart are 2, 4 and 5, and 143 is a clean stop.

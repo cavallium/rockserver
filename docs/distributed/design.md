@@ -6205,13 +6205,14 @@ install it (`apt-get install gcc libc6-dev`) and run with `-Drockserver.test.req
      - Found on the way and not changed (it needs a decision): a start of the single-node server that fails after the
        database opened (a taken Thrift or gRPC port, any exception there) logs `Unexpected error`, closes everything,
        logs `Shut down successfully` and ends with status 0, the status of a `main` that returned. A supervisor that
-       restarts on failure only does not restart it. `MainStartProcessTest` pins the 0 as what it does today, with a
-       comment that says so.
+       restarts on failure only does not restart it. `MainStartProcessTest` pinned the 0 as what it did, with a
+       comment that said so. Changed since: it ends with 1 (see "Residuals of the review of R67", 1).
      - `JvmExit` (what is read in the stack traces) and `ProcessHalt` (`_exit`) moved to
        `it.cavallium.rockserver.core.impl`, public; the replicated server's classes of those names stay and delegate,
        so its code, its tests' probe and its answers are the same. The single-node server links `_exit` only when it
-       halts (nothing new runs at a normal start or stop); without `--enable-native-access` it falls back to the JVM's
-       halt, which can hang a database that is writing (R62-1).
+       halts (nothing new runs at a normal start or stop). It was written here that without
+       `--enable-native-access` the halt falls back to the JVM's halt, which can hang a database that is writing
+       (R62-1): not so on Java 27, see "Residuals of the review of R67", 2.
      - The residual of R61-13 that the review of R65 left, in the replicated server: after a signal the hook waits for
        a start still running without limit, also when another thread then calls `System.exit` and the start waits for
        that thread. That exit waits behind the signal's shutdown for good, so the start never ends. Reproduced
@@ -6339,13 +6340,78 @@ install it (`apt-get install gcc libc6-dev`) and run with `-Drockserver.test.req
        every 200 ms instead of once, with one stack trace of the thread of `run` per read; `_exit` is linked only on
        the halt. `MainShutdownTest`, `GrpcShutdownTest`, `SafeShutdownTest`, `RocksDBStatisticsShutdownTest` and
        the four non-exit cases of `MainStartProcessTest` pass; its two exit cases hang for 60 s on the old hook.
-       That a failed start of it ends with status 0 (R66-5, "found on the way") is still open and needs a decision.
+       That a failed start of it ends with status 0 (R66-5, "found on the way") was left open here; it ends with 1
+       now ("Residuals of the review of R67", 1).
      - `Ipv6LeaderHintTest` compared the client's leader channel with the leader found before the client connected;
        an election in between (400 to 800 ms timeouts) would have failed it. It now compares with the leader of the
        moment inside its wait. Not seen failing; the bound and what is asserted are the same.
      Not verified: the full core and distributed suites (only the classes named here and in the entries above);
      another JDK than Temurin 27.0.1 for the frame names; a second signal of another kind than SIGTERM (SIGHUP and
      SIGINT go through the same handler class, read in the JDK's source, not run).
+   - Residuals of the review of R67 (what that review left "not fixed" or "not verified", each taken up: one
+     product change in the single-node server, three checks that end a question, one left for a decision):
+     1. (low, single-node server; availability after a failed start) R66-5, "found on the way": a start of
+        `it.cavallium.rockserver.core.Main` that failed after the database opened (a taken Thrift or gRPC port, any
+        exception while the servers are built, started or closed) closed everything and ended with status 0, because
+        `run` caught the exception, logged it and returned. A supervisor that restarts on failure (`Restart=on-failure`)
+        then leaves the server down, and one that restarts always cannot tell this end from a stop it asked for. A
+        database that does not open ended with 1 already (that exception is thrown outside the `catch` and leaves
+        `main`), so the status depended on how far the start got. Red:
+        `MainStartProcessTest.aTakenListeningPortEndsTheProcessWithTheDatabaseClosed` and
+        `aStartThatThrowsEndsTheProcessWithTheDatabaseClosed`, `expected: <1> but was: <0>`. Fixed: `run` returns
+        whether it ended without an exception, and `main` (`Main.runAndExit`, `main` with the test's callbacks)
+        calls `System.exit(1)` if not, after everything is closed, the marker of the last close is written and the
+        hook's latch is released, so the hook of R66-5 does not take it for an exit inside the start. The log then
+        ends with `Shut down after the error above` instead of `Shut down successfully`. Unchanged: a stop by
+        SIGTERM ends with 143 (if a close throws during it, the exit waits behind the signal's shutdown and the
+        status is still the signal's; reasoned from `Shutdown`, not run); `--print-default-config` ends with 0; a
+        caller of `run` that is not `main` gets the boolean and decides
+        (`MainStartProcessTest.anExitOnceRunReturnedKeepsItsStatus`, 7 as before). What it changes for a deployment:
+        a unit with `Restart=on-failure` now restarts a server whose port was taken, as it does one whose database
+        did not open; when the port's holder is the previous process still stopping, the next start passes. A
+        permanent cause makes a restart loop at the supervisor's pace (each try opens and closes the database
+        cleanly), which the supervisor's start limit bounds and its status shows; before, the same cause left the
+        server down with a status that said success. Production's supervisor settings were not read (production is
+        not touched from here): this is the one thing to look at before this version is deployed there.
+     2. (no change; a claim of R66-5 corrected) "Without `--enable-native-access` the halt falls back to
+        `Runtime.halt`" is not what Java 27 does. Without the flag the JDK prints its warning for the restricted
+        call and links `_exit` all the same (JEP 472's default, `--illegal-native-access=warn`). The fallback is
+        taken only where native access is denied (`--illegal-native-access=deny`, announced as a later default), and
+        there `System.loadLibrary` is refused too (`IllegalCallerException`), so the RocksDB library does not load
+        and the server never opens a database: the case R62-1 is about, a halt while RocksDB writes, cannot be
+        reached that way. Pinned by `ProcessHaltNativeAccessTest` (a process each: no flag, the flag, denied). So
+        whether production's launch command has the flag does not decide how a halt ends on Java 27; the flag is
+        still what README asks for (no warning, and required on the day a JDK denies by default, when the first case
+        of that test fails). The replicated server prints `WARNING: libc's _exit could not be linked` at its start
+        when the fallback is in use; the single-node server links only when it halts and prints nothing.
+     3. (test only) A second signal of another kind during a start, which the review had read in `Terminator.java`
+        and not run: `StartExitProcessTest.aHangupThenATermDuringAStartStillWaitsForTheStart` (SIGHUP, then SIGTERM
+        500 ms later: 129 after the start, no halt) and `anInterruptThenAHangupDuringAStartStillWaitsForTheStart`
+        (SIGINT, then SIGHUP: 130). Both fail, with the halt after 2.9 s, when `JvmExit.exitWaiting` is put back to
+        what it was before the review's fix, as the SIGTERM case does.
+     4. (no change; R67-1's kept incompatibility has no one to meet) "A client older than R67-1 that lists an
+        unbracketed IPv6 peer drops the new hint": leader hints exist since `c21b2a5` (2026-11-06), on the branches
+        of this rewrite only. No tag and no remote branch contains that commit, and none of the 193 `rockserver*`
+        jars in the local Maven repository (what Yotsuba builds against) has `LeaderHintRouter`. A client that reads
+        hints and is older than R67-1 was never built outside this branch, so nothing has to keep the old form.
+     5. (no change; R66-4's mechanism checked in every log) The review corrected why the appender sleeps once more
+        after the returned node answered, from one leader log. The other ten kept logs
+        (`/var/tmp/rockserver-r67/r66-4/logs/*/stderr-*.log`) say the same: every sleep after the first answer of
+        the returned node is preceded by one more `INCONSISTENCY` answer that arrives 1 to 3 ms after the sleep
+        before it began (the rest of the same burst, or an answer to a heartbeat), and
+        the error count only rises between them (for example 29, 31; or 31, 33, 34), so no success had cleared it.
+        7 of the 11 runs have a second such sleep and 2 a third; 3 have one and 1 none. The proposal to shorten
+        `APPENDER_RETRY_POLICY` stays declined, for the review's reasons.
+     6. (open, needs a decision; R66-3) No start-time check of `raft-meta.conf` against `InstalledConfiguration` was
+        written, and none is recommended: the state needs Ratis' two-writer race, which no run produced, so a check
+        could only be tested against a file written by hand; the records it would compare are written at other
+        moments than the file, so it can refuse a healthy node; and what it would catch is a real, older
+        configuration of the same group, with which the process cases of `MixedConfigurationFileTest` serve and
+        converge. The fix belongs in Ratis (a lock or a temporary name per writer in
+        `RaftStorageImpl.writeRaftConfiguration`, see "Upstream").
+     Not verified: the full core and distributed suites (the classes named here: `MainStartProcessTest` 6,
+     `MainShutdownTest` 1, `ProcessHaltNativeAccessTest` 3, `StartExitProcessTest` 7); production's supervisor and
+     launch command; another JDK than Temurin 27.0.1.
    - Review of R46, 1 (low, docs): the R46-2 recipe ran `dependency:build-classpath` on `distributed/server/pom.xml`
      alone, so Maven resolved `rockserver-core:${revision}` and that version's pom from `~/.m2` (or the snapshot
      repository): `grep -v /rockserver-core/` dropped the jar but kept the third-party jars of that pom, from whichever
