@@ -36,24 +36,40 @@ public class Main {
 		runAndExit(args, () -> {}, () -> {});
 	}
 
-	/** What {@link #main} does, with the callbacks of {@link #run(String[], Runnable, Runnable)}. */
+	/**
+	 * What {@link #main} does, with the callbacks of {@link #run(String[], Runnable, Runnable)}: runs the server and,
+	 * if it failed, ends the process with status 1 once everything is closed (R66-5). A start that failed after the
+	 * database opened (a listening port that is taken, any exception there) used to end with 0, the status of a
+	 * {@code main} that returned, so a supervisor that restarts on failure left the server down. A database that does
+	 * not open, and an error that is no {@link Exception}, leave {@code run} as a throwable and end with 1 as before.
+	 *
+	 * <p>The exit is called after {@code run} released the shutdown hook's latch, so the hook, if a shutdown is under
+	 * way, does not take it for the exit of {@link #awaitShutdownComplete}; behind a signal's shutdown the call waits
+	 * and the process ends with the signal's status.</p>
+	 */
 	@VisibleForTesting
 	static void runAndExit(String[] args, Runnable shutdownCompleteCallback, Runnable connectedCallback)
 			throws IOException, URISyntaxException {
-		run(args, shutdownCompleteCallback, connectedCallback);
+		if (!run(args, shutdownCompleteCallback, connectedCallback)) {
+			System.exit(1);
+		}
 	}
 
 	@VisibleForTesting
-	static void run(String[] args, Runnable shutdownCompleteCallback) throws IOException, URISyntaxException {
-		run(args, shutdownCompleteCallback, () -> {});
+	static boolean run(String[] args, Runnable shutdownCompleteCallback) throws IOException, URISyntaxException {
+		return run(args, shutdownCompleteCallback, () -> {});
 	}
 
 	/**
 	 * {@code connectedCallback} runs on the calling thread during the start, once the database is open and before the
 	 * servers are built: a test's way to make the start slow, fail or exit.
+	 *
+	 * @return false if the start, the serving or the close of the servers failed with an exception, which is logged
+	 * as {@code Unexpected error}; everything is closed in both cases. The two exits of the argument handling
+	 * ({@code --print-default-config}, a {@code --config} for a database that is not local) do not return.
 	 */
 	@VisibleForTesting
-	static void run(String[] args, Runnable shutdownCompleteCallback, Runnable connectedCallback)
+	static boolean run(String[] args, Runnable shutdownCompleteCallback, Runnable connectedCallback)
 			throws IOException, URISyntaxException {
 		requireNonNull(shutdownCompleteCallback, "shutdownCompleteCallback");
 		requireNonNull(connectedCallback, "connectedCallback");
@@ -98,7 +114,7 @@ public class Main {
 					.getResourceAsStream("it/cavallium/rockserver/core/resources/default.conf"))
 					.transferTo(System.out);
 			System.exit(0);
-			return;
+			return true;
 		}
 
 		LOG.info("Starting...");
@@ -120,7 +136,7 @@ public class Main {
 			if (!databaseUrl.getScheme().equals("file")) {
 				LOG.error("Do not set --config if the database is not local!");
 				System.exit(1);
-				return;
+				return false;
 			} else {
 				clientBuilder.setEmbeddedConfig(Path.of(config));
 			}
@@ -158,6 +174,7 @@ public class Main {
 				});
 		Runtime.getRuntime().addShutdownHook(shutdownHook);
 
+		boolean failed = false;
 		try {
 			LOG.info("Connecting...");
 			try (var connection = clientBuilder.build()) {
@@ -179,9 +196,14 @@ public class Main {
 					}
 				} catch (Exception ex) {
 					LOG.error("Unexpected error", ex);
+					failed = true;
 				}
 			}
-			LOG.info("Shut down successfully");
+			if (failed) {
+				LOG.error("Shut down after the error above");
+			} else {
+				LOG.info("Shut down successfully");
+			}
 		} finally {
 			// A JVM shutdown waits for hook threads, not for this ordinary main thread. Keep the hook alive until all
 			// try-with-resources scopes above have closed gRPC, Thrift, and the database connection.
@@ -196,6 +218,7 @@ public class Main {
 				}
 			}
 		}
+		return !failed;
 	}
 
 	/**
