@@ -12,6 +12,7 @@ import java.time.Duration;
  * <li>{@code exit-after-signal}: after 3 s, during which the test sends SIGTERM, the start calls
  * {@code System.exit(9)}.</li>
  * <li>{@code exit-elsewhere}: another thread calls {@code System.exit(7)}, and the start waits for that thread.</li>
+ * <li>{@code exit-elsewhere-after-signal}: the same, after 3 s during which the test sends SIGTERM.</li>
  * </ul>
  */
 public final class StartExitMain {
@@ -32,6 +33,11 @@ public final class StartExitMain {
 						System.exit(9);
 					}
 					case "exit-elsewhere" -> {
+						var exiting = Thread.ofPlatform().name("test-exit").start(() -> System.exit(7));
+						exiting.join();
+					}
+					case "exit-elsewhere-after-signal" -> {
+						Thread.sleep(3000);
 						var exiting = Thread.ofPlatform().name("test-exit").start(() -> System.exit(7));
 						exiting.join();
 					}

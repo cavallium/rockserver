@@ -72,6 +72,23 @@ class StartExitProcessTest {
 		assertTrue(output.contains("Node a does not start: a System.exit on another thread started the shutdown"), output);
 	}
 
+	/**
+	 * R66-5: a signal started the shutdown, then another thread calls {@code System.exit} and the start waits for that
+	 * thread. The exit waits behind the signal's shutdown for good, so the start cannot end: the hook's wait for a start
+	 * after a signal, which has no limit otherwise, gets the limit of an exit on another thread.
+	 */
+	@Test
+	void anExitOnAnotherThreadAfterASignalThatTheStartWaitsForEndsWithOne() throws Exception {
+		var ports = ProcessCluster.freePorts(2, List.of());
+		var process = start("exit-elsewhere-after-signal", ports);
+		awaitStarting(process);
+		process.destroy();
+		var output = awaitExit(process);
+		assertEquals(1, process.exitValue(), output);
+		assertTrue(output.contains("Node a does not start: a System.exit on another thread waits behind the shutdown"
+				+ " that a signal started"), output);
+	}
+
 	private Process start(String mode, List<Integer> ports) throws Exception {
 		var command = PortInUseProcessTest.command(tempDir, StartExitMain.class, ports.get(0), ports.get(1),
 				List.of("-Drockserver.test.startExit=" + mode));
