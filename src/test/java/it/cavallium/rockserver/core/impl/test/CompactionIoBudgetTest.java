@@ -509,6 +509,18 @@ class CompactionIoBudgetTest {
         t.window(10, 200, 950_000);
         assertEquals(950_000, t.policy.budget(), "a saturated window with slow point reads must not grow");
     }
+    @Test void growthTowardsTheHarmfulRateDoesNotStallOnRounding() {
+        // 90% of 1,000,003 is not a whole number of bytes: the budget stopped one byte under it and never took the
+        // +5% steps, which start at 90%.
+        var t = new Trace();
+        t.window(10, 100, 1_000_003); t.window(10, 100, 750_002); t.window(10, 100, 750_002);
+        t.window(10, 200, 1_000_003); t.window(10, 200, 1_000_003);
+        t.window(10, 100, 700_002); t.window(10, 100, 700_002); t.window(10, 100, 700_002);
+        assertEquals(700_002, t.policy.budget());
+        assertEquals(1_000_003, t.policy.harmCeilingBytesPerSecond());
+        for (int i = 0; i < 14; i++) t.window(10, 100, t.policy.budget());
+        assertTrue(t.policy.budget() >= 1_000_003, "budget " + t.policy.budget());
+    }
     @Test void aDoublingFollowedBySlowPointReadsIsTakenBack() {
         var t = new Trace(); t.window(10, 100, SEED); t.window(10, 100, SEED); t.window(10, 100, SEED);
         assertEquals(SEED, t.policy.budget());

@@ -1012,12 +1012,12 @@ public final class CompactionIoBudget {
     private long grown(double achieved) {
         if (hold > 0) return budget;
         if (ceiling > 0) {
-            double step;
-            if (budget < ceiling * CEILING_APPROACH) step = Math.min(ceiling * .1, ceiling * CEILING_APPROACH - budget);
-            else if (++ceilingWindows >= CEILING_STEP_WINDOWS) step = ceiling * .05;
+            long approach = (long) (ceiling * CEILING_APPROACH), next;
+            if (budget < approach) next = (long) Math.min(approach, budget + ceiling * .1);
+            else if (++ceilingWindows >= CEILING_STEP_WINDOWS) next = (long) Math.ceil(budget + ceiling * .05);
             else return budget;
             ceilingWindows = 0;
-            return bound(Math.max(budget, Math.min(budget + step, achieved * 1.25)));
+            return bound(Math.max(budget, Math.min(next, achieved * 1.25)));
         }
         long next = bound(Math.max(budget, achieved * 2));
         if (next > budget) beforeGrowth = budget;
