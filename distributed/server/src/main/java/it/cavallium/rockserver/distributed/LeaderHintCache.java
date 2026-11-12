@@ -1,6 +1,8 @@
 package it.cavallium.rockserver.distributed;
 
+import it.cavallium.rockserver.core.common.Utils;
 import it.cavallium.rockserver.core.common.Utils.HostAndPort;
+import java.util.List;
 import java.util.function.Function;
 import java.util.function.LongSupplier;
 import org.apache.ratis.protocol.RaftPeerId;
@@ -17,7 +19,7 @@ final class LeaderHintCache {
 	private volatile @Nullable Cached cached;
 
 	/**
-	 * The API address of {@code leader} as {@code host:port}, or null if unknown. The version is read before the
+	 * The API address of {@code leader} as {@code host:port} (an IPv6 host in brackets, {@code [::1]:5333}), or null if unknown. The version is read before the
 	 * lookup, so that an address that changes during the lookup is looked up again at the next call (R18-2).
 	 */
 	@Nullable String hint(RaftPeerId leader, LongSupplier addressVersion,
@@ -28,7 +30,7 @@ final class LeaderHintCache {
 			return current.address();
 		}
 		var api = apiAddress.apply(leader.toString());
-		var address = api == null ? null : api.host() + ":" + api.port();
+		var address = api == null ? null : Utils.formatHostAndPorts(List.of(api));
 		cached = new Cached(leader, version, address);
 		return address;
 	}
