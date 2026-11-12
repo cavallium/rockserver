@@ -17,6 +17,14 @@ public final class CompactionIoBudget {
     static final double HARM_DECREASE = .7;
     /** Consecutive harmful windows (5 s each) before a decrease: one slow window is noise, two are 10 s of slow reads. */
     static final int HARM_WINDOWS = 2;
+    /** Windows after a decrease in which the budget does not grow: the settle window and two measured ones. */
+    static final int HOLD_WINDOWS = 3;
+    /** Below this share of the rate at which harm was measured, growth is +10% of that rate per saturated window. */
+    static final double CEILING_APPROACH = .9;
+    /** From there on: +5% of that rate every 6th saturated healthy window (30 s), so that harm recurs rarely. */
+    static final int CEILING_STEP_WINDOWS = 6;
+    /** Windows with background I/O and no harm (10 minutes) after which the harmful rate is forgotten. */
+    static final int CEILING_MEMORY_WINDOWS = 120;
     /** Windows after a decrease that did not help, or that the floor did not allow, before the next one. */
     static final int COOLDOWN_WINDOWS = 12;
     public record Sample(long nanos, long readCount, long readMicros, long bytes,
@@ -219,12 +227,19 @@ public final class CompactionIoBudget {
     private double recentAchieved, lastAchieved;
     private long preThrottle, probeBudget;
     private double probeLatency, probeAchieved, probeForegroundRate, probePointCallRate;
-    private int settle, cooldown, healthyRecovery, probeBenefits, cautiousGrowth;
+    private int settle, cooldown, healthyRecovery, probeBenefits;
     private long beforeGrowth;
     /** Consecutive completed TRACKING windows with background I/O and a mean read latency over 1.2x its baseline. */
     private int harmWindows;
     /** Windows until measured harm may lower the budget again (set when a decrease did not help or was at the floor). */
     private int harmCooldown;
+    private int hold, ceilingWindows, harmFreeWindows;
+    /**
+     * The background rate at which foreground harm was last measured (0: none known). While it is known, growth is
+     * gentle (see {@link #grown}); it is forgotten after {@link #CEILING_MEMORY_WINDOWS} harm-free windows and when
+     * urgent pressure opens the budget.
+     */
+    private volatile double ceiling;
     /** Whether the reduction under test answers measured harm (else it is a trial from a healthy state). */
     private boolean probeForHarm;
     private double firstProbeBenefitLatency;
@@ -282,6 +297,8 @@ public final class CompactionIoBudget {
     public double pointReadMicros() { double mean = lastPointMean; return mean > 0 ? mean : Double.NaN; }
     public long shutdownBudget() { return shutdownBudget; }
     public State state() { return state; }
+    /** The background rate at which foreground harm was last measured, or 0 when none is remembered. */
+    public double harmCeilingBytesPerSecond() { return ceiling; }
     private static long bound(double value) {
         return (long) Math.max(MIN_BYTES_PER_SECOND, Math.min(MAX_BYTES_PER_SECOND, value));
     }
@@ -311,7 +328,8 @@ public final class CompactionIoBudget {
             state = State.RECOVERY;
             healthyRecovery = 0;
             beforeGrowth = 0;
-            harmWindows = harmCooldown = 0;
+            harmWindows = harmCooldown = hold = 0;
+            ceiling = 0; // Urgent pressure wins: what harm taught is learned again after it.
             queueReferenceWindows = 0; probeQueueProtected = false;
             double usefulService = Math.max(preThrottle, Math.max(recentAchieved, probeBudget));
             if (usefulService > 0 && tracking) usefulService = Math.max(usefulService, budget);
@@ -393,7 +411,6 @@ public final class CompactionIoBudget {
         boolean unhealthyMean = pointReliable && baseline > 0 && latency > baseline * 1.2
                 || bulkComparable && bulkBaseline > 0 && bulkLatency > bulkBaseline * 1.2;
         if (unhealthyMean || noForegroundProgress || bulkNoProgress) reduceReadahead(0);
-        if (unhealthyMean && active) cautiousGrowth = 12;
         boolean ownPointReliable = !pointTailActive || pointReliable && pointTailInWindow > 0;
         boolean ownBulkReliable = bulkIdle && !bulkTailActive
                 || bulkComparable && nativeBulks >= 32 && nativeBulkShapeInWindow > 0 && bulkTailInWindow > 0;
@@ -492,6 +509,7 @@ public final class CompactionIoBudget {
         foregroundHealthy = active && (pointReliable || bulkComparable) && pointHealthy
                 && readaheadGrowthAllowed;
         clearWindow();
+        if (hold > 0) hold--;
         readWindowTracking &= foregroundHealthy;
         evaluateReadService(sample);
         if (state == State.RECOVERY) {
@@ -541,6 +559,8 @@ public final class CompactionIoBudget {
         // that I/O used the whole budget does not matter: it is the rate in use that was too high.
         boolean harm = active && unhealthyMean;
         harmWindows = harm ? harmWindows + 1 : 0;
+        if (harmWindows >= HARM_WINDOWS) harmFreeWindows = 0;
+        else if (active && ceiling > 0 && ++harmFreeWindows >= CEILING_MEMORY_WINDOWS) ceiling = 0;
         if (!active) {
             if (Double.isFinite(latency) && latency > 0) {
                 baseline = baseline == 0 ? latency : baseline * .8 + latency * .2;
@@ -579,9 +599,11 @@ public final class CompactionIoBudget {
         beforeGrowth = 0;
         boolean reductionAllowed = !rateProbeBlocked() && (bulkIdle || bulkComparable);
         if (harm && undo > 0 && undo < budget) {
-            // The window after a growth step had slow reads: take the step back at once (it is the likely cause, and
-            // the budget before it was healthy).
+            // The window after a doubling had slow reads: take the step back at once (it is the likely cause, and
+            // the budget before it was healthy). If the step did raise the background rate, that rate harms.
+            if (achieved > undo) rememberHarm(achieved);
             budget = undo;
+            hold = HOLD_WINDOWS;
         } else {
             // Slow reads in HARM_WINDOWS consecutive windows: HARM_DECREASE of the achieved rate, kept or undone by
             // the next windows. Healthy reads: a trial from a window that saturated the limiter, when one is due.
@@ -964,17 +986,35 @@ public final class CompactionIoBudget {
             }
         } else reliableGrowthWindows = 0;
     }
-    /** Called only for a window that saturated the limiter (achieved >= 80% of budget) with a healthy foreground. */
+    /**
+     * Called only for a window that saturated the limiter (achieved >= 80% of budget) with a healthy foreground.
+     * Two phases, as slow start and congestion avoidance:
+     * <ul>
+     * <li>no harmful rate is known: capacity is unknown and the limiter is the bottleneck, so the budget becomes
+     * twice the achieved rate (40 KiB/s reaches 200 MB/s in 13 windows, not 90);</li>
+     * <li>harm was measured at {@link #ceiling}: +10% of it per window up to 90% of it, then +5% of it every 6th
+     * window, never over 1.25x the achieved rate. The rate that harmed is approached quickly, reached again
+     * slowly (the device or the workload may have changed since), and passed just as slowly.</li>
+     * </ul>
+     * Nothing grows in the {@link #HOLD_WINDOWS} windows after a decrease.
+     */
     private long grown(double achieved) {
-        // Measured foreground harm in the last 12 growth windows: +10% steps. Otherwise capacity is unknown and
-        // the limiter is the bottleneck, so search multiplicatively (40 KiB/s reaches 200 MB/s in 13 windows, not 90).
-        if (cautiousGrowth > 0) {
-            cautiousGrowth--;
-            return bound(Math.max(budget, Math.min(budget * 1.1, recentAchieved * 1.25)));
+        if (hold > 0) return budget;
+        if (ceiling > 0) {
+            double step;
+            if (budget < ceiling * CEILING_APPROACH) step = Math.min(ceiling * .1, ceiling * CEILING_APPROACH - budget);
+            else if (++ceilingWindows >= CEILING_STEP_WINDOWS) step = ceiling * .05;
+            else return budget;
+            ceilingWindows = 0;
+            return bound(Math.max(budget, Math.min(budget + step, achieved * 1.25)));
         }
         long next = bound(Math.max(budget, achieved * 2));
         if (next > budget) beforeGrowth = budget;
         return next;
+    }
+    private void rememberHarm(double rate) {
+        ceiling = rate;
+        harmFreeWindows = ceilingWindows = 0;
     }
     private long publishBudget() {
         // A byte-rate probe may block growth, but never a latency-safety reduction.
@@ -1001,7 +1041,8 @@ public final class CompactionIoBudget {
     private boolean limiterBound() { return lastAchieved >= budget * .8; }
     private void finishProbe(boolean improved, double latency) {
         if (improved) {
-            cautiousGrowth = 12;
+            // The lower rate made reads faster: the rate before it is one at which background I/O harms them.
+            rememberHarm(probeAchieved);
             harmCooldown = 0; // If reads are still slow, the next decrease follows without waiting.
             // After measured harm the reference only falls: reads that got 10% faster may still be slow.
             if (Double.isFinite(latency) && latency > 0)
@@ -1058,6 +1099,7 @@ public final class CompactionIoBudget {
         }
         beforeGrowth = 0;
         probeForHarm = harm;
+        hold = HOLD_WINDOWS;
         probeQueueRemovals = 0;
         probeQueueProtected = queueReferenceWindows >= 2;
         queueReferenceWindows = 0;

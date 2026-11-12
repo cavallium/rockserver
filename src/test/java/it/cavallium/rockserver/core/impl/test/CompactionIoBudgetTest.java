@@ -433,11 +433,20 @@ class CompactionIoBudgetTest {
         t.window(10, 100, SEED);
         t.window(10, 80, 750_000); t.window(10, 80, 750_000); t.window(10, 80, 750_000);
         assertEquals(750_000, t.policy.budget(), "throttling measurably helped point reads: the reduction is kept");
+        assertEquals(SEED, t.policy.harmCeilingBytesPerSecond(), "and the rate before it is the one that harms");
+        // Towards the harmful rate: +10% of it per saturated healthy window up to 90% of it, then +5% every 6th.
         t.window(10, 80, 750_000);
-        assertTrue(t.policy.budget() > 750_000 && t.policy.budget() <= 825_000, "budget " + t.policy.budget());
-        long budget = t.policy.budget();
-        t.window(10, 200, budget);
-        assertEquals(budget, t.policy.budget(), "a saturated window with slow point reads must not grow");
+        assertEquals(850_000, t.policy.budget());
+        t.window(10, 80, 850_000);
+        assertEquals(900_000, t.policy.budget());
+        for (int i = 0; i < 5; i++) {
+            t.window(10, 80, 900_000);
+            assertEquals(900_000, t.policy.budget(), "window " + i);
+        }
+        t.window(10, 80, 900_000);
+        assertEquals(950_000, t.policy.budget());
+        t.window(10, 200, 950_000);
+        assertEquals(950_000, t.policy.budget(), "a saturated window with slow point reads must not grow");
     }
     @Test void aDoublingFollowedBySlowPointReadsIsTakenBack() {
         var t = new Trace(); t.window(10, 100, SEED); t.window(10, 100, SEED); t.window(10, 100, SEED);
@@ -446,8 +455,37 @@ class CompactionIoBudgetTest {
         assertEquals(2 * SEED, t.policy.budget());
         t.window(10, 200, 2 * SEED);
         assertEquals(SEED, t.policy.budget(), "point reads at twice the baseline right after the step");
+        assertEquals(2 * SEED, t.policy.harmCeilingBytesPerSecond());
+        for (int i = 0; i < 2; i++) {
+            t.window(10, 100, SEED);
+            assertEquals(SEED, t.policy.budget(), "no growth in the 3 windows after a decrease (the slow one was the first)");
+        }
         t.window(10, 100, SEED);
-        assertTrue(t.policy.budget() > SEED && t.policy.budget() <= SEED * 1.1, "budget " + t.policy.budget());
+        assertEquals(1_200_000, t.policy.budget(), "then +10% of the rate that harmed, not a doubling back to it");
+    }
+    @Test void aDoublingThatDidNotRaiseTheBackgroundRateTeachesNoCeiling() {
+        var t = new Trace(); t.window(10, 100, SEED); t.window(10, 100, SEED); t.window(10, 100, SEED);
+        t.window(10, 100, SEED);
+        assertEquals(2 * SEED, t.policy.budget());
+        t.window(10, 200, SEED); // background I/O did not use the step: the slow reads are not its doing
+        assertEquals(SEED, t.policy.budget(), "the unused step is taken back all the same");
+        assertEquals(0, t.policy.harmCeilingBytesPerSecond());
+    }
+    @Test void theHarmfulRateIsForgottenAfterTenHarmFreeMinutes() {
+        var t = new Trace();
+        t.window(10, 100, SEED); t.window(10, 100, 750_000); t.window(10, 100, 750_000);
+        t.window(10, 200, SEED); t.window(10, 200, SEED);
+        t.window(10, 100, 700_000); t.window(10, 100, 700_000); t.window(10, 100, 700_000);
+        assertEquals(700_000, t.policy.budget());
+        assertEquals(SEED, t.policy.harmCeilingBytesPerSecond());
+        for (int i = 0; i < 118; i++) {
+            // Background I/O under 80% of the budget, and one slow window now and then (noise, not harm).
+            t.window(10, i % 10 == 9 ? 200 : 100, 400_000);
+            assertEquals(SEED, t.policy.harmCeilingBytesPerSecond(), "window " + i);
+            assertEquals(700_000, t.policy.budget());
+        }
+        t.window(10, 100, 400_000); t.window(10, 100, 400_000);
+        assertEquals(0, t.policy.harmCeilingBytesPerSecond());
     }
     @Test void healthyGrowthNeedsDemandAndStaysBoundedDespiteJitter() {
         var t = new Trace(); t.window(10, 100, SEED); t.window(10, 100, SEED); t.window(10, 100, SEED);

@@ -52,6 +52,10 @@ final class CompactionIoController implements AutoCloseable {
                         .register(registry),
                 Gauge.builder("rockserver.compaction.io.state", budget, b -> b.state().ordinal())
                         .tag("db", name).register(registry),
+                Gauge.builder("rockserver.compaction.io.harm.ceiling", budget, CompactionIoBudget::harmCeilingBytesPerSecond)
+                        .tag("db", name).baseUnit("bytes/second")
+                        .description("Background rate at which slow foreground reads were last measured; 0 when none is remembered")
+                        .register(registry),
                 Gauge.builder("rockserver.compaction.io.readahead", appliedReadahead, AtomicLong::doubleValue)
                         .tag("db", name).baseUnit("bytes")
                         .description("Last successfully acknowledged readahead cap for compaction readers")
