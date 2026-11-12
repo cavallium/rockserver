@@ -733,7 +733,8 @@ final class LeaderHintRouter implements AutoCloseable {
 	/**
 	 * The one spelling of an address that listed and hinted addresses are compared in: no brackets, lower case, and an
 	 * IP literal as the JDK prints it, so that {@code ::1}, {@code [::1]} and {@code 0:0:0:0:0:0:0:1} are one host. Only
-	 * the text is read: a name is never looked up. IPv6 hosts are written in brackets before the port.
+	 * the text is read: a name is never looked up. IPv6 hosts are written in brackets before the port. An IPv4-mapped
+	 * IPv6 literal ({@code ::ffff:10.0.0.1}) is the IPv4 address it holds, as the JDK reads it, and is written as one.
 	 */
 	static String normalize(String host, int port) {
 		var lower = host.toLowerCase(Locale.ROOT);
@@ -746,8 +747,7 @@ final class LeaderHintRouter implements AutoCloseable {
 			} catch (RuntimeException notAnAddress) {
 				// kept as written
 			}
-			return "[" + lower + "]:" + port;
 		}
-		return lower + ":" + port;
+		return lower.indexOf(':') >= 0 ? "[" + lower + "]:" + port : lower + ":" + port;
 	}
 }

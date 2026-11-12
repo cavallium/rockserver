@@ -44,11 +44,13 @@ public final class JvmExit {
 
 	/**
 	 * Whether a thread is inside {@code System.exit} without being the one that runs the hooks: it called it after the
-	 * shutdown under way began, and waits behind it for good.
+	 * shutdown under way began, and waits behind it for good. The handler thread of a later signal waits there too
+	 * (a second SIGTERM, or the SIGHUP of a closing terminal next to its SIGTERM) and is not counted: it is a thread of
+	 * the JVM's own, which nothing waits for (review of R67).
 	 */
 	public static boolean exitWaiting() {
 		for (var stack : Thread.getAllStackTraces().values()) {
-			if (has(stack, SHUTDOWN, null) && !has(stack, SHUTDOWN, RUN_HOOKS)) {
+			if (has(stack, SHUTDOWN, null) && !has(stack, SHUTDOWN, RUN_HOOKS) && !has(stack, SIGNAL_HANDLER, null)) {
 				return true;
 			}
 		}

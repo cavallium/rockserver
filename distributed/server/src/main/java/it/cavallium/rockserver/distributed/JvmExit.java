@@ -24,7 +24,8 @@ final class JvmExit {
 
 		/**
 		 * Whether a thread is inside {@code System.exit} without being the one that runs the hooks: it called it after
-		 * the shutdown under way began, and waits behind it for good. Asked only after a signal (R66-5).
+		 * the shutdown under way began, and waits behind it for good. The handler of a later signal is not one. Asked
+		 * only after a signal (R66-5).
 		 */
 		default boolean exitWaiting() {
 			return false;
