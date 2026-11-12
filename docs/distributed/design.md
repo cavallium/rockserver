@@ -6228,6 +6228,52 @@ install it (`apt-get install gcc libc6-dev`) and run with `-Drockserver.test.req
        dump of all stack traces per 200 ms, only in a hook that waits for a start after a signal.
      - What is read are JDK implementation classes, seen on Temurin 27.0.1 and pinned by the process tests: a JDK where
        an exit is not recognised fails the two exit cases of `MainStartProcessTest` with the hang.
+   - R66-4 (low, docs; no code changed): in `ColdRestartTest.twoNodesServeAfterAColdRestartAndTheThirdConverges` the
+     node that was down for about 10 s applied nothing 3.5 s after its return in several runs, and was level with the
+     leader after about 7 s. Expected, from stock Ratis' appender back-off, and already shorter than with Ratis'
+     defaults. Measured with the real processes of the test (a scratch copy of the test printing, every 100 ms, the
+     returned node's applied and commit index from `admin status`, with `DEBUG` for `org.apache.ratis.server.leader`,
+     `.server.impl` and `.grpc` and timestamps in every node's log). 23 runs, 0 failures: the returned node had
+     applied everything the leader committed 2.4 s at the least, 4.8 s at the median and 9.7 s at the most after its
+     process was started, and in 16 of the 23 more than 3.5 s. (The two sets: 12 runs without the logging, 11 with;
+     the polling is one `admin` JVM per answer, about 0.8 s, so the times are rounded up by up to that.)
+     Where the time goes, from the 10 runs with the leader's log (seconds after the start of the node's process):
+     - Process start, RocksDB open and the log read: 1.1 to 1.6 s until `READY` (the first `INFO` lines: the database
+       open takes 0.35 s, 310 entries of log read in 0.03 s). Nothing there is slow, and nothing waits for the
+       election timeout: the node, a follower that heard no leader for its 544 to 661 ms election timeout, started a
+       pre-vote, which the leader rejected ("still has leadership"), and went back to follower. Harmless.
+     - The leader's appender for that follower is asleep from the failed tries of the downtime. Each failure adds to
+       `errorCount` (about 2 per sleep in the logs), and the sleep is a step of the policy
+       (`RaftSettings.APPENDER_RETRY_POLICY`, `1ms,10, 1s,20, 2s,...`) times Ratis' random factor of 0.5 to 1.5: 1 ms up
+       to a count of 10, 0.5 to 1.5 s up to 30, 1 to 3 s past it (Ratis' default has 5 s there: 2.5 to 7.5 s). In the 10
+       runs the leader's count was 12 to 28 when the node came back, so the first try that reached it came 1.4 to 2.6 s
+       after its start (the leader's `nextIndex` for it was 1120, the node's log 310 entries long).
+     - That try is a heartbeat, which the node answers `INCONSISTENCY` (its log is shorter). Ratis counts that answer
+       as an error (`errorCount` 29 to 31 in the log), so the appender sleeps again (0.5 to 1.5 s in the 10 runs), then sends a
+       heartbeat at the new `nextIndex`, which succeeds (the node's commit index jumps to what it knows, 308 in one
+       run) but carries no entries. The error count is not cleared by it either, so the appender sleeps a third time
+       before it sends the entries (0.5 to 2.5 s in the 10 runs: the answers took the count past 30, where the step is 2 s, in some): in the run printed (leader log, seconds after the start): 2.15
+       first try, `INCONSISTENCY`, sleep 1444 ms, heartbeat `OK` at 3.60, sleep 2520 ms, 813 entries sent at 6.14 and
+       applied within 20 ms.
+     - The ten runs, seconds after the node's start: `READY` 1.2 to 1.4; first answer 1.4 to 2.6; the first
+       successful heartbeat 1.6 to 4.4; the entries acknowledged 1.7 to 6.1 (two runs had no `INCONSISTENCY` and so no
+       second and third sleep: 1.7 and 2.2); the polling saw the node level 2.7 to 7.2. Sleeps after the first answer:
+       none (2 runs), one (1 run), two (5 runs) or three (2 runs).
+     So the catch-up of a returned node is the appender's sleeps (up to three, 0.5 to 3 s each), not the node: its own
+     apply of 813 entries takes 20 ms, no snapshot is installed ("installed a snapshot: false" in all 12 runs that
+     printed it, the log being kept), and the test's own polling adds up to 0.8 s. These sleeps are stock Ratis' and
+     no `sleep` or back-off of ours is in the way: below a count of 30 the policy equals Ratis' default, and past it
+     the sleeps are 2.5 times shorter than the default's (2.5 to 7.5 s, which is why the last step was lowered, see
+     "ApiGate"). The test's 30 s bound (`CONVERGENCE_TIMEOUT`) holds the worst case (three sleeps of 3 s plus the
+     start, 10.5 s) with room, so the test is unchanged.
+     Not done, a proposal: shorter steps of the policy (the 1 s step to 0.5 s and the last to 1 s, so sleeps of 0.25 to
+     0.75 s and 0.5 to 1.5 s) would cut the catch-up of a returned node to about 2 to 4 s, at the price of `ApiGate`'s minimum pause
+     (twice the longest sleep, now 6 s, would be 3 s: a node that is cut off for a moment would be taken out of service
+     sooner, so the gate's own tests need a re-run) and of twice as many failed tries against a node that is down
+     (the 0.15% of a core of this policy's last step, see "ApiGate", would roughly double, and the warnings, batched every 5 s,
+     do not grow). Not changed here: this is a replication timing setting. A change in Ratis, clearing the error
+     state on the first successful reply (a heartbeat too, or an `INCONSISTENCY` that moves `nextIndex`), might remove
+     the second and third sleep for every setting (not tried: the Ratis code that resets the count was not read); "Upstream" is the place to note it if it is filed.
    - Review of R46, 1 (low, docs): the R46-2 recipe ran `dependency:build-classpath` on `distributed/server/pom.xml`
      alone, so Maven resolved `rockserver-core:${revision}` and that version's pom from `~/.m2` (or the snapshot
      repository): `grep -v /rockserver-core/` dropped the jar but kept the third-party jars of that pom, from whichever

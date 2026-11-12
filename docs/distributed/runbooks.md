@@ -679,6 +679,11 @@ Upgrade one node at a time (a rolling restart): stop it (SIGTERM: a leader hands
 it, wait until `status` shows it with the others' commit index, then the next. Clients see a few hundred milliseconds
 without writes per leader restart.
 
+A node that was down for a while needs 2.5 to 10 s after its process started before it has applied what it missed
+(about 1.2 s of that is its start) (median 5 s in 23 runs of a test of three nodes): the leader's appender for it is sleeping between tries, up to
+three times for 0.5 to 3 s (design document, R66-4). `status` shows the node as `FOLLOWER` with its old indices meanwhile,
+and nothing is wrong: wait for the commit index, as above, before restarting the next node.
+
 Do not change the membership in the middle of an upgrade if you can avoid it. If you must, change one voter per call
 (`remove-peer` then `add-peer` for a lost node, as in "Replacing a node"), whatever the version of `admin`: until every
 node that can become leader runs round 14 or later, a leader of an older version does not refuse a change of several
