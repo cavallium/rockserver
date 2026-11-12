@@ -197,6 +197,7 @@ public final class ReplicatedNode implements AutoCloseable {
 			if (!existing) {
 				// Before anything opens the database: copies of a seed are the same only until then. It fsyncs the seed's
 				// files first, which an operator copied into place and nothing fsynced (R34-1).
+				NodeStore.requireSeedWalInside(config.dbDir(), config.rockserverConfig());
 				NodeStore.recordSeedDigest(config.dbDir());
 				// Durably, before the check's open changes the files: a start killed during that open keeps the seed digest
 				// at the next first start (R41-1).

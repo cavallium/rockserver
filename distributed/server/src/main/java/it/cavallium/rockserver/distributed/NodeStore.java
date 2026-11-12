@@ -95,8 +95,14 @@ import org.slf4j.LoggerFactory;
  * (such as the default {@code ./volume} and {@code ./wal}) are supported, directories elsewhere are not. The
  * database directory and everything under it must be on the same file system as its parent directory, because
  * {@link #restore} swaps it by renaming: mount the node's data directory, not the database directory or a volume
- * inside it. {@link #open} refuses a WAL directory outside the database directory and anything under it on another
- * file system; a live file outside it makes {@link #checkpoint} fail.</p>
+ * inside it. {@link #open} refuses anything under it on another file system; a live table file outside it makes
+ * {@link #checkpoint} fail.</p>
+ *
+ * <p>The WAL directory alone may be outside the database directory (an absolute {@code wal-path}, for a WAL on
+ * another disk). It is then the node's own, and nothing that leaves the node points into it: a checkpoint (a
+ * snapshot, a backup, an exported seed) carries its WAL files in {@link #DETACHED_WAL} inside it, and {@link #open}
+ * moves the WAL files of a database that was put in place (a restored checkpoint, a seed) into the WAL directory
+ * before RocksDB opens it, deleting the WAL files of the database that was there ({@link #adoptDetachedWal}).</p>
  *
  * <p>The database is opened with the node's Rockserver config plus {@link #REPLICA_OVERRIDES}, settings that every
  * replica needs whatever that config says, and the memtable sizing of {@link #withReplicaWriteBuffers}.</p>
@@ -159,8 +165,24 @@ final class NodeStore implements Closeable {
 			database.global.optimistic = true
 			""";
 
+	/**
+	 * The directory, inside a checkpoint or a database that was put in place, that holds the WAL files of a database
+	 * whose WAL directory is outside its database directory. {@link #open} empties it into the WAL directory.
+	 */
+	static final String DETACHED_WAL = "wal.detached";
+	/**
+	 * An empty file that {@link #restore} leaves in a database it put in place from a checkpoint without
+	 * {@link #DETACHED_WAL}: the WAL files of an outside WAL directory belong to the database that was replaced, and
+	 * {@link #open} deletes them.
+	 */
+	static final String WAL_RESET = "wal.reset";
+	private static final java.util.regex.Pattern WAL_FILE = java.util.regex.Pattern.compile("\\d+\\.log");
+
 	private final Path dbDir;
-	/** RocksDB WAL directory: {@code dbDir} itself or the configured {@code wal-path} (default {@code ./wal}). */
+	/**
+	 * RocksDB WAL directory: {@code dbDir} itself, or the configured {@code wal-path} (default {@code ./wal}), which
+	 * may be outside {@code dbDir}.
+	 */
 	private final Path walDir;
 	private final EmbeddedConnection connection;
 	private final long metaColumnId;
@@ -226,6 +248,7 @@ final class NodeStore implements Closeable {
 				noAutoCompactions ? NodeStore::withoutAutoCompactions : UnaryOperator.identity());
 		EmbeddedConnection connection;
 		try {
+			adoptDetachedWal(dbDir, walDirOf(ConfigFactory.parseFile(config.toFile()), dbDir));
 			connection = new EmbeddedConnection(dbDir, name, config);
 		} finally {
 			// The database parses its config once, when it opens.
@@ -301,7 +324,7 @@ final class NodeStore implements Closeable {
 			}
 			config = withReplicaWriteBuffers(config.resolve());
 			if (sourceDbDir != null) {
-				config = withRelativePaths(config, sourceDbDir);
+				config = withDetachedWal(withRelativePaths(config, sourceDbDir), dbDir);
 			}
 			config = adjust.apply(config);
 		} catch (ConfigException | IllegalArgumentException e) {
@@ -614,11 +637,140 @@ final class NodeStore implements Closeable {
 		} catch (GestaltException e) {
 			throw new IOException("Failed to read wal-path from the Rockserver config", e);
 		}
-		Path walDir = walPath == null ? dbDir : dbDir.resolve(walPath).normalize();
-		if (!walDir.startsWith(dbDir)) {
-			throw new IOException("wal-path must be inside the database directory " + dbDir + ": " + walDir);
+		return walPath == null ? dbDir : dbDir.resolve(walPath).normalize();
+	}
+
+	/** The WAL directory that {@code config} (a Rockserver config, defaults applied here) gives a database in {@code dbDir}. */
+	private static Path walDirOf(Config config, Path dbDir) throws IOException {
+		Config effective;
+		try {
+			effective = config.withFallback(defaultConfig()).resolve();
+		} catch (ConfigException e) {
+			throw new IOException("Failed to read the Rockserver config", e);
 		}
-		return walDir;
+		Path root = dbDir.toAbsolutePath().normalize();
+		String key = "database.global.wal-path";
+		return effective.hasPath(key) ? root.resolve(effective.getString(key)).normalize() : root;
+	}
+
+	/**
+	 * The WAL directory a node with this Rockserver config (null: the defaults) uses for its database in
+	 * {@code dbDir}.
+	 */
+	static Path configuredWalDir(@Nullable Path rockserverConfig, Path dbDir) throws IOException {
+		try {
+			var config = rockserverConfig == null ? ConfigFactory.empty()
+					: ConfigFactory.parseFile(rockserverConfig.toFile(), ConfigParseOptions.defaults().setAllowMissing(false));
+			return walDirOf(config, dbDir);
+		} catch (ConfigException e) {
+			throw new IOException("Failed to read the Rockserver config " + rockserverConfig, e);
+		}
+	}
+
+	/**
+	 * For a copy of a database, or one built aside to be renamed into place: a {@code wal-path} outside {@code dbDir}
+	 * (the WAL directory of the node, which the copy must neither read nor write) becomes {@link #DETACHED_WAL} inside
+	 * it, where a checkpoint of such a node keeps its WAL files and where the node's open looks for them.
+	 */
+	static Config withDetachedWal(Config config, Path dbDir) throws IOException {
+		Path root = dbDir.toAbsolutePath().normalize();
+		if (walDirOf(config, root).startsWith(root)) {
+			return config;
+		}
+		return config.withValue("database.global.wal-path", ConfigValueFactory.fromAnyRef("./" + DETACHED_WAL));
+	}
+
+	/**
+	 * Before RocksDB opens the database in {@code dbDir} with the WAL directory {@code walDir}: moves the WAL files of
+	 * a database that was put in place ({@link #DETACHED_WAL}: a restored checkpoint, a seed) into {@code walDir}, after
+	 * deleting the WAL files there, which are those of the database that was replaced; {@link #WAL_RESET} alone deletes
+	 * them when {@code walDir} is outside {@code dbDir}. The files are copied and fsynced before the directory inside
+	 * the database is deleted, so a crash at any point repeats the step at the next open. With {@code walDir} outside
+	 * {@code dbDir} it then refuses two layouts that would lose or invent writes: WAL files in {@code walDir} with no
+	 * database in {@code dbDir} (left by a database that was deleted), and WAL files under {@code dbDir} (a checkpoint
+	 * of a node whose WAL directory is inside its database, which RocksDB would not read here).
+	 */
+	static void adoptDetachedWal(Path dbDir, Path walDir) throws IOException {
+		Path detached = dbDir.resolve(DETACHED_WAL);
+		Path reset = dbDir.resolve(WAL_RESET);
+		boolean outside = !walDir.startsWith(dbDir);
+		boolean copy = walDir.equals(detached);
+		if (!copy && (Files.isDirectory(detached) || Files.exists(reset))) {
+			boolean hasDetached = Files.isDirectory(detached);
+			if (hasDetached || outside) {
+				Files.createDirectories(walDir);
+				for (Path stale : walFiles(walDir)) {
+					Files.delete(stale);
+				}
+			}
+			if (hasDetached) {
+				for (Path source : walFiles(detached)) {
+					Path target = walDir.resolve(source.getFileName().toString());
+					Files.copy(source, target);
+					syncFile(target);
+				}
+			}
+			if (hasDetached || outside) {
+				syncDirectory(walDir);
+			}
+			deleteRecursively(detached);
+			Files.deleteIfExists(reset);
+			syncDirectory(dbDir);
+		}
+		if (outside || copy) {
+			if (outside && !Files.isRegularFile(dbDir.resolve("CURRENT")) && !walFiles(walDir).isEmpty()) {
+				throw new IOException("The WAL directory " + walDir + " holds WAL files, but there is no database in " + dbDir
+						+ ": they belong to a database that was deleted. Delete the *.log files in " + walDir
+						+ " and start again");
+			}
+			if (Files.isDirectory(dbDir)) {
+				try (Stream<Path> walk = Files.walk(dbDir)) {
+					var stray = walk.filter(file -> WAL_FILE.matcher(file.getFileName().toString()).matches())
+							.filter(file -> !file.startsWith(detached))
+							.findFirst();
+					if (stray.isPresent()) {
+						throw new IOException("The database in " + dbDir + " holds the WAL file " + stray.get() + ", but its"
+								+ " WAL directory is " + walDir + ": RocksDB would not read it. It comes from a node whose"
+								+ " wal-path is inside its database directory: every node must run the same Rockserver"
+								+ " config. Move the WAL files into " + detached + " if they belong to this database");
+					}
+				} catch (java.io.UncheckedIOException e) {
+					throw e.getCause();
+				}
+			}
+		}
+	}
+
+	/** The WAL files ({@code <number>.log}) directly in {@code dir}; none if it does not exist. */
+	private static List<Path> walFiles(Path dir) throws IOException {
+		if (!Files.isDirectory(dir)) {
+			return List.of();
+		}
+		try (Stream<Path> list = Files.list(dir)) {
+			return list.filter(file -> WAL_FILE.matcher(file.getFileName().toString()).matches())
+					.filter(Files::isRegularFile)
+					.sorted()
+					.toList();
+		}
+	}
+
+	/**
+	 * At a first start, before the seed digest is recorded: refuses a seed in {@code dbDir} without
+	 * {@link #DETACHED_WAL} while the WAL directory outside it holds WAL files, which nothing ties to the seed (those of
+	 * an earlier database, or the seed's own, copied where the digest does not see them). Not once a digest is
+	 * recorded: an earlier first start may have moved the seed's WAL files there already.
+	 */
+	static void requireSeedWalInside(Path dbDir, @Nullable Path rockserverConfig) throws IOException {
+		Path root = dbDir.toAbsolutePath().normalize();
+		Path walDir = configuredWalDir(rockserverConfig, root);
+		if (walDir.startsWith(root) || !Files.isRegularFile(root.resolve("CURRENT")) || readSeedDigest(root) != null
+				|| Files.isDirectory(root.resolve(DETACHED_WAL)) || walFiles(walDir).isEmpty()) {
+			return;
+		}
+		throw new IOException("The WAL directory " + walDir + " holds WAL files, and the seed in " + root + " has no "
+				+ DETACHED_WAL + " directory: put the seed's WAL files in " + root.resolve(DETACHED_WAL)
+				+ " on every node (the node moves them), or delete the *.log files in " + walDir
+				+ " if the seed was closed with nothing left in its WAL");
 	}
 
 	/** Fails unless {@code dbDir} and every directory under it are on the file system of its parent. */
@@ -935,9 +1087,9 @@ final class NodeStore implements Closeable {
 	 * hard-links the same inodes, which {@link #syncTree(Path)} skips. Runs at every first start (no Raft group
 	 * directory yet, see {@link #recordSeedDigest}), so once per node unless a first start fails: one fsync per file of
 	 * the seed, which forces out what writeback has not flushed yet and is cheap for what it has. A node that starts
-	 * has every column volume and its WAL directory under {@code dbDir}: one configured outside makes the open that
-	 * follows refuse the start ({@link #checkVolumesInside}, {@code walDir}), so nothing of a seed in use is left out
-	 * (R50-2).
+	 * has every column volume under {@code dbDir} (one configured outside makes the open that follows refuse the start,
+	 * {@link #checkVolumesInside}), and a seed's WAL files under it too, in its WAL directory or in
+	 * {@link #DETACHED_WAL} ({@link #requireSeedWalInside}), so nothing of a seed in use is left out (R50-2).
 	 */
 	static void syncSeed(Path dbDir) throws IOException {
 		Path absolute = dbDir.toAbsolutePath().normalize();
@@ -1303,7 +1455,7 @@ final class NodeStore implements Closeable {
 	 * that copies made elsewhere would differ by them (R26-1).
 	 */
 	private static boolean isSkippedByDigest(String name) {
-		return name.equals("LOCK") || name.startsWith("LOG") || name.endsWith("_LOG") || name.contains("_LOG.old.");
+		return name.equals("LOCK") || name.equals(WAL_RESET) || name.startsWith("LOG") || name.endsWith("_LOG") || name.contains("_LOG.old.");
 	}
 
 	private static void update(MessageDigest digest, String value) {
@@ -1859,7 +2011,10 @@ final class NodeStore implements Closeable {
 			throw new IOException("RocksDB listed no MANIFEST among the live files of " + dbDir);
 		}
 		Files.writeString(target.resolve("CURRENT"), manifest + "\n", StandardCharsets.UTF_8);
-		Path walTarget = target.resolve(dbDir.relativize(walDir));
+		// A WAL directory outside the database: its files travel in DETACHED_WAL, made even when there is none, so that
+		// the open of the restored checkpoint deletes the WAL files of the database it replaces (adoptDetachedWal).
+		Path walTarget = walDir.startsWith(dbDir) ? target.resolve(dbDir.relativize(walDir))
+				: target.resolve(DETACHED_WAL);
 		Files.createDirectories(walTarget);
 		for (LogFile wal : wals) {
 			if (wal.type() == WalFileType.kAliveLogFile && wal.logNumber() >= minWalNumber) {
@@ -1994,6 +2149,11 @@ final class NodeStore implements Closeable {
 		if (!linked) {
 			LOG.warn("Restoring {} copies the table files of {}: hard links between them are not possible", dbDir,
 					checkpointDir);
+		}
+		if (!Files.isDirectory(dirs.building.resolve(DETACHED_WAL))) {
+			// For a node whose WAL directory is outside its database: the WAL files there are not this checkpoint's.
+			Files.deleteIfExists(dirs.building.resolve(WAL_RESET));
+			Files.createFile(dirs.building.resolve(WAL_RESET));
 		}
 		syncTree(dirs.building, !sourceDurable);
 		Files.move(dirs.building, dirs.ready);

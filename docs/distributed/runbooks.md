@@ -125,8 +125,12 @@ the check of step 3 finds.
    n1:/srv/rockserver/data/db/`). The data directories must hold nothing else: no `raft/`. Then run `sync` on every
    node (or `sync -f <data-dir>/db`): `rsync`, `cp` and `scp` do not fsync, and a power loss before writeback can
    leave copied table files empty or with holes. The first start fsyncs `db/` too, before it records the digest
-   (R34-1), with every column volume and the WAL (a node refuses to start with either outside `db/`), but not before
+   (R34-1), with every column volume (a node refuses to start with one outside `db/`), but not before
    the start.
+   If the nodes' `wal-path` is outside `db/`, the seed's WAL files do not go there: put them in `db/wal.detached/`
+   on every node (create it; the node moves them into its WAL directory at the first start, and the seed digest covers
+   them), and leave the WAL directory itself without `*.log` files. A first start refuses a seed without
+   `wal.detached/` while the WAL directory holds WAL files.
 3. Check that the copies are equal, for example `find db -type f -exec sha256sum {} + | sort -k2 | sha256sum` on
    each node, the same result everywhere. Do not skip it: the digest of the first start compares table files by size
    only.

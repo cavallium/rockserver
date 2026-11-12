@@ -526,10 +526,13 @@ below come from the code and the logs, without a new run.
   without power-loss protection take 1–3 ms per fdatasync when idle and 10–30 ms when RocksDB compaction writes
   heavily to the same disk. Prefer SSDs with power-loss protection. Do not split the data directory over
   several disks: a node refuses to start (exit 1) if anything under `data/db`, a column volume included, is on
-  another file system, if a column volume or the RocksDB `wal-path` is outside `data/db` (a volume there would make
+  another file system, if a column volume is outside `data/db` (a volume there would make
   every snapshot fail), or if `data/raft` is on another file system than the data directory (every snapshot would
-  copy the whole database instead of hard-linking it, while the apply waits). Keep `data/raft`, `data/db`, every
-  column volume and the RocksDB WAL on one file system (see "Disk layout" in the design document).
+  copy the whole database instead of hard-linking it, while the apply waits). Keep `data/raft`, `data/db` and every
+  column volume on one file system. Only the RocksDB WAL may be elsewhere: a node whose `wal-path` is outside
+  `data/db` starts, and keeps that directory to itself (see "Disk layout" in the design document). A replica applies
+  entries without the RocksDB WAL (`atomic-flush`), so moving it gains little: the Raft log is what every write
+  fsyncs.
 - **Power loss.** After any failure reading the Raft log at startup (the failed start prints the command), stop the
   node, run `ReplicatedServerMain repair-log --data-dir DIR --dry-run` (with the node's `--group-id` if it has one)
   and follow its verdict, not the error message: a torn

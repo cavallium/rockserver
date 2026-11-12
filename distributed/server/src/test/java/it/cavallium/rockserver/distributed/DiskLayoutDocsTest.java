@@ -10,7 +10,7 @@ import org.junit.jupiter.api.Test;
 
 /**
  * R50-2: the operator documents describe the disk layouts a node refuses at start (design.md "Disk layout":
- * {@code NodeStore.checkVolumesInside}, {@code walDir}, {@code ReplicatedNode.requireSameFileSystem}) as refused,
+ * {@code NodeStore.checkVolumesInside}, {@code ReplicatedNode.requireSameFileSystem}) as refused,
  * not as degraded but accepted.
  */
 class DiskLayoutDocsTest {
@@ -25,7 +25,9 @@ class DiskLayoutDocsTest {
 		assertFalse(disks.contains("with\n  `data/raft` on another disk every snapshot copies"), disks);
 		assertTrue(disks.contains("refuses to start"), disks);
 		assertTrue(disks.contains("`data/raft` is on another file system"), disks);
-		assertTrue(disks.contains("`wal-path` is outside `data/db`"), disks);
+		assertTrue(disks.contains("if a column volume is outside `data/db`"), disks);
+		// The WAL directory alone may be outside (NodeStore.adoptDetachedWal).
+		assertTrue(disks.contains("a node whose `wal-path` is outside\n  `data/db` starts"), disks);
 	}
 
 	@Test

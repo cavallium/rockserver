@@ -54,7 +54,7 @@ a difference, and some settings, such as cache sizes on machines of other sizes,
 
 **Disk layout.** A node's data directory holds `db/` (the database) and `raft/` (the Raft log and snapshots).
 Keep all of it on one file system and mount the data directory itself, not `db/`, `raft/` or a column volume.
-A node refuses to start if the RocksDB `wal-path` is outside `db/`, if anything under `db/` (column volumes
+A node refuses to start if anything under `db/` (column volumes
 included, also through symbolic links) is on another file system, if a column volume (`volumes[].volume-path`, RocksDB's
 `cf_paths`, of `fallback-column-options` or of any `column-options` entry) resolves outside `db/`, which would make every
 snapshot fail (checked before the database opens, so the directory is not created), or if `raft/` or anything under it
@@ -64,6 +64,23 @@ The check under `db/` runs again on every open, after the database opened (a col
 open), and after a restore. RocksDB deletes files there from its own threads meanwhile (the inputs of a compaction,
 obsolete WALs), so an entry that is gone before the check reads it is skipped, a file or a directory alike (core
 deletes only files of an open database, but nothing depends on that).
+
+The RocksDB WAL directory alone may be outside `db/` (an absolute `wal-path`, on any file system). It is then the
+node's own: nothing that leaves the node points into it. A checkpoint (a snapshot, a backup, an exported seed) of such
+a node carries its WAL files in `wal.detached/` inside it, a directory that exists even when it holds none, and a
+restore of a checkpoint without that directory leaves an empty file `wal.reset` in the restored database. Before
+RocksDB opens a database, the node moves the files of `db/wal.detached/` into its WAL directory, after deleting the
+`*.log` files there, which belong to the database that was replaced (with `wal.reset` alone it only deletes them); the
+files are copied and fsynced before `wal.detached/` is deleted, so a crash repeats the step at the next open
+(`NodeStore.adoptDetachedWal`). A copy of a database that is opened aside (`export-seed`, `restore-backup`) uses
+`wal.detached/` as its WAL directory, never the node's. With the WAL outside, a node refuses to start in three cases:
+WAL files in the WAL directory and no database in `db/` (left by a database that was deleted: delete them); WAL files
+under `db/` outside `wal.detached/` (a checkpoint of a node whose WAL is inside its database, which RocksDB would not
+read: every node must run the same config); and, at a first start with a seed, WAL files in the WAL directory while
+the seed has no `wal.detached/` (nothing ties them to the seed, and the seed digest does not cover them). Tests:
+`NodeStoreTest.aCheckpointOfANodeWithAnOutsideWalRestoresOnAnotherSuchNode`,
+`...RestoresOnANodeWithItsWalInside`, `anOutsideWalDirectoryWithWalFilesAndNoDatabaseIsRefused`. Not tested: a snapshot
+install between running nodes with the WAL outside, and a crash in the middle of the move.
 
 **What this module needs from core.** Single-node behavior and the wire contract are unchanged, apart from the
 separate removal of CDC from Rockserver. The core additions are used only by replicas or by a server that

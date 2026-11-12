@@ -1918,6 +1918,85 @@ class NodeStoreTest {
 		return dir.getFileSystem().supportedFileAttributeViews().contains("posix");
 	}
 
+	/**
+	 * A WAL directory outside the database directory (an absolute {@code wal-path}): a checkpoint carries its WAL files
+	 * in {@link NodeStore#DETACHED_WAL}, and the open of the database restored from it on another such node deletes the
+	 * WAL files of the database that was there and moves the checkpoint's in.
+	 */
+	@Test
+	void aCheckpointOfANodeWithAnOutsideWalRestoresOnAnotherSuchNode() throws IOException {
+		Path walA = tempDir.resolve("wal-a").toAbsolutePath().normalize();
+		Path walB = tempDir.resolve("wal-b").toAbsolutePath().normalize();
+		Path configA = Files.writeString(tempDir.resolve("a.conf"), "database.global.wal-path = \"%s\"\n".formatted(walA));
+		Path configB = Files.writeString(tempDir.resolve("b.conf"), "database.global.wal-path = \"%s\"\n".formatted(walB));
+		Path checkpoint = tempDir.resolve("checkpoint");
+		Path dbA = tempDir.resolve("a").resolve("db");
+		Expected expected;
+		try (var store = NodeStore.open(dbA, configA, "a")) {
+			assertTrue(store.directories().contains(walA), store.directories().toString());
+			long column = store.db().createColumn(DATA_COLUMN, DATA_SCHEMA);
+			for (int i = 0; i < 10; i++) {
+				put(store, column, i, "v" + i);
+			}
+			setApplied(store, TermIndex.valueOf(1, 10));
+			store.checkpoint(checkpoint);
+			expected = Expected.of(store, column);
+		}
+		assertTrue(Files.isDirectory(checkpoint.resolve(NodeStore.DETACHED_WAL)), "no detached WAL in the checkpoint");
+		assertFalse(Files.exists(dbA.resolve(NodeStore.DETACHED_WAL)));
+
+		Path dbB = tempDir.resolve("b").resolve("db");
+		try (var store = NodeStore.open(dbB, configB, "b")) {
+			long column = store.db().createColumn(DATA_COLUMN, DATA_SCHEMA);
+			put(store, column, 99, "old");
+		}
+		Files.writeString(walB.resolve("999999.log"), "a WAL file of the database that is replaced");
+		NodeStore.restore(checkpoint, dbB);
+		try (var store = NodeStore.open(dbB, configB, "b")) {
+			assertEquals(expected, Expected.of(store, store.db().getColumnId(DATA_COLUMN)));
+			assertFalse(Files.exists(walB.resolve("999999.log")), "the old database's WAL file stayed");
+			assertFalse(Files.exists(dbB.resolve(NodeStore.DETACHED_WAL)));
+			assertFalse(Files.exists(dbB.resolve(NodeStore.WAL_RESET)));
+		}
+		// Again: nothing is left to move, and the WAL files in the outside directory are the database's own.
+		try (var store = NodeStore.open(dbB, configB, "b")) {
+			assertEquals(expected, Expected.of(store, store.db().getColumnId(DATA_COLUMN)));
+		}
+	}
+
+	/** A checkpoint of a node with an outside WAL restores on a node whose WAL is inside its database, and back. */
+	@Test
+	void aCheckpointOfANodeWithAnOutsideWalRestoresOnANodeWithItsWalInside() throws IOException {
+		Path walA = tempDir.resolve("wal-a").toAbsolutePath().normalize();
+		Path configA = Files.writeString(tempDir.resolve("a.conf"), "database.global.wal-path = \"%s\"\n".formatted(walA));
+		Path checkpoint = tempDir.resolve("checkpoint");
+		Expected expected;
+		try (var store = NodeStore.open(tempDir.resolve("a").resolve("db"), configA, "a")) {
+			long column = store.db().createColumn(DATA_COLUMN, DATA_SCHEMA);
+			for (int i = 0; i < 10; i++) {
+				put(store, column, i, "v" + i);
+			}
+			setApplied(store, TermIndex.valueOf(1, 10));
+			store.checkpoint(checkpoint);
+			expected = Expected.of(store, column);
+		}
+		Path dbB = tempDir.resolve("b").resolve("db");
+		NodeStore.restore(checkpoint, dbB);
+		assertMatchesCheckpoint(dbB, expected);
+		assertFalse(Files.exists(dbB.resolve(NodeStore.DETACHED_WAL)));
+	}
+
+	/** WAL files in an outside WAL directory with no database: refused, they are another database's. */
+	@Test
+	void anOutsideWalDirectoryWithWalFilesAndNoDatabaseIsRefused() throws IOException {
+		Path wal = Files.createDirectories(tempDir.resolve("wal")).toAbsolutePath().normalize();
+		Path config = Files.writeString(tempDir.resolve("n.conf"), "database.global.wal-path = \"%s\"\n".formatted(wal));
+		Files.writeString(wal.resolve("000012.log"), "left");
+		var refused = assertThrows(IOException.class, () -> NodeStore.open(tempDir.resolve("n").resolve("db"), config, "n"));
+		assertTrue(refused.getMessage().contains("belong to a database that was deleted"), refused.getMessage());
+		assertTrue(Files.exists(wal.resolve("000012.log")));
+	}
+
 	static String mode(Path file) throws IOException {
 		Set<PosixFilePermission> permissions = Files.getPosixFilePermissions(file);
 		return PosixFilePermissions.toString(permissions);
