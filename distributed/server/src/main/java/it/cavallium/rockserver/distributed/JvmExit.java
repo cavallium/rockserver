@@ -21,6 +21,14 @@ final class JvmExit {
 
 		/** Whether a signal (SIGTERM, SIGINT, SIGHUP) started the shutdown under way, and not a {@code System.exit}. */
 		boolean bySignal();
+
+		/**
+		 * Whether a thread is inside {@code System.exit} without being the one that runs the hooks: it called it after
+		 * the shutdown under way began, and waits behind it for good. Asked only after a signal (R66-5).
+		 */
+		default boolean exitWaiting() {
+			return false;
+		}
 	}
 
 	/** The answers for this JVM. */
@@ -33,6 +41,11 @@ final class JvmExit {
 		@Override
 		public boolean bySignal() {
 			return it.cavallium.rockserver.core.impl.JvmExit.bySignal();
+		}
+
+		@Override
+		public boolean exitWaiting() {
+			return it.cavallium.rockserver.core.impl.JvmExit.exitWaiting();
 		}
 	};
 }

@@ -42,6 +42,19 @@ public final class JvmExit {
 		return false;
 	}
 
+	/**
+	 * Whether a thread is inside {@code System.exit} without being the one that runs the hooks: it called it after the
+	 * shutdown under way began, and waits behind it for good.
+	 */
+	public static boolean exitWaiting() {
+		for (var stack : Thread.getAllStackTraces().values()) {
+			if (has(stack, SHUTDOWN, null) && !has(stack, SHUTDOWN, RUN_HOOKS)) {
+				return true;
+			}
+		}
+		return false;
+	}
+
 	private static boolean has(StackTraceElement[] stack, String type, String method) {
 		for (var frame : stack) {
 			String name = frame.getClassName();
