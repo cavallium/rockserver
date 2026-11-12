@@ -70,7 +70,14 @@ class CompactionIoBudgetTest {
             assertEquals(CompactionIoBudget.State.TRACKING, t.policy.state());
             assertEquals(currentMean == 800 ? candidate : SEED, t.policy.budget(),
                     "two beneficial windows may accept; a stable unchanged workset must not fabricate benefit");
-            assertEquals(currentMean == 800 ? 800 : 750, t.policy.baselineReadMicros(), .001);
+            assertEquals(currentMean == 800 ? 500 : 750, t.policy.baselineReadMicros(), .001,
+                    "a kept decrease does not raise the reference (800 is still slow); one that did not help moves it halfway");
+            if (currentMean != 800) continue;
+            for (int second = 0; second < 5; second++) {
+                t.completions += 40; t.poll(40, 800, candidate, false, true);
+            }
+            assertEquals(CompactionIoBudget.State.PROBE, t.policy.state(), "still slow after a decrease that helped: the next one follows");
+            assertEquals((long) (candidate * .7), t.policy.budget());
         }
     }
     @Test void offProbeRejectsWorseningOrMissingPointReferenceImmediately() throws Exception {
@@ -153,16 +160,16 @@ class CompactionIoBudgetTest {
         assertEquals(CompactionIoBudget.State.BOOTSTRAP, p.state(),
                 "soft hysteresis alone must not retain urgent recovery");
     }
-    @Test void aDemandLimitedWindowNeverStartsATrial() {
+    @Test void aDemandLimitedWindowWithoutSustainedSlowReadsChangesNothing() {
         // It was probeTestsServiceWhenBudgetExceedsActualConsumption: 100 KB/s of background I/O under a 1 MB/s budget
         // started a trial at 75 KB/s, the rate the next memtable flush was then throttled to. Here the background is
-        // 400 KB/s, above the 250 KB/s flush floor: a trial at 300 KB/s is allowed by the floor, but not by a limiter
-        // that is not the bottleneck.
+        // 400 KB/s, above the 250 KB/s flush floor, and uses 40% of the budget.
         var t = new Trace(); t.window(10, 100, SEED);
         t.window(10, 100, SEED); t.window(10, 100, SEED); // restore prior budget
         assertEquals(SEED, t.policy.budget());
         for (int i = 0; i < 40; i++) {
-            // Faster, equal and much slower point reads: none says anything about a limiter that limits nothing.
+            // Faster and equal point reads, and one slow window at a time: no trial (the limiter limits nothing)
+            // and no decrease (one slow window is not harm yet).
             t.window(10, i % 3 == 0 ? 80 : i % 3 == 1 ? 100 : 300, 400_000);
             assertEquals(CompactionIoBudget.State.TRACKING, t.policy.state(), "window " + i);
             assertEquals(SEED, t.policy.budget(), "window " + i);
@@ -170,6 +177,26 @@ class CompactionIoBudgetTest {
         t.window(10, 100, SEED);
         assertEquals(CompactionIoBudget.State.PROBE, t.policy.state(), "the limiter is the bottleneck again");
         assertEquals(750_000, t.policy.budget());
+    }
+    @Test void slowReadsUnderAHalfUsedBudgetLowerItFromTheAchievedRate() {
+        // After a healthy doubling the budget is twice the background rate. Slow reads there started no trial (the
+        // limiter was not saturated), so the limiter had become a fixed cap. The harm is in the rate in use.
+        var t = new Trace(); t.window(10, 100, SEED);
+        t.window(10, 100, SEED); t.window(10, 100, SEED); // restore prior budget
+        t.window(10, 100, SEED);
+        assertEquals(2 * SEED, t.policy.budget());
+        t.window(10, 100, SEED);
+        assertEquals(2 * SEED, t.policy.budget(), "half of the budget in use, healthy reads: nothing changes");
+        t.window(10, 200, SEED);
+        assertEquals(CompactionIoBudget.State.TRACKING, t.policy.state());
+        assertEquals(2 * SEED, t.policy.budget(), "one slow window is not harm yet");
+        t.window(10, 200, SEED);
+        assertEquals(CompactionIoBudget.State.PROBE, t.policy.state());
+        assertEquals(700_000, t.policy.budget(), "70% of the 1 MB/s that background I/O moved, not of the 2 MB/s budget");
+        t.window(10, 100, 700_000); t.window(10, 100, 700_000); t.window(10, 100, 700_000);
+        assertEquals(CompactionIoBudget.State.TRACKING, t.policy.state());
+        assertEquals(700_000, t.policy.budget(), "reads are fast again at the lower rate: it is kept");
+        assertEquals(100, t.policy.baselineReadMicros(), .001);
     }
     @Test void slowerPointReadsOverABackgroundUnderTheFlushFloorBecomeTheBaseline() {
         // The limiter may not go under the seed, so it can do nothing about a background of a tenth of it: without
@@ -186,7 +213,7 @@ class CompactionIoBudgetTest {
         }
         assertTrue(accepted >= 0 && accepted <= 13, "accepted at window " + accepted);
     }
-    /** A background of 40% of the budget, above the flush floor: no trial, no idle window, nothing sets the baseline. */
+    /** A background of 40% of the budget, above the flush floor: no trial from a healthy state and no idle window. */
     private static Trace unsaturatedAboveTheFloor() {
         var t = new Trace(); t.window(10, 100, SEED);
         t.window(10, 100, SEED); t.window(10, 100, SEED); // restore prior budget
@@ -196,26 +223,27 @@ class CompactionIoBudgetTest {
     }
     @Test void aRampOfPointLatencyIsNotFollowedAsHealthy() {
         // +1.5% per window was followed without end (a ratio to the baseline of 1.15, always healthy); +15% is the
-        // fast case. Both must be over 1.2x the baseline within ln(1.44) / ln(growth) windows, and stay there.
+        // fast case. Both must be over 1.2x the baseline within ln(1.44) / ln(growth) windows.
         for (double growth : new double[]{1.015, 1.15}) {
             var t = unsaturatedAboveTheFloor();
             int bound = (int) Math.ceil(Math.log(1.44) / Math.log(growth)), detected = -1;
             double latency = 100;
-            for (int i = 1; i <= 60; i++) {
+            for (int i = 1; i <= 60 && detected < 0; i++) {
                 latency *= growth;
                 t.window(10, Math.round(latency), 400_000);
                 assertEquals(SEED, t.policy.budget());
                 assertTrue(t.policy.baselineReadMicros() <= 120.001, "baseline " + t.policy.baselineReadMicros());
-                boolean unhealthy = Math.round(latency) > t.policy.baselineReadMicros() * 1.2;
-                if (unhealthy && detected < 0) detected = i;
-                if (detected >= 0) assertTrue(unhealthy, "window " + i + " after detection at " + detected);
+                if (Math.round(latency) > t.policy.baselineReadMicros() * 1.2) detected = i;
             }
             assertTrue(detected > 0 && detected <= bound, growth + ": detected at " + detected + ", bound " + bound);
+            t.window(10, Math.round(latency * growth), 400_000);
+            assertEquals(CompactionIoBudget.State.PROBE, t.policy.state(), "the second slow window is answered");
+            assertEquals(280_000, t.policy.budget(), "with 70% of the background rate, which used 40% of the budget");
         }
     }
     @Test void aWorksetShiftIsAcceptedInWindowsWithoutBackgroundIo() {
         var t = unsaturatedAboveTheFloor();
-        for (int i = 0; i < 30; i++) t.window(10, 200, 400_000);
+        t.window(10, 200, 400_000);
         assertTrue(t.policy.baselineReadMicros() <= 120.001, "twice the latency while background I/O runs is not accepted");
         int accepted = -1;
         for (int i = 1; i <= 10 && accepted < 0; i++) {
@@ -227,8 +255,28 @@ class CompactionIoBudgetTest {
         for (int i = 0; i < 30; i++) {
             t.window(10, 200, 400_000);
             assertTrue(200 <= t.policy.baselineReadMicros() * 1.2, "the accepted shift stays healthy with background I/O");
+            assertEquals(SEED, t.policy.budget());
         }
         assertTrue(t.policy.baselineReadMicros() > reference, "and the average goes on from the accepted level");
+    }
+    @Test void aWorksetShiftIsAcceptedAfterDecreasesThatDidNotHelp() {
+        // Background I/O never stops and reads are twice as slow whatever its rate. Each decrease is undone by the
+        // window that shows no faster reads and moves the reference halfway; the next one is 12 windows later.
+        var t = unsaturatedAboveTheFloor();
+        int accepted = -1, decreases = 0;
+        for (int i = 0; i < 60 && accepted < 0; i++) {
+            boolean tracking = t.policy.state() == CompactionIoBudget.State.TRACKING;
+            t.window(10, 200, Math.min(400_000, t.policy.budget()));
+            if (t.policy.state() == CompactionIoBudget.State.PROBE) {
+                if (tracking) decreases++;
+                assertEquals(280_000, t.policy.budget());
+            } else {
+                assertEquals(SEED, t.policy.budget(), "window " + i);
+                if (200 <= t.policy.baselineReadMicros() * 1.2) accepted = i;
+            }
+        }
+        assertEquals(2, decreases);
+        assertTrue(accepted > 0 && accepted <= 20, "accepted at window " + accepted);
     }
     @Test void noisyPointMeansAreNotTakenForDegradation() {
         var t = unsaturatedAboveTheFloor();
@@ -442,14 +490,20 @@ class CompactionIoBudgetTest {
     @Test void mediaShiftWithForegroundProgressDoesNotBackOffPermanently() {
         var t = new Trace();
         for (int second = 0; second < 5; second++) t.poll(10, 20, SEED, false, false);
+        int reduced = 0;
         for (int window = 0; window < 60; window++) {
             for (int second = 0; second < 5; second++) {
                 t.completions += 3_000;
                 t.poll(100, 3_000 + window % 3 * 3_000, Math.min(SEED, t.policy.budget()), false, true);
             }
+            // A reduction is 70% or 75% of the achieved rate while its effect is measured; none is kept or goes further.
+            if (t.policy.state() == CompactionIoBudget.State.PROBE) {
+                reduced++;
+                assertTrue(t.policy.budget() >= SEED * 7 / 10, "window " + window + " budget " + t.policy.budget());
+            } else assertTrue(t.policy.budget() >= SEED, "window " + window + " budget " + t.policy.budget()
+                    + ": latency unresponsive to throttling must not erase observed sustainable background service");
         }
-        assertTrue(t.policy.budget() >= SEED * .75,
-                "latency unresponsive to throttling must not erase observed sustainable background service");
+        assertTrue(reduced <= 12, "windows at a reduced rate: " + reduced);
     }
 
     @Test void highLatencyWithoutProbeBenefitRestoresServiceAndHonorsCooldown() {
@@ -457,14 +511,22 @@ class CompactionIoBudgetTest {
         t.window(10, 100, SEED);
         t.window(10, 100, 750_000); t.window(10, 100, 750_000);
         assertEquals(SEED, t.policy.budget());
+        t.window(10, 6_000, SEED);
+        assertEquals(SEED, t.policy.budget(), "one slow window");
+        t.window(10, 6_000, SEED);
+        assertEquals(CompactionIoBudget.State.PROBE, t.policy.state(), "slow reads are answered at the second window,"
+                + " also right after a trial from a healthy state that showed nothing");
+        assertEquals(700_000, t.policy.budget());
+        t.window(10, 6_000, 700_000); t.window(10, 6_000, 700_000);
+        assertEquals(SEED, t.policy.budget(), "no latency response must restore the budget");
         for (int window = 0; window < 12; window++) {
             t.window(10, 6_000, SEED);
-            assertEquals(SEED, t.policy.budget(), "high latency must respect failed-probe cooldown");
+            assertEquals(SEED, t.policy.budget(), "high latency must respect the cooldown of a decrease that did not help");
         }
         t.window(10, 6_000, SEED);
         assertEquals(CompactionIoBudget.State.PROBE, t.policy.state());
-        t.window(10, 6_000, 750_000); t.window(10, 6_000, 750_000);
-        assertEquals(SEED, t.policy.budget(), "no latency response must restore the pre-probe budget");
+        t.window(10, 6_000, 700_000); t.window(10, 6_000, 700_000);
+        assertEquals(SEED, t.policy.budget(), "no latency response must restore the budget");
     }
     @Test void apparentLatencyBenefitNeedsReducedBackgroundServiceAndForegroundProgress() {
         for (int scenario = 0; scenario < 4; scenario++) {

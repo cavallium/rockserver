@@ -5,7 +5,20 @@ public final class CompactionIoBudget {
     public static final long MIN_BYTES_PER_SECOND = 4096 * 10; // one aligned page per 100ms refill
     public static final long MAX_BYTES_PER_SECOND = Long.MAX_VALUE / 1_000_000;
     public static final long MAX_READAHEAD_BYTES = 16L << 20;
+    /** PROBE: the budget was lowered and the next windows decide whether the lower rate is kept (see beginProbe). */
     public enum State { BOOTSTRAP, TRACKING, PROBE, RECOVERY }
+    /**
+     * Multiplicative decrease on measured foreground harm, applied to the background rate actually achieved in the
+     * harmful window (not to the budget, which may be twice that): it removes the slack and cuts the real rate by
+     * 30% in one step. A kept decrease needs the background rate to fall by 10% and reads to get 10% faster, so the
+     * step must be well over 10%; CUBIC uses the same factor, Reno 0.5 (which would give up half of a device that
+     * is only marginally over capacity).
+     */
+    static final double HARM_DECREASE = .7;
+    /** Consecutive harmful windows (5 s each) before a decrease: one slow window is noise, two are 10 s of slow reads. */
+    static final int HARM_WINDOWS = 2;
+    /** Windows after a decrease that did not help, or that the floor did not allow, before the next one. */
+    static final int COOLDOWN_WINDOWS = 12;
     public record Sample(long nanos, long readCount, long readMicros, long bytes,
                          boolean background, boolean pressure, boolean stopped, boolean valid,
                          boolean foregroundPending, long foregroundCompletions, boolean recoveryClear,
@@ -208,6 +221,12 @@ public final class CompactionIoBudget {
     private double probeLatency, probeAchieved, probeForegroundRate, probePointCallRate;
     private int settle, cooldown, healthyRecovery, probeBenefits, cautiousGrowth;
     private long beforeGrowth;
+    /** Consecutive completed TRACKING windows with background I/O and a mean read latency over 1.2x its baseline. */
+    private int harmWindows;
+    /** Windows until measured harm may lower the budget again (set when a decrease did not help or was at the floor). */
+    private int harmCooldown;
+    /** Whether the reduction under test answers measured harm (else it is a trial from a healthy state). */
+    private boolean probeForHarm;
     private double firstProbeBenefitLatency;
     private long bulkCalls, bulkTime, bulkKeys, readSaturatedNanos, readPendingNanos, readQueuedNanos, readCompleted;
     private boolean bulkEpochValid = true, bulkSeen, bulkIdle = true, bulkComparable, bulkHealthy,
@@ -292,6 +311,7 @@ public final class CompactionIoBudget {
             state = State.RECOVERY;
             healthyRecovery = 0;
             beforeGrowth = 0;
+            harmWindows = harmCooldown = 0;
             queueReferenceWindows = 0; probeQueueProtected = false;
             double usefulService = Math.max(preThrottle, Math.max(recentAchieved, probeBudget));
             if (usefulService > 0 && tracking) usefulService = Math.max(usefulService, budget);
@@ -305,6 +325,7 @@ public final class CompactionIoBudget {
                 || sample.foregroundCompletions < old.foregroundCompletions) {
             if (state == State.PROBE) finishProbe(false, 0);
             if (state == State.RECOVERY) healthyRecovery = 0;
+            harmWindows = 0;
             invalidateBulk();
             clearWindow();
             clearReadWindow();
@@ -516,6 +537,10 @@ public final class CompactionIoBudget {
             else firstProbeBenefitLatency = latency;
             return publishBudget();
         }
+        // Harm: slow reads (same definition as everywhere above) in a window in which background I/O ran. Whether
+        // that I/O used the whole budget does not matter: it is the rate in use that was too high.
+        boolean harm = active && unhealthyMean;
+        harmWindows = harm ? harmWindows + 1 : 0;
         if (!active) {
             if (Double.isFinite(latency) && latency > 0) {
                 baseline = baseline == 0 ? latency : baseline * .8 + latency * .2;
@@ -529,13 +554,14 @@ public final class CompactionIoBudget {
             preThrottle = budget;
             state = State.TRACKING;
             if (pointReliable) baseline = latency;
-            if ((pointReliable || bulkComparable) && bulkSafe) beginProbe(latency, foregroundRate, pointCallRate);
+            harmWindows = 0;
+            if ((pointReliable || bulkComparable) && bulkSafe) beginProbe(latency, foregroundRate, pointCallRate, false);
             return publishBudget();
         }
         // The once-only no-progress trials wait for a window that saturated the limiter instead of being used up.
         if (bulkNoProgress && !bulkNoProgressProbeUsed && bulkBaseline > 0 && limiterBound()) {
             bulkNoProgressProbeUsed = true;
-            beginProbe(latency, foregroundRate, pointCallRate);
+            beginProbe(latency, foregroundRate, pointCallRate, false);
             return publishBudget();
         }
         // Cache hits/mutations or proven foreground idleness cannot conceal an active slow/sparse bulk lane.
@@ -544,29 +570,33 @@ public final class CompactionIoBudget {
                 budget = grown(achieved);
             } else if (noForegroundProgress && !noProgressProbeUsed && baseline > 0 && limiterBound()) {
                 noProgressProbeUsed = true;
-                beginProbe(baseline, foregroundRate, pointCallRate);
+                beginProbe(baseline, foregroundRate, pointCallRate, false);
             }
             return publishBudget();
         }
         if (pointReliable && baseline == 0) baseline = latency;
         long undo = beforeGrowth;
         beforeGrowth = 0;
-        if (unhealthyMean && undo > 0 && undo < budget) {
-            // The window after a growth step had slow reads: take the step back. This comes before a rate trial,
-            // which would start from the harmful budget or, at the flush floor, accept the slow reads as the baseline.
+        boolean reductionAllowed = !rateProbeBlocked() && (bulkIdle || bulkComparable);
+        if (harm && undo > 0 && undo < budget) {
+            // The window after a growth step had slow reads: take the step back at once (it is the likely cause, and
+            // the budget before it was healthy).
             budget = undo;
-            if (cooldown > 0) cooldown--;
-        } else if (cooldown > 0 || rateProbeBlocked() || !(bulkIdle || bulkComparable)
-                || !beginProbe(latency, foregroundRate, pointCallRate)) {
-            // No trial started (a skipped one costs no window): cooldown, baseline tracking and growth go on.
-            if (cooldown > 0) cooldown--;
+        } else {
+            // Slow reads in HARM_WINDOWS consecutive windows: HARM_DECREASE of the achieved rate, kept or undone by
+            // the next windows. Healthy reads: a trial from a window that saturated the limiter, when one is due.
+            if (harm ? harmWindows >= HARM_WINDOWS && harmCooldown == 0 && reductionAllowed
+                        && beginProbe(latency, foregroundRate, pointCallRate, true)
+                    : cooldown == 0 && reductionAllowed
+                        && beginProbe(latency, foregroundRate, pointCallRate, false)) return publishBudget();
+            // No reduction started (a skipped one costs no window): baseline tracking and growth go on.
             if (pointHealthy && growthAllowed) {
                 if (pointReliable) baseline = followed(latency);
-                if (achieved >= budget * .8) {
-                    budget = grown(achieved);
-                }
+                if (achieved >= budget * .8) budget = grown(achieved);
             }
         }
+        if (cooldown > 0) cooldown--;
+        if (harmCooldown > 0) harmCooldown--;
         return publishBudget();
     }
     private void observeForegroundSafety(Sample sample, Sample old) {
@@ -972,11 +1002,18 @@ public final class CompactionIoBudget {
     private void finishProbe(boolean improved, double latency) {
         if (improved) {
             cautiousGrowth = 12;
-            if (Double.isFinite(latency) && latency > 0) baseline = latency;
-            if (probeBulkProtected && bulkComparable) bulkBaseline = bulkLatency;
+            harmCooldown = 0; // If reads are still slow, the next decrease follows without waiting.
+            // After measured harm the reference only falls: reads that got 10% faster may still be slow.
+            if (Double.isFinite(latency) && latency > 0)
+                baseline = probeForHarm && baseline > 0 ? Math.min(baseline, latency) : latency;
+            if (probeBulkProtected && bulkComparable)
+                bulkBaseline = probeForHarm && bulkBaseline > 0 ? Math.min(bulkBaseline, bulkLatency) : bulkLatency;
         }
         else {
             budget = probeBudget;
+            // A decrease that did not make slow reads faster is not repeated at once. A trial from a healthy state
+            // that showed nothing says nothing about reads that become slow later: those are answered at once.
+            if (probeForHarm) harmCooldown = COOLDOWN_WINDOWS;
             if (Double.isFinite(latency) && latency > 0) baseline = baseline * .5 + latency * .5;
             // A stable media/workset shift may not respond to throttling; only clear, guarded no-benefit trials rebase it.
             if (probeBulkRebaseAllowed) bulkBaseline = bulkBaseline * .5 + bulkLatency * .5;
@@ -985,39 +1022,42 @@ public final class CompactionIoBudget {
         probeBudget = 0;
         queueReferenceWindows = 0; probeQueueProtected = false;
         state = State.TRACKING;
-        cooldown = 12;
+        cooldown = COOLDOWN_WINDOWS;
         clearReadWindow();
     }
     /**
-     * Starts a downward rate trial if one can be informative. A trial says something only while the limiter is the
-     * bottleneck of background I/O, and it must never starve a memtable flush:
+     * Lowers the budget and enters PROBE, where the next windows decide: the lower rate is kept if reads got 10%
+     * faster in two consecutive windows while the background rate fell by 10%, otherwise the budget is restored.
      * <ul>
-     * <li>the trial rate is never under the flush floor (the seed);</li>
-     * <li>a trial rate that is not at least 10% under the measured rate is not tried: it could never be kept (a kept
-     * trial needs the background rate to fall by 10%). The limiter is as low as it may go for this background
-     * (which includes every background at or under the flush floor), so the current latency becomes the
-     * reference and the next attempt is 12 windows later;</li>
-     * <li>a window above that which did not saturate the limiter (under 80% of the budget) starts none and learns
-     * nothing: the budget is not what background I/O ran at.</li>
+     * <li>{@code harm}: the answer to measured foreground harm. The new rate is {@link #HARM_DECREASE} of the
+     * achieved rate, whether or not that rate saturated the limiter.</li>
+     * <li>otherwise a trial from a healthy state, at 75% of the achieved rate. It says something only while the
+     * limiter is the bottleneck of background I/O: a window that used under 80% of the budget starts none and
+     * learns nothing.</li>
      * </ul>
-     * @return whether a trial started
+     * Neither goes under the flush floor (the seed). A rate that is not at least 10% under the achieved one is
+     * not tried, because it could never be kept: the limiter is as low as it may go for this background (which
+     * includes every background at or under the flush floor), so the current latency becomes the reference and
+     * the next attempt is {@link #COOLDOWN_WINDOWS} windows later.
+     * @return whether the budget was lowered
      */
-    private boolean beginProbe(double latency, double foregroundRate, double pointCallRate) {
-        long candidate = Math.max(seed, bound(Math.min(budget, lastAchieved) * .75));
+    private boolean beginProbe(double latency, double foregroundRate, double pointCallRate, boolean harm) {
+        long candidate = Math.max(seed, bound(Math.min(budget, lastAchieved) * (harm ? HARM_DECREASE : .75)));
         // A healthy rate trial must fit the acknowledged reader cap. Safety cuts run first and remove this floor.
         if (foregroundHealthy) candidate = Math.max(candidate, bound(Math.ceil(readaheadBytes * 12.5)));
         boolean lowest = candidate >= budget || candidate > lastAchieved * .9;
-        if (!lowest && !limiterBound()) return false;
+        if (!lowest && !harm && !limiterBound()) return false;
         pointReferenceWindows = 0; pointReferenceMax = 0;
         bulkReferenceWindows = 0;
         tailOffProbeHoldUntil = 0;
         resetTailBlocks();
         if (lowest) {
             if (Double.isFinite(latency) && latency > 0) baseline = latency;
-            cooldown = 12;
+            cooldown = harmCooldown = COOLDOWN_WINDOWS;
             return false;
         }
         beforeGrowth = 0;
+        probeForHarm = harm;
         probeQueueRemovals = 0;
         probeQueueProtected = queueReferenceWindows >= 2;
         queueReferenceWindows = 0;

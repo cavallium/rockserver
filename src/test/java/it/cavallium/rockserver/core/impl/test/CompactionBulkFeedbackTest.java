@@ -863,8 +863,8 @@ class CompactionBulkFeedbackTest {
                     ack.invoke(t.p, 0L); t.applied = 0;
                 }
                 case "probe" -> {
-                    var probe = CompactionIoBudget.class.getDeclaredMethod("beginProbe", double.class, double.class, double.class);
-                    probe.setAccessible(true); saturate(t.p); probe.invoke(t.p, 1466d, 10000d, 100d);
+                    var probe = CompactionIoBudget.class.getDeclaredMethod("beginProbe", double.class, double.class, double.class, boolean.class);
+                    probe.setAccessible(true); saturate(t.p); probe.invoke(t.p, 1466d, 10000d, 100d, false);
                 }
                 default -> throw new AssertionError(interrupt);
             }
@@ -989,8 +989,8 @@ class CompactionBulkFeedbackTest {
                     var ack = CompactionIoBudget.class.getDeclaredMethod("readaheadApplied", long.class); ack.setAccessible(true); ack.invoke(t.p, 0L); t.applied = 0;
                 }
                 case "probe" -> {
-                    var probe = CompactionIoBudget.class.getDeclaredMethod("beginProbe", double.class, double.class, double.class);
-                    probe.setAccessible(true); saturate(t.p); probe.invoke(t.p, 22000d, 10000d, 100d);
+                    var probe = CompactionIoBudget.class.getDeclaredMethod("beginProbe", double.class, double.class, double.class, boolean.class);
+                    probe.setAccessible(true); saturate(t.p); probe.invoke(t.p, 22000d, 10000d, 100d, false);
                 }
                 default -> throw new AssertionError(interrupt);
             }
