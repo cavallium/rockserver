@@ -331,19 +331,11 @@ final class EmbeddedDBColumns {
 
 	/**
 	 * Flushes the column and hard-links its table files (copies those on another file system) into {@code exportDir},
-	 * which must not exist and whose parent must. The result is what {@link #createColumnFromExport} takes; the caller
-	 * closes it once the column is imported, and deletes {@code exportDir}. Nothing may write to the column or compact
-	 * it meanwhile. Refused for a column with blob files, which the export leaves out.
-	 *
-	 * <p>RocksDB's column family export ({@code Checkpoint::ExportColumnFamily}) looks for every table file in the
-	 * database directory, whatever the column's {@code cf_paths} (volumes) are, and fails for a file in a volume. So
-	 * for the time of RocksDB's call each such file gets a symbolic link of its name in the database directory, and
-	 * RocksDB exports into {@code column-export.<pid>.<column id>} inside the database directory, where it hard-links
-	 * what it finds: the symbolic links (Linux's {@code link} does not follow them), so no data is read. That directory
-	 * is then replaced by a symbolic link to {@code exportDir}, which this method fills with hard links to the files
-	 * themselves: the import follows it. The symbolic links in the database directory are removed before this returns,
-	 * the one to {@code exportDir} when the result is closed; a process killed in between leaves them, to be deleted
-	 * by hand ({@code *.sst} symbolic links and {@code column-export.*} in the database directory).</p>
+	 * which must not exist and whose parent must: RocksDB's column family export creates it, and takes each table file
+	 * from the directory the column keeps it in (its {@code cf_paths} volume or the database directory). The result is
+	 * what {@link #createColumnFromExport} takes; the caller closes it once the column is imported, and deletes
+	 * {@code exportDir}. Nothing may write to the column or compact it meanwhile. Refused for a column with blob
+	 * files, which the export leaves out.
 	 */
 	public ExportedColumn exportColumn(long columnId, java.nio.file.Path exportDir) throws RocksDBException {
 		edb.ops.beginOp();
@@ -362,75 +354,30 @@ final class EmbeddedDBColumns {
 					throw RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, "The column has " + blobFiles
 							+ " blob files, which RocksDB's column family export does not carry");
 				}
-				var dbDir = java.nio.file.Path.of(db.getName()).toAbsolutePath();
 				var files = columnTableFiles(columnId);
-				var rocksExport = dbDir.resolve("column-export." + ProcessHandle.current().pid() + "." + columnId);
-				if (java.nio.file.Files.exists(rocksExport, java.nio.file.LinkOption.NOFOLLOW_LINKS)) {
-					throw RocksDBException.of(RocksDBErrorType.INTERNAL_ERROR, rocksExport + " already exists: remove it");
-				}
-				var placeholders = new ArrayList<java.nio.file.Path>();
 				ExportImportFilesMetaData metadata = null;
 				boolean done = false;
 				try {
-					try {
-						for (var file : files) {
-							var inDbDir = dbDir.resolve(file.getFileName());
-							if (java.nio.file.Files.exists(inDbDir, java.nio.file.LinkOption.NOFOLLOW_LINKS)) {
-								if (!java.nio.file.Files.isSameFile(inDbDir, file)) {
-									throw new IOException(inDbDir + " exists and is not " + file + ": remove it if a killed export left it");
-								}
-								continue;
-							}
-							java.nio.file.Files.createSymbolicLink(inDbDir, file);
-							placeholders.add(inDbDir);
-						}
-						try (var checkpoint = org.rocksdb.Checkpoint.create(db)) {
-							metadata = checkpoint.exportColumnFamily(col.cfh(), rocksExport.toString());
-						}
-					} finally {
-						for (var placeholder : placeholders) {
-							java.nio.file.Files.deleteIfExists(placeholder);
-						}
+					try (var checkpoint = org.rocksdb.Checkpoint.create(db)) {
+						metadata = checkpoint.exportColumnFamily(col.cfh(), exportDir.toString());
 					}
 					// What RocksDB listed is what was listed here: nothing was flushed or compacted in between.
 					var expected = new TreeSet<String>();
 					files.forEach(file -> expected.add(file.getFileName().toString()));
 					var exported = new TreeSet<String>();
-					try (var list = java.nio.file.Files.list(rocksExport)) {
+					try (var list = java.nio.file.Files.list(exportDir)) {
 						list.forEach(file -> exported.add(file.getFileName().toString()));
 					}
 					if (!exported.equals(expected)) {
 						throw new IOException("The column's table files changed during the export: " + expected + " became "
 								+ exported);
 					}
-					for (var placeholder : placeholders) {
-						if (!java.nio.file.Files.isSymbolicLink(rocksExport.resolve(placeholder.getFileName()))) {
-							// A link() that follows symbolic links, or an export across file systems: correct, but slow.
-							edb.logger.warn("RocksDB copied {} instead of linking its symbolic link", placeholder.getFileName());
-						}
-					}
-					deleteLinks(rocksExport);
-					java.nio.file.Files.createDirectory(exportDir);
-					for (var file : files) {
-						var link = exportDir.resolve(file.getFileName());
-						try {
-							java.nio.file.Files.createLink(link, file);
-						} catch (java.nio.file.FileSystemException | UnsupportedOperationException crossDevice) {
-							java.nio.file.Files.copy(file, link);
-						}
-					}
-					java.nio.file.Files.createSymbolicLink(rocksExport, exportDir.toAbsolutePath());
 					done = true;
-					return new ExportedColumn(metadata, rocksExport, files.size());
+					return new ExportedColumn(metadata, files.size());
 				} finally {
 					if (!done) {
 						if (metadata != null) {
 							metadata.close();
-						}
-						try {
-							deleteLinks(rocksExport);
-						} catch (IOException e) {
-							edb.logger.warn("Failed to delete {}", rocksExport, e);
 						}
 					}
 				}
@@ -440,28 +387,6 @@ final class EmbeddedDBColumns {
 					+ e.getMessage(), e);
 		} finally {
 			edb.ops.endOp();
-		}
-	}
-
-	/** Deletes RocksDB's export directory (links only), or the symbolic link in its place; nothing it links to. */
-	static void deleteLinks(java.nio.file.Path rocksExport) throws IOException {
-		if (java.nio.file.Files.isDirectory(rocksExport, java.nio.file.LinkOption.NOFOLLOW_LINKS)) {
-			try (var list = java.nio.file.Files.list(rocksExport)) {
-				for (var entry : list.toList()) {
-					java.nio.file.Files.delete(entry);
-				}
-			}
-		}
-		java.nio.file.Files.deleteIfExists(rocksExport);
-		// RocksDB builds in <dir>.tmp and leaves it when it fails.
-		var building = rocksExport.resolveSibling(rocksExport.getFileName() + ".tmp");
-		if (java.nio.file.Files.isDirectory(building, java.nio.file.LinkOption.NOFOLLOW_LINKS)) {
-			try (var list = java.nio.file.Files.list(building)) {
-				for (var entry : list.toList()) {
-					java.nio.file.Files.delete(entry);
-				}
-			}
-			java.nio.file.Files.delete(building);
 		}
 	}
 

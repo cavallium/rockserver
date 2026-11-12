@@ -263,6 +263,8 @@ final class SeedBuilder {
 							+ exportParent + ": copying " + bytes + " bytes into the seed");
 				}
 				exportDirs.add(export);
+				// RocksDB builds in <dir>.tmp and leaves it when its export fails.
+				exportDirs.add(export.resolveSibling(export.getFileName() + ".tmp"));
 				try (var exported = source.exportColumn(sourceId, export)) {
 					if (exported.files() != files.size()) {
 						throw new BuildException("Column " + name + " changed while it was exported");

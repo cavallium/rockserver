@@ -178,11 +178,8 @@ rs build-seed --source-db OLD-DB --source-config old-rockserver.conf --target /d
   its memtables are flushed, as a start and stop of the single node would. No table file of it is rewritten or
   deleted. It is refused while a Rockserver runs on it. Run it on a snapshot or clone of the volumes if the source
   must stay untouched.
-- While a column is exported, the source database directory holds a symbolic link for each of the column's table
-  files that is in a volume outside it, and a `column-export.<pid>.<id>` entry; RocksDB's export finds table files
-  only in the database directory. They are removed before the command ends. If the command is killed, delete the
-  `*.sst` symbolic links and `column-export.*` in the source database directory, the `*.build-seed-export`
-  directory next to the volume (or `build-seed-*` in `--export-dir`) and `<target>.tmp`.
+- If the command is killed, delete the `*.build-seed-export` directory next to the volume (or `build-seed-*` in
+  `--export-dir`) and `<target>.tmp`.
 - Hard links need one file system. The table files are first linked into an export directory, by default
   `<volume>.build-seed-export` next to the column's volume (pass `--export-dir DIR` when the volume is a mount point,
   whose sibling is on another file system), then into the target. Where a step crosses file systems, the files are

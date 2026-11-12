@@ -93,10 +93,9 @@ registration as `createColumn`: the schema in `_column_schemas_`, the options fr
 read; across file systems the files are copied. The seed has no replication metadata column and no seed digest, like
 an `export-seed` copy, and a first start treats it as any seed. Column ids are RocksDB's column family ids, assigned
 anew in the seed: nothing stores them outside a database (clients ask for them by name, and every node gets the same
-files). RocksDB's `Checkpoint::ExportColumnFamily` looks for table files in the database directory only, not in
-`cf_paths`, so `exportColumn` puts a symbolic link per table file there for the time of the call, lets RocksDB
-export (it hard-links the symbolic links) into a directory inside the database directory, and replaces that
-directory by a symbolic link to the export directory it fills itself with hard links to the files. A column whose
+files). RocksDB's `Checkpoint::ExportColumnFamily` takes each table file from the directory its column keeps it in
+(`cf_paths`), since native patch 0025 (rocksdbjni 11.8.1.14); before it, `exportColumn` linked the files into the
+database directory for the time of the call. A column whose
 schema names a merge operator is refused: the operator registry is not carried, and core does not give such a
 column its operator when a database is reopened (a read that merges crashes the process; found while testing this,
 not fixed here). Tests: `BuildSeedTest` (volume and WAL outside the source; links checked by inode; reads after a
