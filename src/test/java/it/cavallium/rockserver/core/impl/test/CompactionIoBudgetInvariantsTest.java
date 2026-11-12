@@ -11,9 +11,12 @@ import static org.junit.jupiter.api.Assertions.*;
  * background I/O wants {@code demand} bytes/s and gets min(demand, budget); point reads take {@code BASE} microseconds
  * while that rate is at or under {@code capacity} and are slower in proportion to the excess above it. The model is
  * an assumption (a real device is not this regular); what the properties pin is the controller's side.
+ * <p>A write stall (RocksDB stops or delays writes) is an input of the model, not a consequence of its debt: while
+ * the limiter is unlimited the background moves at the device's rate and reads are several times slower.
  */
 class CompactionIoBudgetInvariantsTest {
     private static final long BASE = 100;
+    private static final long UNLIMITED = CompactionIoBudget.UNLIMITED_BYTES_PER_SECOND;
     private static final class Plant {
         final CompactionIoBudget policy;
         final long seed;
@@ -23,14 +26,18 @@ class CompactionIoBudgetInvariantsTest {
         /** Outcome of the last window. */
         double rate; long latency;
         int windows;
+        /** The rate the limiter is at: what the last poll returned (the budget, or unlimited around a write stall). */
+        long limiter;
         Plant(long seed) { this.seed = seed; policy = new CompactionIoBudget(seed); poll(0, BASE, false); }
-        void poll(long transferred, long pointMicros, boolean pressure) {
+        void poll(long transferred, long pointMicros, boolean delayed) {
             nanos += 1_000_000_000L; reads += 40; micros += 40 * pointMicros; bytes += transferred;
             completions += 40; nativePoints += 40; nativeNanos += 40 * pointMicros * 1000;
-            policy.sample(new CompactionIoBudget.Sample(nanos, reads, micros, bytes,
-                    transferred > 0, pressure, pressure, true, true, completions, !pressure, pressure,
+            limiter = policy.sample(new CompactionIoBudget.Sample(nanos, reads, micros, bytes,
+                    transferred > 0, delayed, false, true, true, completions, !delayed, delayed,
                     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, false,
-                    pointMicros, 0, nativePoints, 0, 0, nativeNanos));
+                    pointMicros, 0, nativePoints, 0, 0, nativeNanos).withWriteDelayed(delayed));
+            assertEquals(policy.state() == State.UNLIMITED ? UNLIMITED : policy.budget(), limiter);
+            assertTrue(limiter >= seed, "the limiter under the seed: " + limiter);
         }
         /** One 5 s window at the budget in force at its start; {@code extra} is added to the modelled latency. */
         void window(long extra) {
@@ -157,6 +164,53 @@ class CompactionIoBudgetInvariantsTest {
             // comes to rest above it (40 doublings at most, each tried twice with 3 windows of hold).
             if (!unlimited) assertTrue(settledAt <= 60, at + ": the budget still moved at window " + settledAt);
         }
+    }
+
+    @Test void aWriteStallOpensTheLimiterAtOnceAndTeachesNothing() {
+        int stalls = 0, closings = 0;
+        for (int run = 0; run < 200; run++) {
+            var random = new Random(4000 + run);
+            var p = new Plant(seedOf(random));
+            p.demand = p.seed * (2 + random.nextInt(60));
+            for (int i = 0; i < 30; i++) p.window();
+            assertEquals(State.TRACKING, p.policy.state());
+            // Without a limit the device moves 20x the demand and reads are 10x slower. Stalls last 4 polls on
+            // average and are 25 polls apart, so some come back within the hold and some after BOOTSTRAP.
+            long burst = (long) p.demand * 20, kept = 0;
+            boolean stalled = false;
+            int clear = 1000;
+            for (int second = 0; second < 600; second++) {
+                if (random.nextInt(stalled ? 4 : 25) == 0) stalled = !stalled;
+                boolean open = p.limiter == UNLIMITED; // the limiter in the second this poll closes
+                long before = p.policy.budget(), shutdown = p.policy.shutdownBudget();
+                double baseline = p.policy.baselineReadMicros();
+                p.poll(open ? burst : (long) Math.min(p.demand, p.limiter), open ? BASE * 10 : BASE, stalled);
+                clear = stalled ? 0 : clear + 1;
+                String at = "run " + run + " second " + second + " in " + p.policy.state();
+                // Unlimited in the poll that sees the stall, and until 10 s lie between two polls without one.
+                assertEquals(clear <= 10, p.limiter == UNLIMITED, at + ", polls without a stall " + clear);
+                if (stalled && !open) {
+                    stalls++;
+                    kept = p.policy.budget();
+                    assertTrue(kept >= before, at + ": the stall lowered the budget " + before + " -> " + kept);
+                } else if (open) {
+                    assertEquals(kept, p.policy.budget(), at + ": the budget moved while the limiter was unlimited");
+                    assertEquals(shutdown, p.policy.shutdownBudget(), at);
+                    assertEquals(baseline, p.policy.baselineReadMicros(), 0, at + ": the baseline moved");
+                    if (p.limiter != UNLIMITED) { closings++; assertEquals(kept, p.limiter, at); }
+                }
+                // Limited windows never moved more than the demand: a larger budget was learned from the burst.
+                assertTrue(p.policy.budget() <= p.demand * 2, at + ": budget " + p.policy.budget() + " for a demand of " + p.demand);
+                assertEquals(0, p.policy.harmCeilingBytesPerSecond(), at + ": the slow reads of a burst are not harm");
+            }
+            for (int i = 0; i < 11; i++) p.poll(p.limiter == UNLIMITED ? burst : (long) Math.min(p.demand, p.limiter), BASE, false);
+            for (int i = 0; i < 40; i++) p.window();
+            String at = "run " + run;
+            assertEquals(State.TRACKING, p.policy.state(), at);
+            assertEquals(BASE, p.policy.baselineReadMicros(), 1, at);
+            assertTrue(p.policy.budget() >= p.demand && p.policy.budget() <= p.demand * 2, at + ": budget " + p.policy.budget());
+        }
+        assertTrue(stalls >= 2000 && closings >= 1000, "stalls " + stalls + ", closings " + closings);
     }
 
     @Test void aDeviceWithAFixedCapacityIsProbedRarely() {

@@ -51,7 +51,9 @@ final class CompactionIoController implements AutoCloseable {
                         .description("Last qualified completed ~5s mean of owned point lookups, excluding scheduler queue and pinned consumer lease time")
                         .register(registry),
                 Gauge.builder("rockserver.compaction.io.state", budget, b -> b.state().ordinal())
-                        .tag("db", name).register(registry),
+                        .tag("db", name)
+                        .description("0 BOOTSTRAP, 1 TRACKING, 2 PROBE, 3 RECOVERY, 4 UNLIMITED (writes stopped or delayed in the last 10 s: the limiter is open and the budget gauge is the rate it returns to)")
+                        .register(registry),
                 Gauge.builder("rockserver.compaction.io.floor", budget, CompactionIoBudget::floorBytesPerSecond)
                         .tag("db", name).baseUnit("bytes/second")
                         .description("Rate under which slow reads do not lower the budget: the limiter's seed, raised with compaction debt")
@@ -75,8 +77,9 @@ final class CompactionIoController implements AutoCloseable {
         poll = () -> {
                 try {
                     long next = budget.sample(sample.get());
-                    if (worthApplying(limiter.getBytesPerSecond(), next,
-                            budget.state() == CompactionIoBudget.State.RECOVERY)) limiter.setBytesPerSecond(next);
+                    var state = budget.state();
+                    if (worthApplying(limiter.getBytesPerSecond(), next, state == CompactionIoBudget.State.RECOVERY
+                            || state == CompactionIoBudget.State.UNLIMITED)) limiter.setBytesPerSecond(next);
                     long target = budget.readaheadBytes();
                     if (readaheadDirty || target != appliedReadahead.get()) {
                         readaheadDirty = true;
@@ -125,7 +128,8 @@ final class CompactionIoController implements AutoCloseable {
      * Dead band of the limiter: a budget within 5% of the rate in force is not written to it. The comparison is
      * with the limiter's own rate, so small steps add up until they pass 5%. Every decrease of the control law is
      * 10% or more; what this holds back is slow upward movement (the +5% steps past a harmful rate, the floor
-     * following compaction debt poll by poll), by at most 5%. Under urgent pressure every change is written.
+     * following compaction debt poll by poll), by at most 5%. Under urgent pressure every change is written, and so
+     * is the unlimited rate of a write stall, in the poll that sees it.
      */
     static boolean worthApplying(long current, long next, boolean urgent) {
         return next != current && (urgent || Math.abs(next - current) >= current / 20);

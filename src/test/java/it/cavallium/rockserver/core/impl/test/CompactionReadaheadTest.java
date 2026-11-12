@@ -140,7 +140,8 @@ class CompactionReadaheadTest {
             t.in.progress = false; t.in.pressure = urgency;
             t.limiterBound = true; // The no-progress escape is a rate trial: the limiter must be the bottleneck.
             t.seconds(5);
-            assertEquals(urgency ? CompactionIoBudget.State.RECOVERY : CompactionIoBudget.State.PROBE, t.policy.state());
+            // The pressure of this trace is a native stop: the limiter is unlimited, readahead is not.
+            assertEquals(urgency ? CompactionIoBudget.State.UNLIMITED : CompactionIoBudget.State.PROBE, t.policy.state());
             assertEquals(0, t.in.applied, "native pressure or foreground no-progress disables readahead immediately");
         }
     }
@@ -178,7 +179,7 @@ class CompactionReadaheadTest {
             var state = CompactionIoBudget.class.getDeclaredField("state"); state.setAccessible(true);
             state.set(p, CompactionIoBudget.State.PROBE); // Existing frozen size with a reduced rate.
             p.sample(new CompactionIoBudget.Sample(1_000_000_001L, 0, 0, 0, true, true, true, true));
-            assertEquals(CompactionIoBudget.State.RECOVERY, p.state());
+            assertEquals(CompactionIoBudget.State.UNLIMITED, p.state(), "a stop: the limiter is open, the budget kept");
             assertEquals(service, p.budget());
             assertEquals(0, p.readaheadBytes());
             long size = p.readaheadBytes();
@@ -382,6 +383,10 @@ class CompactionReadaheadTest {
         assertEquals(true, worth.invoke(null, 1_000_000L, 1_050_000L, false));
         assertEquals(true, worth.invoke(null, 1_000_000L, 700_000L, false));
         assertEquals(true, worth.invoke(null, 1_000_000L, 1_000_001L, true), "under urgent pressure every change counts");
+        long unlimited = CompactionIoBudget.UNLIMITED_BYTES_PER_SECOND;
+        assertEquals(true, worth.invoke(null, 1_000_000L, unlimited, true));
+        assertEquals(true, worth.invoke(null, unlimited - unlimited / 50, unlimited, true), "a stall is urgent at any distance");
+        assertEquals(true, worth.invoke(null, unlimited, 1_000_000L, true));
 
         // A real limiter under the controller: background I/O at 8 MB/s, three decreases after slow reads, then
         // compaction debt that rises by 0.2% per poll and takes the floor (and the budget) up a little every second.
@@ -439,6 +444,74 @@ class CompactionReadaheadTest {
             // The floor passes the 2.744 MB/s budget at about a quarter of the way; from there the budget moves every poll.
             assertTrue(steps >= 150, "the budget moved at " + steps + " polls");
             assertTrue(writes >= 10 && writes <= 30, "the limiter was written " + writes + " times");
+            assertEquals(0, registry.get("rockserver.compaction.io.adjustment.failures").gauge().value());
+        } finally { registry.close(); }
+    }
+
+    @Test void aWriteStallOpensTheRealLimiterInThePollThatSeesItAndTheBudgetReturnsAfterTheHold() throws Exception {
+        RocksDBLoader.loadLibrary();
+        long seed = 1_000_000, unlimited = CompactionIoBudget.UNLIMITED_BYTES_PER_SECOND;
+        var registry = new SimpleMeterRegistry();
+        var script = new Object() {
+            long nanos = System.nanoTime(), bytes, points, pointNanos, rate, latency = 100;
+            boolean stopped, delayed;
+            CompactionIoBudget.Sample next() {
+                nanos += 1_000_000_000L; bytes += rate; points += 40; pointNanos += 40 * latency * 1000;
+                boolean stall = stopped || delayed;
+                return new CompactionIoBudget.Sample(nanos, 0, 0, bytes, rate > 0, stall, stopped, true, true, points, !stall, stall,
+                        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, false, latency, 0, points, 0, 0, pointNanos)
+                        .withWriteDelayed(delayed);
+            }
+        };
+        var constructor = Class.forName("it.cavallium.rockserver.core.impl.CompactionIoController")
+                .getDeclaredConstructor(String.class, RateLimiter.class, java.util.function.Supplier.class,
+                        io.micrometer.core.instrument.MeterRegistry.class, long.class,
+                        java.util.function.LongUnaryOperator.class, boolean.class);
+        constructor.setAccessible(true);
+        try (var limiter = new RateLimiter(seed, 100_000, RateLimiter.DEFAULT_FAIRNESS, org.rocksdb.RateLimiterMode.ALL_IO, false);
+             var controller = (AutoCloseable) constructor.newInstance("write-stall", limiter,
+                     (java.util.function.Supplier<CompactionIoBudget.Sample>) script::next, registry, 0L,
+                     (java.util.function.LongUnaryOperator) size -> size, false)) {
+            var executorField = controller.getClass().getDeclaredField("executor"); executorField.setAccessible(true);
+            var executor = (ScheduledExecutorService) executorField.get(controller);
+            var pollField = controller.getClass().getDeclaredField("poll"); pollField.setAccessible(true);
+            var poll = (Runnable) pollField.get(controller);
+            var budget = registry.get("rockserver.compaction.io.budget").gauge();
+            var state = registry.get("rockserver.compaction.io.state").gauge();
+            executor.submit(poll).get(5, TimeUnit.SECONDS);
+            // Five saturated healthy windows (1, 2, 4, 8, 16 MB/s), then a background of a quarter of the budget.
+            for (int window = 0; window < 8; window++) {
+                script.rate = window < 5 ? limiter.getBytesPerSecond() : 4 * seed;
+                for (int i = 0; i < 5; i++) executor.submit(poll).get(5, TimeUnit.SECONDS);
+            }
+            assertEquals(CompactionIoBudget.State.TRACKING.ordinal(), state.value());
+            assertEquals(16 * seed, limiter.getBytesPerSecond());
+            for (boolean delayed : new boolean[]{true, false}) {
+                long before = (long) budget.value();
+                script.delayed = delayed; script.stopped = !delayed;
+                script.rate = 60 * seed; script.latency = 2000;
+                executor.submit(poll).get(5, TimeUnit.SECONDS);
+                assertEquals(unlimited, limiter.getBytesPerSecond(), "in the poll that saw writes " + (delayed ? "delayed" : "stopped"));
+                // rate x refill period / 1,000,000 in the native limiter, without overflow.
+                assertEquals(unlimited / 10, limiter.getSingleBurstBytes());
+                assertEquals(CompactionIoBudget.State.UNLIMITED.ordinal(), state.value());
+                assertEquals(before, budget.value(), "the budget gauge is the rate the limiter returns to");
+                for (int i = 0; i < 12; i++) {
+                    executor.submit(poll).get(5, TimeUnit.SECONDS);
+                    assertEquals(unlimited, limiter.getBytesPerSecond());
+                }
+                script.delayed = script.stopped = false;
+                for (int i = 0; i < 10; i++) {
+                    executor.submit(poll).get(5, TimeUnit.SECONDS);
+                    assertEquals(unlimited, limiter.getBytesPerSecond(), "clear poll " + i + " of the hold");
+                }
+                script.rate = 4 * seed; script.latency = 100;
+                executor.submit(poll).get(5, TimeUnit.SECONDS);
+                assertEquals(before, limiter.getBytesPerSecond(), "the budget in force before the stall, written exactly");
+                assertEquals(before / 10, limiter.getSingleBurstBytes());
+                assertEquals(CompactionIoBudget.State.RECOVERY.ordinal(), state.value());
+                assertEquals(before, budget.value());
+            }
             assertEquals(0, registry.get("rockserver.compaction.io.adjustment.failures").gauge().value());
         } finally { registry.close(); }
     }

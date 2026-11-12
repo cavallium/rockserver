@@ -5,8 +5,28 @@ public final class CompactionIoBudget {
     public static final long MIN_BYTES_PER_SECOND = 4096 * 10; // one aligned page per 100ms refill
     public static final long MAX_BYTES_PER_SECOND = Long.MAX_VALUE / 1_000_000;
     public static final long MAX_READAHEAD_BYTES = 16L << 20;
-    /** PROBE: the budget was lowered and the next windows decide whether the lower rate is kept (see beginProbe). */
-    public enum State { BOOTSTRAP, TRACKING, PROBE, RECOVERY }
+    /**
+     * The limiter's rate while writes are stopped or delayed: no flush or compaction ever waits for a token at it.
+     * The native limiter computes rate x refill period (microseconds) / 1,000,000 in 64 bits: at this value the
+     * product stays under 2^63 for every refill period up to 1 s (the limiter here is built with 100 ms, where one
+     * refill is 859 GiB), so it does not depend on the native overflow guard. Never 0: the native side divides by
+     * the rate.
+     */
+    public static final long UNLIMITED_BYTES_PER_SECOND = MAX_BYTES_PER_SECOND;
+    /**
+     * PROBE: the budget was lowered and the next windows decide whether the lower rate is kept (see beginProbe).
+     * UNLIMITED: writes are stopped or delayed, or were in the last {@link #STALL_HOLD_NANOS}: the limiter is at
+     * {@link #UNLIMITED_BYTES_PER_SECOND} and the budget is kept for afterwards (see {@link #sample}).
+     */
+    public enum State { BOOTSTRAP, TRACKING, PROBE, RECOVERY, UNLIMITED }
+    /**
+     * How long the limiter stays unlimited after the last poll that saw writes stopped or delayed: two decision
+     * windows without a stall, the same evidence RECOVERY asks for before it ends. RocksDB re-evaluates the stall
+     * at every flush and compaction that completes, so around the trigger the flag changes within seconds, and a
+     * limiter that closed on the first clear poll would throttle again the flush and the compactions that are
+     * clearing the stall. The time is measured between polls that both saw no stall.
+     */
+    static final long STALL_HOLD_NANOS = 10_000_000_000L;
     /**
      * Multiplicative decrease on measured foreground harm, applied to the background rate actually achieved in the
      * harmful window (not to the budget, which may be twice that): it removes the slack and cuts the real rate by
@@ -42,7 +62,27 @@ public final class CompactionIoBudget {
                          long bulkCount, long bulkMicros, long bulkKeys, int readWorkers, int readActive,
                          int latencyReadActive, int latencyReadQueued, long readCompletions, boolean bulkPending,
                          long pointTailMicros, long bulkTailMicros, long nativePointCompletions, long nativeBulkCompletions, long nativeBulkKeys, long nativePointReadNanos, long bulkFoundKeys, long bulkReturnedBytes, long readFailures, long readAccepted, long readTerminalOutcomes, long readNonRunOutcomes, int readTopologyWorkers,
-                         double compactionDebt) {
+                         double compactionDebt, boolean writeDelayed) {
+        /**
+         * The pressure flags, as {@code EmbeddedDBStorageMetrics.sampleCompactionIo} sets them: {@code stopped} is
+         * {@code rocksdb.is-write-stopped}; {@code writeDelayed} is {@code rocksdb.actual-delayed-write-rate != 0}
+         * (the write controller delays writes); {@code urgentPressure} is either of them, or a column with L0 files
+         * at its slowdown trigger, or (max write buffers <= 3) one immutable memtable short of a stop, which with
+         * the default of 2 is every flush in progress; {@code pressure} adds pending compaction bytes at the soft
+         * limit. While {@code stopped || writeDelayed} RocksDB gives new compaction output the limiter priority
+         * IO_USER, above a flush that started earlier at IO_HIGH: only those two make the limiter unlimited.
+         */
+        public boolean writeStalled() { return stopped || writeDelayed; }
+        public Sample withWriteDelayed(boolean delayed) {
+            return new Sample(nanos, readCount, readMicros, bytes, background, pressure, stopped, valid,
+                    foregroundPending, foregroundCompletions, recoveryClear, urgentPressure,
+                    compactionReadBytes, compactionReadMicros, compactionReadCount, prefetchCount, prefetchBytes,
+                    bulkCount, bulkMicros, bulkKeys, readWorkers, readActive, latencyReadActive, latencyReadQueued,
+                    readCompletions, bulkPending, pointTailMicros, bulkTailMicros, nativePointCompletions,
+                    nativeBulkCompletions, nativeBulkKeys, nativePointReadNanos, bulkFoundKeys, bulkReturnedBytes,
+                    readFailures, readAccepted, readTerminalOutcomes, readNonRunOutcomes, readTopologyWorkers,
+                    compactionDebt, delayed);
+        }
         /**
          * {@code compactionDebt}: how close the worst column is to the point where RocksDB starts to delay writes,
          * 0 (none) to 1 (there): the larger of pending compaction bytes / soft pending compaction bytes limit and
@@ -55,7 +95,26 @@ public final class CompactionIoBudget {
                     bulkCount, bulkMicros, bulkKeys, readWorkers, readActive, latencyReadActive, latencyReadQueued,
                     readCompletions, bulkPending, pointTailMicros, bulkTailMicros, nativePointCompletions,
                     nativeBulkCompletions, nativeBulkKeys, nativePointReadNanos, bulkFoundKeys, bulkReturnedBytes,
-                    readFailures, readAccepted, readTerminalOutcomes, readNonRunOutcomes, readTopologyWorkers, debt);
+                    readFailures, readAccepted, readTerminalOutcomes, readNonRunOutcomes, readTopologyWorkers, debt,
+                    writeDelayed);
+        }
+        public Sample(long nanos, long readCount, long readMicros, long bytes,
+                         boolean background, boolean pressure, boolean stopped, boolean valid,
+                         boolean foregroundPending, long foregroundCompletions, boolean recoveryClear,
+                         boolean urgentPressure, long compactionReadBytes, long compactionReadMicros,
+                         long compactionReadCount, long prefetchCount, long prefetchBytes,
+                         long bulkCount, long bulkMicros, long bulkKeys, int readWorkers, int readActive,
+                         int latencyReadActive, int latencyReadQueued, long readCompletions, boolean bulkPending,
+                         long pointTailMicros, long bulkTailMicros, long nativePointCompletions, long nativeBulkCompletions, long nativeBulkKeys, long nativePointReadNanos, long bulkFoundKeys, long bulkReturnedBytes, long readFailures, long readAccepted, long readTerminalOutcomes, long readNonRunOutcomes, int readTopologyWorkers,
+                         double compactionDebt) {
+            this(nanos, readCount, readMicros, bytes, background, pressure, stopped, valid,
+                    foregroundPending, foregroundCompletions, recoveryClear, urgentPressure,
+                    compactionReadBytes, compactionReadMicros, compactionReadCount, prefetchCount, prefetchBytes,
+                    bulkCount, bulkMicros, bulkKeys, readWorkers, readActive, latencyReadActive, latencyReadQueued,
+                    readCompletions, bulkPending, pointTailMicros, bulkTailMicros, nativePointCompletions,
+                    nativeBulkCompletions, nativeBulkKeys, nativePointReadNanos, bulkFoundKeys, bulkReturnedBytes,
+                    readFailures, readAccepted, readTerminalOutcomes, readNonRunOutcomes, readTopologyWorkers,
+                    compactionDebt, false);
         }
         public Sample(long nanos, long readCount, long readMicros, long bytes,
                          boolean background, boolean pressure, boolean stopped, boolean valid,
@@ -258,6 +317,9 @@ public final class CompactionIoBudget {
     private volatile long budget;
     private volatile long shutdownBudget;
     private volatile State state = State.BOOTSTRAP;
+    /** In UNLIMITED: whether the last poll saw no stall, and the time of the first such poll since the last stall. */
+    private boolean stallClear;
+    private long stallClearSince;
     private Sample previous;
     private long windowNanos, reads, pointNanos, bytes;
     private boolean background, pressuredWindow, pendingForeground, noProgressProbeUsed;
@@ -311,7 +373,15 @@ public final class CompactionIoBudget {
         this.seed = bound(seed);
         budget = shutdownBudget = floor = this.seed;
     }
+    /**
+     * The budget of the control law. It is the limiter's rate in every state but UNLIMITED, where it is the rate
+     * the limiter returns to (see {@link #rateBytesPerSecond}).
+     */
     public long budget() { return budget; }
+    /** The rate for the limiter, as the last {@link #sample} returned it. Never under {@link #MIN_BYTES_PER_SECOND}. */
+    public long rateBytesPerSecond() {
+        return state == State.UNLIMITED ? UNLIMITED_BYTES_PER_SECOND : Math.max(MIN_BYTES_PER_SECOND, budget);
+    }
     public long readaheadBytes() { return readaheadBytes; }
     void readaheadApplied(long bytes) {
         if (bytes < 0 || bytes > readaheadCeiling) throw new IllegalArgumentException("Invalid applied readahead");
@@ -367,6 +437,20 @@ public final class CompactionIoBudget {
         bulkFoundKeys = bulkReturnedBytes = readAccepted = readTerminalOutcomes = 0; bulkContentValid = true;
     }
 
+    /**
+     * One poll. Returns the rate for the limiter: the budget, or {@link #UNLIMITED_BYTES_PER_SECOND} from the first
+     * poll that sees writes stopped or delayed until {@link #STALL_HOLD_NANOS} of polls without it.
+     * <p>While unlimited the limiter is by definition not the bottleneck, and reads are expected to be slow (the
+     * burst that clears the stall takes the device): those polls are dropped. No window is formed from them, so
+     * no rate, capacity, baseline, reference or harm is learned, and the budget does not move. The poll that ends
+     * the hold is dropped too (the interval it closes was still unlimited). The limiter then returns to the
+     * budget RECOVERY set when the pressure began: the larger of the budget in force before it, the seed and the
+     * last background service measured under the limiter. Not the floor, and nothing from the stall: the rate
+     * reached without a limit is the device's with reads starved, not one to run at. From there the law of RECOVERY
+     * goes on (no decrease; x2 per saturated window under pressure; after 2 windows without pressure BOOTSTRAP
+     * takes a new baseline), so no window is compared with a baseline until at least 2 windows after the limiter
+     * came back, and never with the baseline from before the stall.
+     */
     public long sample(Sample sample) {
         var old = previous;
         previous = sample;
@@ -374,9 +458,10 @@ public final class CompactionIoBudget {
                 && (sample.nativePointCompletions < 0 || sample.nativePointReadNanos < 0
                     || sample.nativePointCompletions < old.nativePointCompletions
                     || sample.nativePointReadNanos < old.nativePointReadNanos);
-        boolean nativePressure = sample.urgentPressure || sample.stopped;
+        boolean stalled = sample.writeStalled();
+        boolean nativePressure = sample.urgentPressure || stalled;
         if (sample.stopped) reduceReadahead(0);
-        if (nativePressure && state != State.RECOVERY) {
+        if (nativePressure && state != State.RECOVERY && state != State.UNLIMITED) {
             // Restore useful measured service once; repeated stalled polls must not ramp.
             state = State.RECOVERY;
             healthyRecovery = 0;
@@ -390,6 +475,18 @@ public final class CompactionIoBudget {
             budget = bound(Math.max(Math.max(seed, usefulService), budget));
             probeBudget = 0;
             clearWindow();
+        }
+        // Whether the limiter was unlimited in the interval this poll closes, or is from this poll on.
+        boolean unlimited = stalled || state == State.UNLIMITED;
+        if (stalled) {
+            state = State.UNLIMITED;
+            stallClear = false;
+        } else if (unlimited) {
+            if (!stallClear) { stallClear = true; stallClearSince = sample.nanos; }
+            if (sample.nanos - stallClearSince >= STALL_HOLD_NANOS) {
+                state = State.RECOVERY; // At the budget kept since the pressure began; its windows start after this poll.
+                healthyRecovery = 0;
+            }
         }
         if (!sample.valid || old == null || !old.valid || sample.nanos <= old.nanos
                 || pointEpochFailure || sample.readTopologyWorkers < 0 || sample.bytes < 0 || sample.foregroundCompletions < 0
@@ -416,6 +513,10 @@ public final class CompactionIoBudget {
             return publishBudget();
         }
         observeDebt(sample);
+        if (unlimited) {
+            dropUnlimitedPoll();
+            return publishBudget();
+        }
         long elapsed = sample.nanos - old.nanos;
         observeReadService(sample, old, elapsed);
         accumulateBulk(sample, old, elapsed);
@@ -684,6 +785,21 @@ public final class CompactionIoBudget {
         if (cooldown > 0) cooldown--;
         if (harmCooldown > 0) harmCooldown--;
         return publishBudget();
+    }
+    /**
+     * A poll over an interval in which the limiter was unlimited: nothing is measured, and what is counted over
+     * consecutive windows or polls starts again after it.
+     */
+    private void dropUnlimitedPoll() {
+        clearWindow();
+        clearReadWindow();
+        foregroundHealthy = false;
+        lastPointMean = 0;
+        harmWindows = stableLoadedWindows = queueBadPolls = 0;
+        pointReferenceWindows = 0; pointReferenceMax = 0;
+        bulkReferenceWindows = bulkCalibrationWindows = bulkIdleWindows = readClearWindows = 0;
+        queueReferenceWindows = 0; probeQueueProtected = false;
+        resetTailBlocks();
     }
     /** Every valid poll: the floor follows the debt up and down; the budget follows the floor up at once. */
     private void observeDebt(Sample sample) {
@@ -1098,7 +1214,7 @@ public final class CompactionIoBudget {
         reduceReadahead(admissionReadaheadLimit());
         shutdownBudget = bound(Math.max(Math.max(seed, budget),
                 Math.max(Math.max(preThrottle, probeBudget), recentAchieved)));
-        return budget;
+        return rateBytesPerSecond();
     }
     /**
      * The point baseline after a healthy window with background I/O. The 10% moving average takes the noise of 5 s

@@ -333,6 +333,8 @@ final class EmbeddedDBStorageMetrics {
 		boolean stopped = false;
 		boolean pressure = false;
 		boolean urgentPressure = false;
+		// The write controller delays writes: with stopped, the two states in which the limiter must not limit.
+		boolean writeDelayed = false;
 		// Worst column's distance to the write slowdown triggers, 0 to 1: the limiter's floor rises with it.
 		double compactionDebt = 0;
 		try {
@@ -340,7 +342,8 @@ final class EmbeddedDBStorageMetrics {
 			if (observer != null) observer.run();
 			var nativeDb = edb.db.get();
 			stopped = nativeDb.getLongProperty(EmbeddedDB.ROCKSDB_IS_WRITE_STOPPED_PROPERTY) != 0;
-			urgentPressure = stopped || nativeDb.getLongProperty(EmbeddedDB.ROCKSDB_ACTUAL_DELAYED_WRITE_RATE_PROPERTY) != 0;
+			writeDelayed = nativeDb.getLongProperty(EmbeddedDB.ROCKSDB_ACTUAL_DELAYED_WRITE_RATE_PROPERTY) != 0;
+			urgentPressure = stopped || writeDelayed;
 			pressure = urgentPressure;
 			boolean recoveryClear = !pressure;
 			// Unlike admission polling, inspect every column even after a pressure trigger.
@@ -413,12 +416,12 @@ final class EmbeddedDBStorageMetrics {
 						readPoolTelemetry[RWScheduler.POOL_TELEMETRY_ACCEPTED_TASKS],
 						readPoolTelemetry[RWScheduler.POOL_TELEMETRY_TERMINAL_OUTCOMES],
 						readPoolTelemetry[RWScheduler.POOL_TELEMETRY_NON_RUN_OUTCOMES], readTopologyWorkers,
-						Math.min(1, compactionDebt));
+						Math.min(1, compactionDebt), writeDelayed);
 			}
 		} catch (org.rocksdb.RocksDBException failure) {
 			if (pressure || urgentPressure) {
 				return new CompactionIoBudget.Sample(System.nanoTime(), 0, 0, 0,
-						false, pressure, stopped, false, false, 0, false, urgentPressure);
+						false, pressure, stopped, false, false, 0, false, urgentPressure).withWriteDelayed(writeDelayed);
 			}
 			throw new RuntimeException(failure);
 		} finally { edb.ops.endOp(); }

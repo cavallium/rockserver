@@ -21,13 +21,30 @@ class CompactionIoBudgetTest {
         double debt;
         Trace() { this(FLOOR); }
         Trace(long seed) { policy = new CompactionIoBudget(seed); poll(0, 0, 0, false, false); }
+        /** {@code pressure}: urgent pressure that is not a write stall (a column one memtable short of a stop). */
         long poll(long count, long latency, long transferred, boolean pressure, boolean pending) {
+            return poll(count, latency, transferred, pressure, false, false, pending);
+        }
+        /** {@code stopped}, {@code delayed}: what RocksDB reports of its write controller; either is a write stall. */
+        long poll(long count, long latency, long transferred, boolean urgent, boolean stopped, boolean delayed, boolean pending) {
+            boolean pressure = urgent || stopped || delayed;
             nanos += 1_000_000_000L; reads += count; micros += count * latency; bytes += transferred;
             if (point) { nativePoints += count; if (timed) nativeNanos += count * latency * 1000; }
             return policy.sample(new CompactionIoBudget.Sample(nanos, reads, micros, bytes,
-                    transferred > 0, pressure, pressure, true, pending, completions, !pressure, pressure,
+                    transferred > 0, pressure, stopped, true, pending, completions, !pressure, pressure,
                     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, false,
-                    point ? Math.max(latency, pointMax) : 0, 0, nativePoints, 0, 0, nativeNanos).withCompactionDebt(debt));
+                    point ? Math.max(latency, pointMax) : 0, 0, nativePoints, 0, 0, nativeNanos)
+                    .withCompactionDebt(debt).withWriteDelayed(delayed));
+        }
+        /** A poll with writes stopped ({@code delayed}: delayed), reads at {@code latency}, background at {@code transferred}. */
+        long stall(boolean delayed, long latency, long transferred) {
+            completions += 10;
+            return poll(10, latency, transferred, false, !delayed, delayed, true);
+        }
+        /** A poll without pressure. */
+        long clear(long latency, long transferred) {
+            completions += 10;
+            return poll(10, latency, transferred, false, true);
         }
         void window(long count, long latency, long transferred) {
             for (int i = 0; i < 5; i++) {
@@ -138,7 +155,7 @@ class CompactionIoBudgetTest {
             assertEquals(1_000_000, t.policy.budget());
         }
     }
-    @Test void nativeStopRestoresFiniteServiceWithoutRunawayWhenNoIoCompletes() {
+    @Test void urgentPressureRestoresFiniteServiceWithoutRunawayWhenNoIoCompletes() {
         var t = new Trace(); t.window(10, 100, SEED);
         long restored = t.poll(0, 0, 0, true, false);
         assertEquals(1_000_000, restored);
@@ -155,9 +172,11 @@ class CompactionIoBudgetTest {
     }
     @Test void observedStopOverridesPartialSampleAndRecoveryRequiresUrgentClearance() {
         var p = new CompactionIoBudget(SEED);
-        p.sample(new CompactionIoBudget.Sample(1, 0, 0, 0, false, true, true, false));
-        assertEquals(CompactionIoBudget.State.RECOVERY, p.state());
-        for (int i = 1; i < 20; i++) p.sample(new CompactionIoBudget.Sample(i * 1_000_000_000L,
+        assertEquals(CompactionIoBudget.UNLIMITED_BYTES_PER_SECOND,
+                p.sample(new CompactionIoBudget.Sample(1, 0, 0, 0, false, true, true, false)));
+        assertEquals(CompactionIoBudget.State.UNLIMITED, p.state());
+        // 10 s of polls without the stop, then the two windows without urgent pressure that end RECOVERY.
+        for (int i = 1; i < 23; i++) p.sample(new CompactionIoBudget.Sample(i * 1_000_000_000L,
                 0, 0, 0, false, false, false, true, false, 0, false));
         assertEquals(CompactionIoBudget.State.BOOTSTRAP, p.state(),
                 "soft hysteresis alone must not retain urgent recovery");
@@ -368,7 +387,7 @@ class CompactionIoBudgetTest {
             var random = new java.util.Random(seed);
             var t = new Trace(seed);
             long rate = seed, latency = 100;
-            boolean pressure = false, raised = false;
+            boolean pressure = false, raised = false, unlimited = false;
             for (int second = 0; second < 20_000; second++) {
                 if (random.nextInt(5) == 0) {
                     rate = switch (random.nextInt(6)) {
@@ -385,11 +404,17 @@ class CompactionIoBudgetTest {
                 }
                 long count = random.nextInt(4) == 0 ? 0 : 10;
                 t.completions += count;
+                long applied;
                 if (random.nextInt(200) == 0) {
-                    t.policy.sample(new CompactionIoBudget.Sample(t.nanos + 1, 0, 0, 0, false, pressure, pressure, false));
-                } else t.poll(count, latency, rate, pressure, random.nextBoolean());
+                    applied = t.policy.sample(new CompactionIoBudget.Sample(t.nanos + 1, 0, 0, 0, false, pressure, pressure, false));
+                } else applied = t.poll(count, latency, rate, pressure, pressure && second % 3 == 0,
+                        pressure && second % 3 == 1, random.nextBoolean());
                 assertTrue(t.policy.budget() >= seed, "seed " + seed + " second " + second + " budget "
                         + t.policy.budget() + " in " + t.policy.state());
+                // What goes to the limiter: the budget or the unlimited rate, so never under the seed and never 0.
+                assertEquals(t.policy.state() == CompactionIoBudget.State.UNLIMITED
+                        ? CompactionIoBudget.UNLIMITED_BYTES_PER_SECOND : t.policy.budget(), applied);
+                unlimited |= applied == CompactionIoBudget.UNLIMITED_BYTES_PER_SECOND;
                 assertTrue(t.policy.shutdownBudget() >= seed);
                 // The floor that compaction debt raises: never under the seed, and the budget never under it.
                 long floor = t.policy.floorBytesPerSecond();
@@ -398,18 +423,20 @@ class CompactionIoBudgetTest {
                 raised |= floor > seed;
             }
             assertTrue(raised, "the trace must raise the floor above the seed");
+            assertTrue(unlimited, "the trace must stall writes");
         }
     }
     @Test void urgentPressureAlwaysWins() {
         // Whatever the controller was doing (growing, testing a reduction after slow reads, waiting after RECOVERY):
-        // a poll with delayed or stopped writes puts it in RECOVERY with a budget not under the one in force, and
-        // nothing lowers the budget while the pressure lasts.
+        // a poll under urgent pressure puts it in RECOVERY with a budget not under the one in force, and nothing
+        // lowers the budget while the pressure lasts. When the pressure is a write stall (stopped or delayed
+        // writes) the limiter is unlimited in that poll, and the same holds for the budget kept for afterwards.
         for (long seed : new long[]{CompactionIoBudget.MIN_BYTES_PER_SECOND, 300_000, SEED, 64 * SEED}) {
             var random = new java.util.Random(seed + 1);
             var t = new Trace(seed);
             long rate = seed, latency = 100;
             boolean pressure = false;
-            int entries = 0, fromReduced = 0;
+            int entries = 0, fromReduced = 0, kind = 0, stalls = 0;
             for (int second = 0; second < 40_000; second++) {
                 if (random.nextInt(5) == 0) {
                     rate = switch (random.nextInt(5)) {
@@ -419,23 +446,209 @@ class CompactionIoBudgetTest {
                         default -> t.policy.budget();
                     };
                     latency = random.nextInt(3) == 0 ? 400 : 100;
-                    pressure = random.nextInt(pressure ? 3 : 60) == 0 ? !pressure : pressure;
+                    if (random.nextInt(pressure ? 3 : 60) == 0) { pressure = !pressure; kind = random.nextInt(3); }
                 }
-                long before = t.policy.budget();
+                boolean stopped = pressure && kind == 1, delayed = pressure && kind == 2;
+                long before = t.policy.budget(), applied;
                 var stateBefore = t.policy.state();
                 t.completions += 10;
                 if (random.nextInt(100) == 0) {
-                    t.policy.sample(new CompactionIoBudget.Sample(t.nanos + 1, 0, 0, 0, false, pressure, pressure, false));
-                } else t.poll(10, latency, rate, pressure, true);
-                if (!pressure) continue;
+                    applied = t.policy.sample(new CompactionIoBudget.Sample(t.nanos + 1, 0, 0, 0, false, pressure, stopped, false)
+                            .withWriteDelayed(delayed));
+                } else applied = t.poll(10, latency, rate, pressure, stopped, delayed, true);
                 String at = "seed " + seed + " second " + second + " from " + stateBefore;
-                assertEquals(CompactionIoBudget.State.RECOVERY, t.policy.state(), at);
+                var state = t.policy.state();
+                assertEquals(state == CompactionIoBudget.State.UNLIMITED ? CompactionIoBudget.UNLIMITED_BYTES_PER_SECOND
+                        : t.policy.budget(), applied, at);
+                // The hold after a stall ends in RECOVERY, with or without urgent pressure, and nowhere else.
+                if (stateBefore == CompactionIoBudget.State.UNLIMITED)
+                    assertTrue(state == CompactionIoBudget.State.UNLIMITED || state == CompactionIoBudget.State.RECOVERY, at);
+                if (!pressure) continue;
+                if (stopped || delayed) assertEquals(CompactionIoBudget.State.UNLIMITED, state, at);
+                else if (stateBefore != CompactionIoBudget.State.UNLIMITED) assertEquals(CompactionIoBudget.State.RECOVERY, state, at);
                 assertTrue(t.policy.budget() >= before, at + ": " + before + " -> " + t.policy.budget());
-                if (stateBefore != CompactionIoBudget.State.RECOVERY) entries++;
+                if (stateBefore != CompactionIoBudget.State.RECOVERY && stateBefore != CompactionIoBudget.State.UNLIMITED) entries++;
                 if (stateBefore == CompactionIoBudget.State.PROBE) fromReduced++;
+                if (state == CompactionIoBudget.State.UNLIMITED && stateBefore != state) stalls++;
             }
-            assertTrue(entries > 50 && fromReduced > 0, "entries " + entries + ", from a reduced budget " + fromReduced);
+            assertTrue(entries > 50 && fromReduced > 0 && stalls > 50,
+                    "entries " + entries + ", from a reduced budget " + fromReduced + ", stalls " + stalls);
         }
+    }
+    private static final long UNLIMITED = CompactionIoBudget.UNLIMITED_BYTES_PER_SECOND;
+    /** TRACKING at 16 MB/s after five saturated healthy windows, with a background that then uses a quarter of it. */
+    private static Trace trackingAtSixteen() {
+        var t = new Trace(SEED);
+        for (int i = 0; i < 5; i++) t.window(10, 100, t.policy.budget());
+        for (int i = 0; i < 3; i++) t.window(10, 100, 4 * SEED);
+        assertEquals(CompactionIoBudget.State.TRACKING, t.policy.state());
+        assertEquals(16 * SEED, t.policy.budget());
+        assertEquals(100, t.policy.baselineReadMicros(), 1e-9);
+        return t;
+    }
+    @Test void aStopOrADelayAtAnyPollOfAWindowOpensTheLimiterInThatPoll() {
+        for (boolean delayed : new boolean[]{false, true}) {
+            for (int offset = 0; offset < 5; offset++) {
+                var t = trackingAtSixteen();
+                for (int i = 0; i < offset; i++) assertEquals(16 * SEED, t.clear(100, 4 * SEED));
+                String at = (delayed ? "delayed" : "stopped") + " at poll " + offset + " of the window";
+                assertEquals(UNLIMITED, t.stall(delayed, 100, 4 * SEED), at);
+                assertEquals(CompactionIoBudget.State.UNLIMITED, t.policy.state(), at);
+                assertEquals(UNLIMITED, t.policy.rateBytesPerSecond(), at);
+                assertEquals(16 * SEED, t.policy.budget(), "the budget is kept for afterwards");
+            }
+        }
+        // The first poll of a database, with a sample that is otherwise unusable.
+        for (boolean delayed : new boolean[]{false, true}) {
+            var p = new CompactionIoBudget(SEED);
+            assertEquals(UNLIMITED, p.sample(new CompactionIoBudget.Sample(1, 0, 0, 0, false, true, !delayed, false)
+                    .withWriteDelayed(delayed)));
+            assertEquals(SEED, p.budget());
+        }
+        // Not for urgent pressure that is not a stall (with 2 write buffers: every flush in progress), which
+        // keeps the law of RECOVERY, nor for pending compaction bytes at the soft limit alone.
+        var t = trackingAtSixteen();
+        assertEquals(16 * SEED, t.poll(10, 100, 4 * SEED, true, true));
+        assertEquals(CompactionIoBudget.State.RECOVERY, t.policy.state());
+        assertTrue(UNLIMITED > 0 && UNLIMITED <= Long.MAX_VALUE / 1_000_000,
+                "rate x refill period in microseconds must fit 64 bits for every period up to 1 s");
+    }
+    @Test void theLimiterStaysOpenWhileTheStallLastsAndForTenSecondsOfClearPollsAfterIt() {
+        for (boolean delayed : new boolean[]{false, true}) {
+            var t = trackingAtSixteen();
+            // Unlimited, the background moves 60 MB/s and reads are 20x slower: neither is evidence of anything.
+            for (int i = 0; i < 37; i++) {
+                assertEquals(UNLIMITED, t.stall(delayed, 2000, 60 * SEED), "stalled poll " + i);
+                assertEquals(16 * SEED, t.policy.budget());
+            }
+            for (int i = 1; i <= 10; i++) {
+                assertEquals(UNLIMITED, t.clear(2000, 60 * SEED), "clear poll " + i + " of the hold");
+                assertEquals(CompactionIoBudget.State.UNLIMITED, t.policy.state());
+            }
+            assertEquals(16 * SEED, t.clear(2000, 60 * SEED), "10 s between two polls without a stall: the budget returns");
+            assertEquals(CompactionIoBudget.State.RECOVERY, t.policy.state());
+        }
+    }
+    @Test void afterAStallTheLimiterReturnsToTheBudgetInForceBeforeIt() {
+        // From TRACKING above the last measured service: that budget, not the floor, not the 60 MB/s of the burst.
+        var t = trackingAtSixteen();
+        for (int i = 0; i < 20; i++) t.stall(i % 2 == 0, 2000, 60 * SEED);
+        long returned = UNLIMITED;
+        for (int i = 0; i < 11; i++) returned = t.clear(2000, 60 * SEED);
+        assertEquals(16 * SEED, returned);
+        assertEquals(SEED, t.policy.floorBytesPerSecond());
+        // From a reduction under test: the budget before the reduction (what RECOVERY restores), not the reduced one.
+        var reduced = new Trace();
+        reduced.window(10, 100, SEED);
+        assertEquals(CompactionIoBudget.State.PROBE, reduced.policy.state());
+        assertEquals(SEED * 3 / 4, reduced.policy.budget());
+        assertEquals(UNLIMITED, reduced.stall(true, 100, SEED));
+        assertEquals(SEED, reduced.policy.budget());
+        for (int i = 0; i < 10; i++) assertEquals(UNLIMITED, reduced.clear(100, SEED));
+        assertEquals(SEED, reduced.clear(100, SEED));
+        // From the seed, before anything was measured: the seed.
+        var fresh = new Trace(SEED);
+        assertEquals(UNLIMITED, fresh.stall(false, 100, 60 * SEED));
+        for (int i = 0; i < 10; i++) assertEquals(UNLIMITED, fresh.clear(100, 60 * SEED));
+        assertEquals(SEED, fresh.clear(100, 60 * SEED));
+        // From RECOVERY that doubled under urgent pressure with a saturated limiter: what it had reached.
+        var urgent = new Trace(SEED);
+        for (int i = 0; i < 12; i++) urgent.poll(0, 0, urgent.policy.budget(), true, true);
+        long reached = urgent.policy.budget();
+        assertTrue(reached >= 4 * SEED, "budget " + reached);
+        assertEquals(UNLIMITED, urgent.stall(false, 100, 60 * SEED));
+        for (int i = 0; i < 10; i++) assertEquals(UNLIMITED, urgent.clear(100, 60 * SEED));
+        assertEquals(reached, urgent.clear(100, 60 * SEED));
+    }
+    @Test void nothingIsLearnedWhileTheLimiterIsUnlimitedNorFromTheReadsRightAfter() {
+        var t = trackingAtSixteen();
+        t.debt = 1; // The floor at full debt is the last known background service: it shows what is remembered of it.
+        t.clear(100, 4 * SEED);
+        long budget = t.policy.budget(), known = t.policy.floorBytesPerSecond(), shutdown = t.policy.shutdownBudget();
+        assertTrue(known > SEED && known <= budget, "known service " + known);
+        // 30 s stalled and the 10 s of the hold: every window moves 60 MB/s (over 80% of any budget here, so each
+        // would count as saturated) with reads 20x slower than the baseline.
+        for (int i = 0; i < 41; i++) {
+            if (i == 30) t.debt = 0;
+            long applied = i < 30 ? t.stall(i % 3 == 0, 2000, 60 * SEED) : t.clear(2000, 60 * SEED);
+            String at = "poll " + i;
+            if (i < 40) assertEquals(UNLIMITED, applied, at); else assertEquals(budget, applied, at);
+            assertEquals(budget, t.policy.budget(), at + ": no capacity from an unlimited window");
+            if (i < 30) assertEquals(known, t.policy.floorBytesPerSecond(), at + ": no service from an unlimited window");
+            assertEquals(shutdown, t.policy.shutdownBudget(), at);
+            assertEquals(100, t.policy.baselineReadMicros(), 1e-9, at + ": no baseline from an unlimited window");
+            assertEquals(0, t.policy.harmCeilingBytesPerSecond(), at + ": no harmful rate from an unlimited window");
+            assertTrue(Double.isNaN(t.policy.pointReadMicros()), at + ": no window was completed");
+        }
+        assertEquals(CompactionIoBudget.State.RECOVERY, t.policy.state());
+        // Right after: the limiter is back, reads are still 3x the old baseline while the backlog drains. RECOVERY
+        // compares nothing for two windows, then BOOTSTRAP takes its baseline from the reads as they are.
+        for (int window = 0; window < 2; window++) {
+            t.window(10, 300, 4 * SEED);
+            assertEquals(budget, t.policy.budget());
+        }
+        assertEquals(CompactionIoBudget.State.BOOTSTRAP, t.policy.state());
+        assertEquals(0, t.policy.baselineReadMicros(), "the baseline from before the stall is not used again");
+        t.window(10, 300, 4 * SEED);
+        assertEquals(CompactionIoBudget.State.TRACKING, t.policy.state());
+        assertEquals(300, t.policy.baselineReadMicros(), 1e-9);
+        for (int window = 0; window < 6; window++) {
+            t.window(10, 300 - 30 * window, 4 * SEED);
+            assertEquals(budget, t.policy.budget(), "slow reads after a stall are not harm: window " + window);
+            assertEquals(CompactionIoBudget.State.TRACKING, t.policy.state());
+        }
+        assertEquals(0, t.policy.harmCeilingBytesPerSecond());
+        // The service known afterwards is the budget BOOTSTRAP started from, not the 60 MB/s of the burst.
+        t.debt = 1;
+        t.clear(150, 4 * SEED);
+        assertEquals(budget, t.policy.floorBytesPerSecond());
+        assertEquals(budget, t.policy.budget());
+    }
+    @Test void aStallThatComesAndGoesDoesNotMoveTheLimiterBackAndForth() {
+        // Every other poll, then with gaps of up to 10 clear polls: one opening, no closing.
+        var t = trackingAtSixteen();
+        for (int i = 0; i < 60; i++) {
+            long applied = i % 2 == 0 ? t.stall(i % 4 == 0, 2000, 60 * SEED) : t.clear(2000, 60 * SEED);
+            assertEquals(UNLIMITED, applied, "poll " + i);
+            assertEquals(16 * SEED, t.policy.budget());
+        }
+        for (int gap = 1; gap <= 10; gap++) {
+            for (int i = 0; i < gap; i++) assertEquals(UNLIMITED, t.clear(2000, 60 * SEED), "gap " + gap + " poll " + i);
+            assertEquals(UNLIMITED, t.stall(true, 2000, 60 * SEED));
+        }
+        // Random episodes: the limiter's rate changes twice per stall that is followed by 11 clear polls, never more.
+        var random = new java.util.Random(7);
+        long last = UNLIMITED;
+        int changes = 0, closings = 0, clear = 0;
+        boolean stalled = true;
+        for (int i = 0; i < 20_000; i++) {
+            if (random.nextInt(stalled ? 2 : 9) == 0) stalled = !stalled;
+            boolean open = last == UNLIMITED;
+            long applied = stalled ? t.stall(random.nextBoolean(), 2000, 60 * SEED)
+                    : t.clear(100, open ? 60 * SEED : Math.min(4 * SEED, t.policy.budget()));
+            clear = stalled ? 0 : clear + 1;
+            if (stalled) assertEquals(UNLIMITED, applied, "poll " + i);
+            if ((applied == UNLIMITED) != open) {
+                changes++;
+                if (open) { closings++; assertEquals(11, clear, "poll " + i + ": closed after 10 s without a stall"); }
+            }
+            if (applied != UNLIMITED) assertTrue(clear >= 11, "poll " + i);
+            last = applied;
+        }
+        assertTrue(closings > 100 && changes <= 2 * closings + 1, "changes " + changes + ", closings " + closings);
+    }
+    @Test void anUnusablePollDoesNotCloseAnOpenLimiterBeforeTheHold() {
+        var t = trackingAtSixteen();
+        assertEquals(UNLIMITED, t.stall(false, 100, 4 * SEED));
+        // A sample that could not be completed says nothing of a stall; one whose time does not advance neither.
+        for (int i = 1; i <= 10; i++) {
+            t.nanos += 1_000_000_000L;
+            assertEquals(UNLIMITED, t.policy.sample(new CompactionIoBudget.Sample(t.nanos, 0, 0, 0, false, false, false, false)));
+            assertEquals(UNLIMITED, t.policy.sample(new CompactionIoBudget.Sample(t.nanos, 0, 0, 0, false, false, false, false)));
+        }
+        t.nanos += 1_000_000_000L;
+        assertEquals(16 * SEED, t.policy.sample(new CompactionIoBudget.Sample(t.nanos, 0, 0, 0, false, false, false, false)));
+        assertEquals(CompactionIoBudget.State.RECOVERY, t.policy.state());
     }
     /**
      * Background I/O at 8 MB/s under a 16 MB/s budget; reads are slow while it moves over 3 MB/s, and three
@@ -817,7 +1030,7 @@ class CompactionIoBudgetTest {
 
     @Test void urgentRecoveryYieldsToForegroundCalibrationInsideSoftDebtCorridor() {
         var p = new CompactionIoBudget(SEED);
-        p.sample(new CompactionIoBudget.Sample(0, 0, 0, 0, false, true, true, true));
+        p.sample(new CompactionIoBudget.Sample(0, 0, 0, 0, false, true, false, true));
         for (int second = 1; second <= 15; second++) {
             p.sample(new CompactionIoBudget.Sample(second * 1_000_000_000L,
                     second * 100, second * 600_000, second * (SEED / 4),
@@ -844,7 +1057,7 @@ class CompactionIoBudgetTest {
         t.window(10, 100, SEED);
         assertEquals(CompactionIoBudget.State.PROBE, t.policy.state());
         assertEquals(SEED * 3 / 4, t.policy.budget());
-        t.policy.sample(new CompactionIoBudget.Sample(t.nanos + 1, 0, 0, 0, false, true, true, false));
+        t.policy.sample(new CompactionIoBudget.Sample(t.nanos + 1, 0, 0, 0, false, true, false, false));
         assertEquals(SEED, t.policy.budget(), "the budget in force before the trial: not the trial rate, not the limiter's seed");
         assertEquals(CompactionIoBudget.State.RECOVERY, t.policy.state());
     }
@@ -869,7 +1082,7 @@ class CompactionIoBudgetTest {
         assertEquals(SEED, t.policy.budget());
         assertEquals(CompactionIoBudget.State.RECOVERY, t.policy.state());
         var p = new CompactionIoBudget(SEED);
-        p.sample(new CompactionIoBudget.Sample(0, 0, 0, 0, false, true, true, true));
+        p.sample(new CompactionIoBudget.Sample(0, 0, 0, 0, false, true, false, true));
         for (int second = 1; second <= 12; second++) {
             p.sample(new CompactionIoBudget.Sample(second * 1_000_000_000L, 0, 0, 0,
                     false, false, false, second != 6, false, 0, false));
@@ -884,16 +1097,16 @@ class CompactionIoBudgetTest {
 
     @Test void urgentReentryBeforeCalibrationStaysAtTheFlushFloor() {
         var p = new CompactionIoBudget(SEED);
-        p.sample(new CompactionIoBudget.Sample(0, 0, 0, 0, false, true, true, true));
+        p.sample(new CompactionIoBudget.Sample(0, 0, 0, 0, false, true, false, true));
         for (int second = 1; second <= 15; second++) {
             p.sample(new CompactionIoBudget.Sample(second * 1_000_000_000L, 0, 0, second * (SEED / 4),
-                    true, second <= 5, second <= 5, true, false, 0, false));
+                    true, second <= 5, false, true, false, 0, false));
         }
         assertEquals(CompactionIoBudget.State.BOOTSTRAP, p.state());
         assertEquals(SEED, p.budget());
-        p.sample(new CompactionIoBudget.Sample(16_000_000_000L, 0, 0, 4 * SEED, true, true, true, true));
-        assertEquals(SEED, p.budget(), "a quarter of the seed was what the background asked for while writes were"
-                + " stopped; a stop must not put the limiter under the rate that flushes a memtable in 5 s");
+        p.sample(new CompactionIoBudget.Sample(16_000_000_000L, 0, 0, 4 * SEED, true, true, false, true));
+        assertEquals(SEED, p.budget(), "a quarter of the seed was what the background asked for under pressure;"
+                + " pressure must not put the limiter under the rate that flushes a memtable in 5 s");
     }
 
 }
