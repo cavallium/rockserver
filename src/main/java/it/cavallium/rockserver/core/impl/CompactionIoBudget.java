@@ -201,6 +201,8 @@ public final class CompactionIoBudget {
     private boolean background, pressuredWindow, pendingForeground, noProgressProbeUsed;
     private long completions;
     private volatile double baseline;
+    /** See {@link #followed}: the baseline as the healthy-window average last wrote it, and its lowest level since. */
+    private double followedBaseline, baselineAnchor;
     private double recentAchieved, lastAchieved;
     private long preThrottle, probeBudget;
     private double probeLatency, probeAchieved, probeForegroundRate, probePointCallRate;
@@ -559,7 +561,7 @@ public final class CompactionIoBudget {
             // No trial started (a skipped one costs no window): cooldown, baseline tracking and growth go on.
             if (cooldown > 0) cooldown--;
             if (pointHealthy && growthAllowed) {
-                if (pointReliable) baseline = baseline * .9 + latency * .1;
+                if (pointReliable) baseline = followed(latency);
                 if (achieved >= budget * .8) {
                     budget = grown(achieved);
                 }
@@ -950,6 +952,20 @@ public final class CompactionIoBudget {
         shutdownBudget = bound(Math.max(Math.max(seed, budget),
                 Math.max(Math.max(preThrottle, probeBudget), recentAchieved)));
         return budget;
+    }
+    /**
+     * The point baseline after a healthy window with background I/O. The 10% moving average takes the noise of 5 s
+     * means out of the reference, but alone it follows any degradation of under 2% per window without end (a
+     * window at 1.2x the baseline is healthy and raises it by 2%). So it may fall freely and rise to at most 1.2x
+     * its lowest level since the baseline was last set by something that shows the latency is not the limiter's
+     * doing: a window without background I/O, the result of a rate trial, a limiter that cannot go lower, a
+     * calibration. Reads slower than 1.44x that level are unhealthy until one of those happens again.
+     */
+    private double followed(double latency) {
+        if (baseline != followedBaseline) baselineAnchor = baseline; // Set elsewhere since the last healthy window.
+        double next = Math.min(baseline * .9 + latency * .1, baselineAnchor * 1.2);
+        baselineAnchor = Math.min(baselineAnchor, next);
+        return followedBaseline = next;
     }
     /** Whether the last window's background I/O used at least 80% of the budget: the limiter was its bottleneck. */
     private boolean limiterBound() { return lastAchieved >= budget * .8; }

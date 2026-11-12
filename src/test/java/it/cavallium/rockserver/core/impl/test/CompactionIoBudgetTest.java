@@ -186,6 +186,60 @@ class CompactionIoBudgetTest {
         }
         assertTrue(accepted >= 0 && accepted <= 13, "accepted at window " + accepted);
     }
+    /** A background of 40% of the budget, above the flush floor: no trial, no idle window, nothing sets the baseline. */
+    private static Trace unsaturatedAboveTheFloor() {
+        var t = new Trace(); t.window(10, 100, SEED);
+        t.window(10, 100, SEED); t.window(10, 100, SEED); // restore prior budget
+        t.window(10, 100, 400_000);
+        assertEquals(100, t.policy.baselineReadMicros(), .001);
+        return t;
+    }
+    @Test void aRampOfPointLatencyIsNotFollowedAsHealthy() {
+        // +1.5% per window was followed without end (a ratio to the baseline of 1.15, always healthy); +15% is the
+        // fast case. Both must be over 1.2x the baseline within ln(1.44) / ln(growth) windows, and stay there.
+        for (double growth : new double[]{1.015, 1.15}) {
+            var t = unsaturatedAboveTheFloor();
+            int bound = (int) Math.ceil(Math.log(1.44) / Math.log(growth)), detected = -1;
+            double latency = 100;
+            for (int i = 1; i <= 60; i++) {
+                latency *= growth;
+                t.window(10, Math.round(latency), 400_000);
+                assertEquals(SEED, t.policy.budget());
+                assertTrue(t.policy.baselineReadMicros() <= 120.001, "baseline " + t.policy.baselineReadMicros());
+                boolean unhealthy = Math.round(latency) > t.policy.baselineReadMicros() * 1.2;
+                if (unhealthy && detected < 0) detected = i;
+                if (detected >= 0) assertTrue(unhealthy, "window " + i + " after detection at " + detected);
+            }
+            assertTrue(detected > 0 && detected <= bound, growth + ": detected at " + detected + ", bound " + bound);
+        }
+    }
+    @Test void aWorksetShiftIsAcceptedInWindowsWithoutBackgroundIo() {
+        var t = unsaturatedAboveTheFloor();
+        for (int i = 0; i < 30; i++) t.window(10, 200, 400_000);
+        assertTrue(t.policy.baselineReadMicros() <= 120.001, "twice the latency while background I/O runs is not accepted");
+        int accepted = -1;
+        for (int i = 1; i <= 10 && accepted < 0; i++) {
+            t.window(10, 200, 0);
+            if (200 <= t.policy.baselineReadMicros() * 1.2) accepted = i;
+        }
+        assertTrue(accepted > 0 && accepted <= 6, "accepted at idle window " + accepted);
+        double reference = t.policy.baselineReadMicros();
+        for (int i = 0; i < 30; i++) {
+            t.window(10, 200, 400_000);
+            assertTrue(200 <= t.policy.baselineReadMicros() * 1.2, "the accepted shift stays healthy with background I/O");
+        }
+        assertTrue(t.policy.baselineReadMicros() > reference, "and the average goes on from the accepted level");
+    }
+    @Test void noisyPointMeansAreNotTakenForDegradation() {
+        var t = unsaturatedAboveTheFloor();
+        long[] noise = {100, 115, 88, 110, 85, 118, 92, 105};
+        for (int i = 0; i < 400; i++) {
+            long latency = noise[i % noise.length];
+            t.window(10, latency, 400_000);
+            assertTrue(latency <= t.policy.baselineReadMicros() * 1.2,
+                    "window " + i + ": " + latency + " over baseline " + t.policy.baselineReadMicros());
+        }
+    }
     @Test void aTrialNeverGoesUnderTheSeed() {
         var t = new Trace(800_000);
         t.window(10, 100, SEED);
