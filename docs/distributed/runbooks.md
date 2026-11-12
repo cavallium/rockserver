@@ -831,7 +831,14 @@ API port also ends with 1: `Failed to start node <id>:` with the same `Failed to
 the start closed what it opened. Find the holder with `ss -ltnp 'sport = :<port>'`; when it is the node's previous
 process still stopping, the supervisor's next restart passes. A node that prints
 `... a System.exit on another thread started the shutdown, and the start did not end within PT30S ...; halting with 1`
-was asked to exit by a library while it started: the cause is above that line in its log. A node that is killed (SIGKILL, 137 in a shell) or crashes in native code
+was asked to exit by a library while it started: the cause is above that line in its log. The same holds for
+`... a System.exit on another thread waits behind the shutdown that a signal started, and the start did not end within
+PT30S ...; halting with 1`: a SIGTERM reached the node while it started, something then called `System.exit`, and the
+start did not end within 30 s of that (R66-5; without such an exit a SIGTERM during a start waits for the start,
+however long). The single-node server (`it.cavallium.rockserver.core.Main`) has one line of this kind:
+`Rockserver cannot shut down: the thread that runs it called System.exit ...; halting with 1`, with exit code 1 and
+its database left as after a crash (the next start recovers it); the stack below the line shows what called the
+exit. A node that is killed (SIGKILL, 137 in a shell) or crashes in native code
 (SIGABRT, 134) ends by a signal, and any other failure before the node serves (a malformed option value ends with 2
 instead) ends with 1, as in the table. A supervisor restarts all of these except a stop it asked for. So the codes a
 supervisor must not restart are 2, 4 and 5, and 143 is a clean stop.

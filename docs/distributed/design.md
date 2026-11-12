@@ -6171,6 +6171,63 @@ install it (`apt-get install gcc libc6-dev`) and run with `-Drockserver.test.req
      `GrpcConnection.leaderChannelAddressForTesting()`; that writes go straight to the leader is shown by the channel
      being the leader's and taking leader-bound calls (`LeaderHintRouter` routing is covered by its own tests), not by a
      count of forwarded calls, which the server does not keep.
+   - R66-5 (low, single-node server and replicated server; availability at a stop): the shutdown hook of the
+     single-node server (`it.cavallium.rockserver.core.Main`, what production runs) had the shape R61-13 fixed in the
+     replicated one. The hook asks the thread of `run` to stop and waits, without limit, for a latch that only that
+     thread releases once it closed the servers and the database. `System.exit` runs the hooks on the thread that
+     called it and waits for them, so an exit on that thread, between the registration of the hook and the end of
+     `run`, left the two waiting for each other. Reproduced with a real process (`MainStartProcessTest`, red: still
+     running after 60 s, the thread dump showing `main` in `Shutdown.runHooks` under `System.exit` and
+     `DB shutdown hook` in `CountDownLatch.await`), for an exit during the start and for one after a SIGTERM (which
+     waits behind the signal's shutdown instead of running the hooks, with the same end). The process kept its database
+     open, served nothing and ignored SIGTERM. No caller is known: the core's main code has no `System.exit` after the
+     hook is registered (its three are in the argument handling before it), and a taken port there throws; it would
+     take a library, or code loaded into the server, that exits on that thread. So this closes a shape, not a failure
+     that was seen.
+     - The rule now, as in R61-13: the hook never waits for something only an exiting thread can do. While it waits,
+       it looks at the thread of `run` every 200 ms (`Main.awaitShutdownComplete`); if that thread has a frame of
+       `java.lang.Shutdown` and the latch is not released, it prints
+       `Rockserver cannot shut down: the thread that runs it called System.exit ...; halting with 1` with that thread's
+       stack and ends the process with 1 through libc's `_exit`. The database is open at that point and only that
+       thread could close it, so this leaves what a crash leaves; the test opens the database again afterwards. The
+       latch is read again after the look at the thread, so a caller that exits once `run` returned (inside
+       `System.exit` too, with everything closed) is not halted and keeps its status.
+     - Nothing else changed for the single-node server, and these are pinned with real processes: a SIGTERM while
+       serving (`MainShutdownTest`, as before) and a SIGTERM during a start (5 s more of start, then the close) end
+       with 143, the marker `run` writes after its last close present and the database free; a start that fails (a
+       taken gRPC port; a start that throws) ends by itself with everything closed.
+     - Left as it is, on purpose: the single-node hook has no time limit for a `System.exit` on *another* thread
+       (case 3 of R61-13). Such an exit while serving is an ordinary stop there (the thread of `run` closes everything
+       and the exit completes), the hook's wait covers the close and the rest of a start, which have no bound by
+       design (a large database opens for minutes), and a limit would turn a slow clean stop into a halt. What stays
+       without limit is therefore a start, or a close, that itself waits for a thread inside `System.exit`: no caller
+       known, a SIGKILL ends it, as before.
+     - Found on the way and not changed (it needs a decision): a start of the single-node server that fails after the
+       database opened (a taken Thrift or gRPC port, any exception there) logs `Unexpected error`, closes everything,
+       logs `Shut down successfully` and ends with status 0, the status of a `main` that returned. A supervisor that
+       restarts on failure only does not restart it. `MainStartProcessTest` pins the 0 as what it does today, with a
+       comment that says so.
+     - `JvmExit` (what is read in the stack traces) and `ProcessHalt` (`_exit`) moved to
+       `it.cavallium.rockserver.core.impl`, public; the replicated server's classes of those names stay and delegate,
+       so its code, its tests' probe and its answers are the same. The single-node server links `_exit` only when it
+       halts (nothing new runs at a normal start or stop); without `--enable-native-access` it falls back to the JVM's
+       halt, which can hang a database that is writing (R62-1).
+     - The residual of R61-13 that the review of R65 left, in the replicated server: after a signal the hook waits for
+       a start still running without limit, also when another thread then calls `System.exit` and the start waits for
+       that thread. That exit waits behind the signal's shutdown for good, so the start never ends. Reproduced
+       (`StartExitProcessTest.anExitOnAnotherThreadAfterASignalThatTheStartWaitsForEndsWithOne`, red: still running
+       after 60 s, `SIGTERM handler` in `Shutdown.runHooks`, the exiting thread blocked in `Shutdown.exit`, `main`
+       joining it). Bounded: after a signal the hook also asks whether a thread is inside `System.exit` without being
+       the one that runs the hooks (`JvmExit.exitWaiting`: a frame of `java.lang.Shutdown`, none of `runHooks`), and
+       from when it first sees one the start gets the 30 s of case 3 (`startAfterExitTimeout`), then
+       `Node <id> does not start: a System.exit on another thread waits behind the shutdown that a signal started ...;
+       halting with 1`. Whether the start waits for that thread cannot be told, as in case 3, and the cost is the same:
+       a start that would have ended later than 30 s after such an exit is halted before it serves. A signal during a
+       start with no such thread waits without limit, as before
+       (`StartExitProcessTest.aSignalDuringAStartStillStopsTheNodeCleanly`, unchanged, passes). The question costs one
+       dump of all stack traces per 200 ms, only in a hook that waits for a start after a signal.
+     - What is read are JDK implementation classes, seen on Temurin 27.0.1 and pinned by the process tests: a JDK where
+       an exit is not recognised fails the two exit cases of `MainStartProcessTest` with the hang.
    - Review of R46, 1 (low, docs): the R46-2 recipe ran `dependency:build-classpath` on `distributed/server/pom.xml`
      alone, so Maven resolved `rockserver-core:${revision}` and that version's pom from `~/.m2` (or the snapshot
      repository): `grep -v /rockserver-core/` dropped the jar but kept the third-party jars of that pom, from whichever
