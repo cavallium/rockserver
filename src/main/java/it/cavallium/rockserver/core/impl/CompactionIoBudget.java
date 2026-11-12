@@ -242,6 +242,13 @@ public final class CompactionIoBudget {
     private volatile double ceiling;
     /** Whether the reduction under test answers measured harm (else it is a trial from a healthy state). */
     private boolean probeForHarm;
+    /**
+     * Whether a trial from a healthy state may still run. Slow reads are measured against the baseline, and BOOTSTRAP
+     * takes the baseline with background I/O running, so it may already contain that I/O's harm: only a lower rate
+     * can show it. Set by BOOTSTRAP; cleared when a reduction shows that a lower rate does not make reads faster,
+     * or when the rate cannot go lower. A kept trial leaves it set: the next one follows 12 windows later.
+     */
+    private boolean calibrating;
     private double firstProbeBenefitLatency;
     private long bulkCalls, bulkTime, bulkKeys, readSaturatedNanos, readPendingNanos, readQueuedNanos, readCompleted;
     private boolean bulkEpochValid = true, bulkSeen, bulkIdle = true, bulkComparable, bulkHealthy,
@@ -550,8 +557,10 @@ public final class CompactionIoBudget {
             probeBulkRebaseAllowed = !benefit && probeBulkProtected && bulkComparable && pointOk && bulkOk
                     && active && probeAchieved > 0 && achieved <= probeAchieved * .9
                     && probeReadPressureClear && readPressureClear;
-            if (!benefit) finishProbe(false, latency);
-            else if (++probeBenefits >= 2) finishProbe(true, pointReliable ? Math.max(firstProbeBenefitLatency, latency) : Double.NaN);
+            if (!benefit) {
+                calibrating = false; // A verdict, not an abort: this lower rate did not make reads faster.
+                finishProbe(false, latency);
+            } else if (++probeBenefits >= 2) finishProbe(true, pointReliable ? Math.max(firstProbeBenefitLatency, latency) : Double.NaN);
             else firstProbeBenefitLatency = latency;
             return publishBudget();
         }
@@ -575,6 +584,7 @@ public final class CompactionIoBudget {
             state = State.TRACKING;
             if (pointReliable) baseline = latency;
             harmWindows = 0;
+            calibrating = true;
             if ((pointReliable || bulkComparable) && bulkSafe) beginProbe(latency, foregroundRate, pointCallRate, false);
             return publishBudget();
         }
@@ -606,10 +616,11 @@ public final class CompactionIoBudget {
             hold = HOLD_WINDOWS;
         } else {
             // Slow reads in HARM_WINDOWS consecutive windows: HARM_DECREASE of the achieved rate, kept or undone by
-            // the next windows. Healthy reads: a trial from a window that saturated the limiter, when one is due.
+            // the next windows. Healthy reads: a trial from a window that saturated the limiter, only while the
+            // baseline is not calibrated or the read pool is saturated (a distress no baseline measures).
             if (harm ? harmWindows >= HARM_WINDOWS && harmCooldown == 0 && reductionAllowed
                         && beginProbe(latency, foregroundRate, pointCallRate, true)
-                    : cooldown == 0 && reductionAllowed
+                    : cooldown == 0 && (calibrating || readGrowthVeto) && reductionAllowed
                         && beginProbe(latency, foregroundRate, pointCallRate, false)) return publishBudget();
             // No reduction started (a skipped one costs no window): baseline tracking and growth go on.
             if (pointHealthy && growthAllowed) {
@@ -1078,8 +1089,9 @@ public final class CompactionIoBudget {
      * </ul>
      * Neither goes under the flush floor (the seed). A rate that is not at least 10% under the achieved one is
      * not tried, because it could never be kept: the limiter is as low as it may go for this background (which
-     * includes every background at or under the flush floor), so the current latency becomes the reference and
-     * the next attempt is {@link #COOLDOWN_WINDOWS} windows later.
+     * includes every background at or under the flush floor). For slow reads the current latency then becomes
+     * the reference and the next attempt is {@link #COOLDOWN_WINDOWS} windows later; for healthy reads the
+     * baseline is as well calibrated as it can be.
      * @return whether the budget was lowered
      */
     private boolean beginProbe(double latency, double foregroundRate, double pointCallRate, boolean harm) {
@@ -1087,7 +1099,8 @@ public final class CompactionIoBudget {
         // A healthy rate trial must fit the acknowledged reader cap. Safety cuts run first and remove this floor.
         if (foregroundHealthy) candidate = Math.max(candidate, bound(Math.ceil(readaheadBytes * 12.5)));
         boolean lowest = candidate >= budget || candidate > lastAchieved * .9;
-        if (!lowest && !harm && !limiterBound()) return false;
+        if (!harm && lowest) calibrating = false;
+        if (!harm && (lowest || !limiterBound())) return false;
         pointReferenceWindows = 0; pointReferenceMax = 0;
         bulkReferenceWindows = 0;
         tailOffProbeHoldUntil = 0;

@@ -18,6 +18,16 @@ class CompactionReadaheadTest {
             method.setAccessible(true); method.invoke(policy, bytes);
         } catch (ReflectiveOperationException failure) { throw new AssertionError(failure); }
     }
+    /**
+     * States that the point baseline is not calibrated yet, as after a BOOTSTRAP above the flush floor: only then is
+     * a trial from a healthy state due. These traces start at their floor, where BOOTSTRAP has nothing to calibrate.
+     */
+    private static void uncalibrated(CompactionIoBudget policy) {
+        try {
+            var field = CompactionIoBudget.class.getDeclaredField("calibrating");
+            field.setAccessible(true); field.setBoolean(policy, true);
+        } catch (ReflectiveOperationException failure) { throw new AssertionError(failure); }
+    }
     private AutoCloseable controller(String name, RateLimiter limiter, Input input, SimpleMeterRegistry registry,
                                       java.util.function.LongUnaryOperator apply) throws Exception {
         var constructor = Class.forName("it.cavallium.rockserver.core.impl.CompactionIoController")
@@ -114,7 +124,7 @@ class CompactionReadaheadTest {
     @Test void delayedUnconfirmedReadersFreezeGrowthButCannotDisableRateProbesForever() {
         var t = new Trace(16 * MIB); t.in.readerDelay = Long.MAX_VALUE / 4;
         t.until(65536); long change = t.changedAt;
-        t.limiterBound = true;
+        t.limiterBound = true; uncalibrated(t.policy);
         boolean probe = false;
         for (int i = 0; i < 200; i++) {
             t.step();
@@ -331,7 +341,7 @@ class CompactionReadaheadTest {
     }
     @Test void healthyProbeBoundaryCannotCauseRepeatedCapShrinkRegrowthWobble() {
         var t = new Trace(16 * MIB); t.in.rate = 200 * MIB; t.until(16 * MIB);
-        t.limiterBound = true;
+        t.limiterBound = true; uncalibrated(t.policy);
         int changes = t.changes; boolean probed = false;
         for (int i = 0; i < 500; i++) {
             t.step(); probed |= t.policy.state() == CompactionIoBudget.State.PROBE;

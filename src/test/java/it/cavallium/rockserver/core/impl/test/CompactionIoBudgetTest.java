@@ -175,8 +175,32 @@ class CompactionIoBudgetTest {
             assertEquals(SEED, t.policy.budget(), "window " + i);
         }
         t.window(10, 100, SEED);
-        assertEquals(CompactionIoBudget.State.PROBE, t.policy.state(), "the limiter is the bottleneck again");
+        assertEquals(CompactionIoBudget.State.TRACKING, t.policy.state(), "the limiter is the bottleneck again, but the"
+                + " trial after BOOTSTRAP showed that a lower rate does not make reads faster: none is repeated");
+        assertEquals(2 * SEED, t.policy.budget());
+    }
+    @Test void aTrialFromAHealthyStateIsRepeatedOnlyWhileItHelps() {
+        // BOOTSTRAP takes its baseline with background I/O running. Each trial that makes reads 20% faster is kept
+        // and followed by the next one 12 windows later; the first that shows nothing is the last.
+        var t = new Trace();
+        t.window(10, 100, SEED);
+        assertEquals(CompactionIoBudget.State.PROBE, t.policy.state());
+        t.window(10, 80, 750_000); t.window(10, 80, 750_000); t.window(10, 80, 750_000);
         assertEquals(750_000, t.policy.budget());
+        int waited = 0;
+        while (t.policy.state() != CompactionIoBudget.State.PROBE && waited < 20) { t.window(10, 80, t.policy.budget()); waited++; }
+        assertEquals(13, waited, "the next trial: 12 windows of cooldown, then the first saturated one");
+        long before = 950_000; // 750,000 + 10% + 5% + 5% of the 1 MB/s at which the first trial found harm
+        assertEquals(before * 3 / 4, t.policy.budget());
+        t.window(10, 80, t.policy.budget()); t.window(10, 80, t.policy.budget());
+        assertEquals(CompactionIoBudget.State.TRACKING, t.policy.state());
+        assertEquals(before, t.policy.budget(), "no faster reads: restored");
+        for (int i = 0; i < 60; i++) {
+            long budget = t.policy.budget();
+            t.window(10, 80, budget);
+            assertEquals(CompactionIoBudget.State.TRACKING, t.policy.state(), "window " + i);
+            assertTrue(t.policy.budget() >= budget, "window " + i);
+        }
     }
     @Test void slowReadsUnderAHalfUsedBudgetLowerItFromTheAchievedRate() {
         // After a healthy doubling the budget is twice the background rate. Slow reads there started no trial (the
@@ -486,6 +510,8 @@ class CompactionIoBudgetTest {
         }
         t.window(10, 100, 400_000); t.window(10, 100, 400_000);
         assertEquals(0, t.policy.harmCeilingBytesPerSecond());
+        t.window(10, 100, 700_000);
+        assertEquals(1_400_000, t.policy.budget(), "capacity is unknown again: a saturated healthy window doubles");
     }
     @Test void healthyGrowthNeedsDemandAndStaysBoundedDespiteJitter() {
         var t = new Trace(); t.window(10, 100, SEED); t.window(10, 100, SEED); t.window(10, 100, SEED);

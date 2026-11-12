@@ -582,7 +582,11 @@ class CompactionBulkFeedbackTest {
         t.seconds(180); assertTrue(t.applied >= 65536);
     }
     @Test void newUnreferencedPointLaneAbortsBulkOnlyProbeBeforeApparentBulkBenefit() throws Exception {
-        var t = new Trace(); t.point = false; t.prime(); t.probe();
+        var t = new Trace(); t.point = false; t.prime();
+        // A trial from a healthy state runs only while the baseline is not calibrated: state that it is not.
+        var calibrating = CompactionIoBudget.class.getDeclaredField("calibrating"); calibrating.setAccessible(true);
+        calibrating.setBoolean(t.p, true);
+        t.probe();
         assertEquals(0, t.p.baselineReadMicros());
         var reference = CompactionIoBudget.class.getDeclaredField("probePointProtected"); reference.setAccessible(true);
         assertFalse(reference.getBoolean(t.p));
