@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.distributed;
 
+import org.junit.jupiter.api.Tag;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -31,6 +32,7 @@ import org.junit.jupiter.api.io.TempDir;
  * exactly once while leadership moves between nodes whose clocks disagree by hours.
  */
 @Timeout(180)
+@Tag("slow")
 class ClockSkewTest {
 
 	private static final Duration TIMEOUT = Duration.ofSeconds(30);

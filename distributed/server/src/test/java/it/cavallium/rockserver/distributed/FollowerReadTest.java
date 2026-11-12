@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.distributed;
 
+import org.junit.jupiter.api.Tag;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -41,6 +42,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 /** Point reads served by followers: linearizable, and forwarded rather than stale when a follower lags or is cut off. */
+@Tag("slow")
 class FollowerReadTest {
 
 	private static final Duration TIMEOUT = Duration.ofSeconds(30);

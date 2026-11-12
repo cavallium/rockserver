@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.distributed;
 
+import org.junit.jupiter.api.Tag;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -53,6 +54,7 @@ import org.junit.jupiter.api.io.TempDir;
  * <p>Multi-process: part of the heavy suites.</p>
  */
 @Timeout(600)
+@Tag("slow")
 class MixedConfigurationFileTest {
 
 	private static final List<String> SERVER_ARGS = List.of(

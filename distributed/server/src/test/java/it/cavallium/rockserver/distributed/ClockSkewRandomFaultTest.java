@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.distributed;
 
+import org.junit.jupiter.api.Tag;
 import java.util.List;
 
 /**
@@ -9,6 +10,7 @@ import java.util.List;
  * up; reads, leases and timeouts run on monotonic time and must not care. The skew stays below the shortest client
  * session timeout (10 minutes), so no session may expire, and every check of the base test must still hold.
  */
+@Tag("slow")
 class ClockSkewRandomFaultTest extends RandomFaultTest {
 
 	static final long SKEW_MILLIS = 90_000;

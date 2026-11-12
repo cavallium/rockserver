@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.distributed;
 
+import org.junit.jupiter.api.Tag;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -45,6 +46,7 @@ import org.junit.jupiter.api.io.TempDir;
  * its directory, by linking table files, opens as a node's database with the same contents and seeds a cluster.
  */
 @Timeout(300)
+@Tag("slow")
 class BuildSeedTest {
 
 	private static final Duration TIMEOUT = Duration.ofSeconds(30);

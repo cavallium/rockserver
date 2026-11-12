@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.core.impl.test;
 
+import org.junit.jupiter.api.Tag;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -44,6 +45,7 @@ import org.junit.jupiter.params.provider.MethodSource;
 import org.rocksdb.Transaction;
 
 @Timeout(10)
+@Tag("slow")
 class TransactionCloseConcurrencyTest {
 
 	@TempDir

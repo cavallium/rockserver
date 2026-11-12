@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.distributed;
 
+import org.junit.jupiter.api.Tag;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -34,6 +35,7 @@ import org.junit.jupiter.api.io.TempDir;
  * thread with the node monitor, which reads the snapshot directory under the storage monitor and the log under its
  * read lock: one hung disk parked that thread for good, and the API was never paused, nor the leader stepped down.
  */
+@Tag("slow")
 class WatchdogThreadsTest {
 
 	private static final Duration TIMEOUT = Duration.ofSeconds(30);

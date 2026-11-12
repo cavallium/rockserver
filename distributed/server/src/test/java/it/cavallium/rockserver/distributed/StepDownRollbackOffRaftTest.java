@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.distributed;
 
+import org.junit.jupiter.api.Tag;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -44,6 +45,7 @@ import org.junit.jupiter.api.io.TempDir;
  * for such a call by holding the monitor of one open transaction.
  */
 @Timeout(120)
+@Tag("slow")
 class StepDownRollbackOffRaftTest {
 
 	private static final Duration TIMEOUT = Duration.ofSeconds(30);

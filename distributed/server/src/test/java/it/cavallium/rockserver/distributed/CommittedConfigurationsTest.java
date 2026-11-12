@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.distributed;
 
+import org.junit.jupiter.api.Tag;
 import static it.cavallium.rockserver.distributed.RemovalScenarios.TIMEOUT;
 import static it.cavallium.rockserver.distributed.RemovalScenarios.awaitReadyLeader;
 import static it.cavallium.rockserver.distributed.RemovalScenarios.confEntry;
@@ -40,6 +41,7 @@ import org.junit.jupiter.api.io.TempDir;
  * notification reports the leader's latest configuration whether committed or not, records nothing.
  */
 @Timeout(300)
+@Tag("slow")
 class CommittedConfigurationsTest {
 
 	private static final ColumnSchema SCHEMA = ColumnSchema.of(IntList.of(Long.BYTES), ObjectList.of(), true);

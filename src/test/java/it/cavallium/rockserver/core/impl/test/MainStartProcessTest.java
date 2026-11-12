@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.core.impl.test;
 
+import org.junit.jupiter.api.Tag;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -41,6 +42,7 @@ import org.junit.jupiter.api.io.TempDir;
  * the exit is not recognised they fail with the hang.</p>
  */
 @Timeout(180)
+@Tag("slow")
 public class MainStartProcessTest {
 
 	private static final long EXIT_SECONDS = 60;

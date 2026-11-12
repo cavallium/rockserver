@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.distributed;
 
+import org.junit.jupiter.api.Tag;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -26,6 +27,7 @@ import org.junit.jupiter.api.io.TempDir;
  * version in use: the members exist, and on a real single-node cluster a blocked worker holds a write back until it is
  * released, and a pause delays one by about its length.
  */
+@Tag("slow")
 class LogWorkerGateContractTest {
 
 	private static final ColumnSchema SCHEMA = ColumnSchema.of(IntList.of(Long.BYTES), ObjectList.of(), true);

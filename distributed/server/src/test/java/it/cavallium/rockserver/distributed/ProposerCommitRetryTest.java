@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.distributed;
 
+import org.junit.jupiter.api.Tag;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
@@ -42,6 +43,7 @@ import org.junit.jupiter.api.io.TempDir;
  * room, by Ratis' pending-request limits or by this node's own attempt permits, goes back to the queue and is sent again
  * ({@code retryLater}): it succeeds once there is room, and fails only at its caller's deadline, as not applied.
  */
+@Tag("slow")
 class ProposerCommitRetryTest {
 
 	@TempDir

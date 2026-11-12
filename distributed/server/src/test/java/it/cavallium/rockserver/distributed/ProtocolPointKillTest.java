@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.distributed;
 
+import org.junit.jupiter.api.Tag;
 import static it.cavallium.rockserver.distributed.ScenarioSupport.BATCH_CONTEXT;
 import static it.cavallium.rockserver.distributed.ScenarioSupport.CLIENT_RETRY_TIMEOUT;
 import static it.cavallium.rockserver.distributed.ScenarioSupport.PHASE_TIMEOUT;
@@ -42,6 +43,7 @@ import org.junit.jupiter.api.io.TempDir;
  * (default 12).</p>
  */
 @Timeout(900)
+@Tag("slow")
 class ProtocolPointKillTest {
 
 	private static final int ROUNDS = Integer.getInteger("rockserver.test.protocolKillRounds", 12);

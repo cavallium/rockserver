@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.core.impl.test;
 
+import org.junit.jupiter.api.Tag;
 import it.cavallium.buffer.Buf;
 import it.cavallium.rockserver.core.client.EmbeddedConnection;
 import it.cavallium.rockserver.core.common.*;
@@ -35,6 +36,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * for-update success and abort; bounded forward/reverse ranges and cancellation; explicit and
  * expiring iterators; range reductions; flush; and compaction.</p>
  */
+@Tag("slow")
 public class RandomizedLeakStressTest {
 
 	private static final String LEAK_DETECTION_PROPERTY = "it.cavallium.rockserver.leakdetection";

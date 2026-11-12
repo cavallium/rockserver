@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.distributed;
 
+import org.junit.jupiter.api.Tag;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -62,6 +63,7 @@ import reactor.core.publisher.Flux;
  * numbered batch stream, and the "not applied" trailer of a write refused by the leader behind a follower's forward.
  */
 @Timeout(180)
+@Tag("slow")
 class NumberedWritesTest {
 
 	private static final Duration TIMEOUT = Duration.ofSeconds(30);

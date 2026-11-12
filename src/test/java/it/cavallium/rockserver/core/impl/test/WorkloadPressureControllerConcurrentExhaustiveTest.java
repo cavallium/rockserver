@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.core.impl.test;
 
+import org.junit.jupiter.api.Tag;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -21,6 +22,7 @@ import java.util.function.IntConsumer;
 import org.junit.jupiter.api.Test;
 
 /** Exhaustive semantic-permit-symmetry bisimulation for pressured caps greater than one. */
+@Tag("slow")
 class WorkloadPressureControllerConcurrentExhaustiveTest {
 
 	@Test

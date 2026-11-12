@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.distributed;
 
+import org.junit.jupiter.api.Tag;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
@@ -42,6 +43,7 @@ import org.junit.jupiter.api.io.TempDir;
  * The forwarder without a Raft server: leader lookups against a {@link StubRaft} division, and connections to a
  * minimal gRPC server that answers the capability handshake.
  */
+@Tag("slow")
 class LeaderForwarderTest {
 
 	@TempDir

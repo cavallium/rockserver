@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.distributed;
 
+import org.junit.jupiter.api.Tag;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -93,6 +94,7 @@ import org.junit.jupiter.api.io.TempDir;
  * of silently in production. Pinned elsewhere, because they need links that lose replies: the follower order behind
  * {@link LeaderStall#pairById} and the match index moving only on replies with entries ({@code LeaderStallTest}).
  */
+@Tag("slow")
 class RatisContractTest {
 
 	private static final Duration WAIT = Duration.ofSeconds(20);

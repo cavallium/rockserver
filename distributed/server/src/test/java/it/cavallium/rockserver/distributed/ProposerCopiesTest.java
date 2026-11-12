@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.distributed;
 
+import org.junit.jupiter.api.Tag;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
@@ -44,6 +45,7 @@ import org.junit.jupiter.api.io.TempDir;
  * answered only once the encoding is done (R2-LC-2).
  */
 @Timeout(120)
+@Tag("slow")
 class ProposerCopiesTest {
 
 	@TempDir

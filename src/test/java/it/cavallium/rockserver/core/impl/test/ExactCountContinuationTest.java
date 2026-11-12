@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.core.impl.test;
 
+import org.junit.jupiter.api.Tag;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -37,6 +38,7 @@ import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
 
 @Timeout(60)
+@Tag("slow")
 class ExactCountContinuationTest {
 
 	private static final int INITIAL_ENTRIES = 4_200;

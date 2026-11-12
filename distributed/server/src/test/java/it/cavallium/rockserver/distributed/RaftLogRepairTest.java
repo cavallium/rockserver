@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.distributed;
 
+import org.junit.jupiter.api.Tag;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -105,6 +106,7 @@ import org.junit.jupiter.params.provider.ValueSource;
  * hold.</p>
  */
 @Timeout(value = 5, unit = TimeUnit.MINUTES)
+@Tag("slow")
 class RaftLogRepairTest {
 
 	private static final String GROUP = NodeConfig.DEFAULT_GROUP_ID;

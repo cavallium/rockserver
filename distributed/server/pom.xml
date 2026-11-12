@@ -15,6 +15,8 @@
     <!-- Where tests create their directories. Fsync is free on the tmpfs that /tmp often is: see "Tests" in the design
          document for why the suite must also pass with -Drockserver.test.tmpdir set to a directory on a real disk. -->
     <rockserver.test.tmpdir>${java.io.tmpdir}</rockserver.test.tmpdir>
+    <!-- JUnit tag groups the tests skip by default: the slow ones. -Pslow-tests empties it (runs everything). -->
+    <rockserver.excludedGroups>slow</rockserver.excludedGroups>
   </properties>
 
   <repositories>
@@ -85,6 +87,7 @@
         <configuration>
           <!-- Ratis jars are automatic modules with split packages: run on the classpath. -->
           <useModulePath>false</useModulePath>
+          <excludedGroups>${rockserver.excludedGroups}</excludedGroups>
           <argLine>--enable-native-access=ALL-UNNAMED --add-modules jdk.incubator.vector -Djava.io.tmpdir=${rockserver.test.tmpdir}</argLine>
           <systemPropertyVariables>
             <org.slf4j.simpleLogger.defaultLogLevel>warn</org.slf4j.simpleLogger.defaultLogLevel>
@@ -94,4 +97,13 @@
       </plugin>
     </plugins>
   </build>
+  <profiles>
+    <!-- Runs the whole test suite: the fast tests and the ones tagged @Tag("slow") (skipped by default). -->
+    <profile>
+      <id>slow-tests</id>
+      <properties>
+        <rockserver.excludedGroups></rockserver.excludedGroups>
+      </properties>
+    </profile>
+  </profiles>
 </project>

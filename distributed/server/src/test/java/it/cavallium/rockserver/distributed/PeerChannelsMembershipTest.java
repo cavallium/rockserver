@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.distributed;
 
+import org.junit.jupiter.api.Tag;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -28,6 +29,7 @@ import org.junit.jupiter.api.io.TempDir;
  * purpose: see {@code PeerChannelsPruningTest}).
  */
 @Timeout(180)
+@Tag("slow")
 class PeerChannelsMembershipTest {
 
 	private static final Duration TIMEOUT = Duration.ofSeconds(30);

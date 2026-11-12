@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.distributed;
 
+import org.junit.jupiter.api.Tag;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -20,6 +21,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 /** {@link LogTerms} reads what a stopped node's log holds, and finds where two logs disagree. */
+@Tag("slow")
 class LogTermsTest {
 
 	private static final Duration TIMEOUT = Duration.ofSeconds(30);

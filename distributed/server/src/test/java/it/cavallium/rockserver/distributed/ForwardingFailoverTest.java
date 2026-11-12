@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.distributed;
 
+import org.junit.jupiter.api.Tag;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
@@ -54,6 +55,7 @@ import reactor.core.publisher.Flux;
  * A range read that succeeds returns every key exactly once: a stream cut by the kill fails, it is not truncated.
  */
 @Timeout(180)
+@Tag("slow")
 class ForwardingFailoverTest {
 
 	private static final Duration READY_TIMEOUT = Duration.ofSeconds(60);

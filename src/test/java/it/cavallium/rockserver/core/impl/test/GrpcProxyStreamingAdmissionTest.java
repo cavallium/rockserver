@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.core.impl.test;
 
+import org.junit.jupiter.api.Tag;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -40,6 +41,7 @@ import reactor.core.publisher.Flux;
  * worker for its whole life, so they cannot use the proxy scheduler's unbounded workers.
  */
 @Timeout(60)
+@Tag("slow")
 class GrpcProxyStreamingAdmissionTest {
 
 	/** GrpcServer.PROXY_STREAM_PARALLELISM */

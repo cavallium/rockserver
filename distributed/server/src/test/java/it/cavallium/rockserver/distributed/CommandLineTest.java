@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.distributed;
 
+import org.junit.jupiter.api.Tag;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -44,6 +45,7 @@ import org.junit.jupiter.api.io.TempDir;
  * serves the data. Also the refusals: wrong arguments (exit 2), a target that exists, a restore into a used directory
  * (exit 1), and a newer cluster's database or backup (exit 5).
  */
+@Tag("slow")
 class CommandLineTest {
 
 	private static final Duration TIMEOUT = Duration.ofSeconds(30);

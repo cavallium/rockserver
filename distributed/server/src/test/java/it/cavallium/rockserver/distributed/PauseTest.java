@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.distributed;
 
+import org.junit.jupiter.api.Tag;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -73,6 +74,7 @@ import org.junit.jupiter.api.io.TempDir;
  * linearizable, the follower pause may cost at most a short blip, and the replicas must end up identical.</p>
  */
 @Timeout(300)
+@Tag("slow")
 class PauseTest {
 
 	private static final Duration ELECTION_TIMEOUT_MIN = Duration.ofMillis(400);

@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.distributed;
 
+import org.junit.jupiter.api.Tag;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
@@ -100,6 +101,7 @@ import org.junit.jupiter.api.io.TempDir;
  * {@code -Dorg.slf4j.simpleLogger.showDateTime=true}, which the nodes inherit, to timestamp those).</p>
  */
 @Timeout(value = 10, unit = TimeUnit.MINUTES)
+@Tag("slow")
 class RandomFaultTest {
 
 	static final String SEED_PROPERTY = "rockserver.randomFault.seed";

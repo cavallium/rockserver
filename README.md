@@ -397,6 +397,12 @@ java --enable-native-access=ALL-UNNAMED --add-modules jdk.incubator.vector -jar 
 
 GUI sources and tests live under `src/desktop/java` and `src/desktop-test/java`.
 `mvn -Pdesktop test` includes the GUI tests; use `xvfb-run -a` on a headless Linux machine.
+
+### Running the tests
+
+`mvn test` / `mvn verify` (also `mvn -f distributed/pom.xml verify` for core + distributed + server) run only the fast
+tests, about a minute in all. The long ones (cluster, fault-injection, multi-process and exhaustive suites) are tagged
+`@Tag("slow")` and skipped by default. Add `-Pslow-tests` to run everything; releases and CI must do so.
 The other profiles omit the GUI sources and runtime dependencies. Each build variant uses
 its own class/test output directories, so switching profiles cannot reuse the wrong module descriptor.
 

@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.distributed;
 
+import org.junit.jupiter.api.Tag;
 import static it.cavallium.rockserver.distributed.RemovalScenarios.TIMEOUT;
 import static it.cavallium.rockserver.distributed.RemovalScenarios.awaitConfigurationOnDisk;
 import static it.cavallium.rockserver.distributed.RemovalScenarios.awaitReadyLeader;
@@ -34,6 +35,7 @@ import org.junit.jupiter.api.io.TempDir;
  * that its tail can never be committed.
  */
 @Timeout(300)
+@Tag("slow")
 class DivergentTailRemovalTest {
 
 	/** Kept when a test fails, for the node logs. */

@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.distributed;
 
+import org.junit.jupiter.api.Tag;
 import static it.cavallium.rockserver.distributed.NodeStoreTest.DATA_COLUMN;
 import static it.cavallium.rockserver.distributed.NodeStoreTest.DATA_SCHEMA;
 import static it.cavallium.rockserver.distributed.NodeStoreTest.contents;
@@ -40,6 +41,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+@Tag("slow")
 class CheckpointStorageTest {
 
 	@TempDir

@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.core.impl.test;
 
+import org.junit.jupiter.api.Tag;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -49,6 +50,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 /** {@code closeFailedUpdate} against a connection that answers late, as a replicated one does for a chained update. */
+@Tag("slow")
 class GrpcProxyCloseTest {
 
 	/** More than the workers and the queue of the CONTROL scheduler of a proxy server hold together. */

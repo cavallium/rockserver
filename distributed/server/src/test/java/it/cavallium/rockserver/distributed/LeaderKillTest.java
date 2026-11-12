@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.distributed;
 
+import org.junit.jupiter.api.Tag;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -65,6 +66,7 @@ import org.junit.jupiter.api.io.TempDir;
  * on disk. Writes must resume quickly after each kill.</p>
  */
 @Timeout(300)
+@Tag("slow")
 class LeaderKillTest {
 
 	private static final int ROUNDS = 3;

@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.distributed;
 
+import org.junit.jupiter.api.Tag;
 import static it.cavallium.rockserver.distributed.RemovalScenarios.TIMEOUT;
 import static it.cavallium.rockserver.distributed.RemovalScenarios.awaitReadyLeader;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -48,6 +49,7 @@ import org.junit.jupiter.api.io.TempDir;
  * at a start that then fails, since Ratis cannot read it either) and its lowering at the next start that reads it.
  */
 @Timeout(300)
+@Tag("slow")
 class InstallStreamTest {
 
 	private static final ColumnSchema SCHEMA = ColumnSchema.of(IntList.of(Long.BYTES), ObjectList.of(), true);

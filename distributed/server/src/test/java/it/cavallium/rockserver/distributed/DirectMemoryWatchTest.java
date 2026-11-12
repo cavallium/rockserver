@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.distributed;
 
+import org.junit.jupiter.api.Tag;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -26,6 +27,7 @@ import org.junit.jupiter.api.io.TempDir;
  * request (the API's transport, a forward) the request fails and the node goes on: halting would carry the same request
  * to the next node, and halt it too.
  */
+@Tag("slow")
 class DirectMemoryWatchTest {
 
 	private static final String APPENDER = "n0@group-0A1B2C3D4E5F->n1-GrpcLogAppender-LogAppenderDaemon";

@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.distributed;
 
+import org.junit.jupiter.api.Tag;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
@@ -77,6 +78,8 @@ import org.apache.ratis.server.protocol.TermIndex;
  * still commit; add-peer reported the failure, and a retried add-peer refuses the node's log, so the operator wipes it
  * (design: "Removal and waiting outside", residuals).</p>
  */
+@Tag("slow")
+@net.jqwik.api.Tag("slow") // jqwik's own engine ignores the Jupiter tag
 class RemovalRulePropertyTest {
 
 	static final List<String> UNIVERSE = List.of("a", "b", "c", "d", "x", "y");

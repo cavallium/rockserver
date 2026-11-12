@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.distributed;
 
+import org.junit.jupiter.api.Tag;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -35,6 +36,7 @@ import org.junit.jupiter.api.io.TempDir;
  * member that was down needs an install: the install itself is the production one.</p>
  */
 @Timeout(300)
+@Tag("slow")
 class SnapshotInstallTest {
 
 	private static final Duration TIMEOUT = Duration.ofSeconds(60);

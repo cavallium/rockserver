@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.distributed;
 
+import org.junit.jupiter.api.Tag;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -39,6 +40,7 @@ import org.junit.jupiter.api.io.TempDir;
  * of this JVM, shared by three nodes, is only printed.</p>
  */
 @Timeout(300)
+@Tag("slow")
 class SlowFollowerDiskTest {
 
 	private static final ColumnSchema SCHEMA = ColumnSchema.of(IntList.of(Long.BYTES), ObjectList.of(), true);

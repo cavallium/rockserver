@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.distributed;
 
+import org.junit.jupiter.api.Tag;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -51,6 +52,7 @@ import reactor.core.publisher.Flux;
  * and takes effect once.
  */
 @Timeout(180)
+@Tag("slow")
 class ClientSessionTest {
 
 	private static final Duration TIMEOUT = Duration.ofSeconds(30);

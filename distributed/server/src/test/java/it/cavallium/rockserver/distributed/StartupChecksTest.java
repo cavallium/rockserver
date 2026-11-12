@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.distributed;
 
+import org.junit.jupiter.api.Tag;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
@@ -40,6 +41,7 @@ import org.rocksdb.RocksDB;
 import org.rocksdb.RocksDBException;
 
 /** Checks a node makes on its own files before and while it starts: see "Disk layout" and "Heap" in the design. */
+@Tag("slow")
 class StartupChecksTest {
 
 	@TempDir

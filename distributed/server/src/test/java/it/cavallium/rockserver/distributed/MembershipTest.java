@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.distributed;
 
+import org.junit.jupiter.api.Tag;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -51,6 +52,7 @@ import org.junit.jupiter.params.provider.CsvSource;
  * ({@link #fillUntilLogsArePurged}).</p>
  */
 @Timeout(600)
+@Tag("slow")
 class MembershipTest {
 
 	private static final Duration READY_TIMEOUT = Duration.ofSeconds(60);

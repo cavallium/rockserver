@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.distributed;
 
+import org.junit.jupiter.api.Tag;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -18,6 +19,7 @@ import org.junit.jupiter.api.io.TempDir;
  * the JDK's stack traces: a signal that is not recognised fails {@link #aSignalDuringAStartStillStopsTheNodeCleanly},
  * an exit that is not recognised fails the two others (and {@link PortInUseProcessTest}).
  */
+@Tag("slow")
 class StartExitProcessTest {
 
 	private static final long EXIT_SECONDS = 60;

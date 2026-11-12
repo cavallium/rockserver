@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.distributed;
 
+import org.junit.jupiter.api.Tag;
 import static it.cavallium.rockserver.distributed.ScenarioSupport.BATCH_CONTEXT;
 import static it.cavallium.rockserver.distributed.ScenarioSupport.CLIENT_RETRY_TIMEOUT;
 import static it.cavallium.rockserver.distributed.ScenarioSupport.PHASE_TIMEOUT;
@@ -48,6 +49,7 @@ import org.junit.jupiter.api.io.TempDir;
  * configuration was committed, no acknowledged write may be lost, and every member must end with the same data.
  */
 @Timeout(600)
+@Tag("slow")
 class MembershipFaultTest {
 
 	private static final Duration CRASH_TIMEOUT = Duration.ofSeconds(90);

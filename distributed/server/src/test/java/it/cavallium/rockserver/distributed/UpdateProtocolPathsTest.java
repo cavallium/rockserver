@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.distributed;
 
+import org.junit.jupiter.api.Tag;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
@@ -34,6 +35,7 @@ import org.junit.jupiter.api.io.TempDir;
  * write that ends an update answer when their transaction or update is not (or no longer) on the leader, a staged write
  * that carries a client request id, and a commit with nothing to write.
  */
+@Tag("slow")
 class UpdateProtocolPathsTest {
 
 	private static final ColumnSchema SCHEMA = ColumnSchema.of(IntList.of(Long.BYTES), ObjectList.of(), true);

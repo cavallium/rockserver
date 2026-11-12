@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.distributed;
 
+import org.junit.jupiter.api.Tag;
 import static it.cavallium.rockserver.distributed.ScenarioSupport.BATCH_CONTEXT;
 import static it.cavallium.rockserver.distributed.ScenarioSupport.CLIENT_RETRY_TIMEOUT;
 import static it.cavallium.rockserver.distributed.ScenarioSupport.PHASE_TIMEOUT;
@@ -35,6 +36,7 @@ import org.junit.jupiter.api.io.TempDir;
  * see RT-4) would give the same lag without a cut.</p>
  */
 @Timeout(600)
+@Tag("slow")
 class LaggingInstallTest {
 
 	private static final String SNAPSHOT_INSTALLED = "installing snapshot";

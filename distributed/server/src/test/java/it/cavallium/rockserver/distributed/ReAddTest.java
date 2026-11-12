@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.distributed;
 
+import org.junit.jupiter.api.Tag;
 import static it.cavallium.rockserver.distributed.RemovalScenarios.TIMEOUT;
 import static it.cavallium.rockserver.distributed.RemovalScenarios.awaitAnyReadyLeader;
 import static it.cavallium.rockserver.distributed.RemovalScenarios.awaitReadyLeader;
@@ -29,6 +30,7 @@ import org.junit.jupiter.api.io.TempDir;
  * says it was removed.
  */
 @Timeout(300)
+@Tag("slow")
 class ReAddTest {
 
 	/** Kept when a test fails, for the node logs. */

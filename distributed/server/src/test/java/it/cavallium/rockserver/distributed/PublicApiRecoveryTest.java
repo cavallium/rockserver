@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.distributed;
 
+import org.junit.jupiter.api.Tag;
 import static it.cavallium.rockserver.distributed.ScenarioSupport.BATCH_CONTEXT;
 import static it.cavallium.rockserver.distributed.ScenarioSupport.CLIENT_RETRY_TIMEOUT;
 import static it.cavallium.rockserver.distributed.ScenarioSupport.PHASE_TIMEOUT;
@@ -63,6 +64,7 @@ import org.junit.jupiter.params.provider.ValueSource;
  * <p>Multi-process: part of the heavy suites.</p>
  */
 @Timeout(300)
+@Tag("slow")
 class PublicApiRecoveryTest {
 
 	private static final Duration CALL_TIMEOUT = Duration.ofSeconds(40);

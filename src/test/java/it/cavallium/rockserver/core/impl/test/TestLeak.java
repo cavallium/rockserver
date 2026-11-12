@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.core.impl.test;
 
+import org.junit.jupiter.api.Tag;
 import org.rocksdb.Options;
 import org.rocksdb.WriteBatch;
 import org.rocksdb.WriteOptions;
@@ -7,6 +8,7 @@ import org.rocksdb.RocksDB;
 import org.junit.jupiter.api.Test;
 import java.io.File;
 
+@Tag("slow")
 public class TestLeak {
     static {
         RocksDB.loadLibrary();

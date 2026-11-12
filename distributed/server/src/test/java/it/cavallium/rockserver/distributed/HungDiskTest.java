@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.distributed;
 
+import org.junit.jupiter.api.Tag;
 import static it.cavallium.rockserver.distributed.ScenarioSupport.BATCH_CONTEXT;
 import static it.cavallium.rockserver.distributed.ScenarioSupport.CLIENT_RETRY_TIMEOUT;
 import static it.cavallium.rockserver.distributed.ScenarioSupport.PHASE_TIMEOUT;
@@ -38,6 +39,7 @@ import org.junit.jupiter.params.provider.ValueSource;
  * {@code -Drockserver.test.hungDisk=true}.</p>
  */
 @Timeout(600)
+@Tag("slow")
 class HungDiskTest {
 
 	@TempDir

@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.distributed;
 
+import org.junit.jupiter.api.Tag;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
@@ -40,6 +41,7 @@ import org.junit.jupiter.api.io.TempDir;
 
 /** Start-up checks that need a cluster: removed nodes, peer API addresses, seed digests. */
 @Timeout(180)
+@Tag("slow")
 class StartupClusterTest {
 
 	private static final Duration TIMEOUT = Duration.ofSeconds(30);

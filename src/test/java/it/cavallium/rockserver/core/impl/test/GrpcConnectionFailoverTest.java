@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.core.impl.test;
 
+import org.junit.jupiter.api.Tag;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -90,6 +91,7 @@ import org.junit.jupiter.api.parallel.Resources;
  */
 @Timeout(60)
 @ResourceLock(Resources.SYSTEM_PROPERTIES)
+@Tag("slow")
 class GrpcConnectionFailoverTest {
 
 	private static final ColumnSchema SCHEMA = ColumnSchema.of(IntList.of(Long.BYTES), ObjectList.of(), true);

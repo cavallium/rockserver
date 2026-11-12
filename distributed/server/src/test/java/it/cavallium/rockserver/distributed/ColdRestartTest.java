@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.distributed;
 
+import org.junit.jupiter.api.Tag;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -76,6 +77,7 @@ import org.junit.jupiter.api.io.TempDir;
  * syncs its SST files, MANIFEST and closed WALs itself).</p>
  */
 @Timeout(value = 10, unit = TimeUnit.MINUTES)
+@Tag("slow")
 class ColdRestartTest {
 
 	private static final int CYCLES = 5;

@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.distributed;
 
+import org.junit.jupiter.api.Tag;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -34,6 +35,7 @@ import org.junit.jupiter.api.io.TempDir;
 
 /** {@link ClusterClient} against a real single-node Rockserver gRPC server. */
 @Timeout(60)
+@Tag("slow")
 class ClusterClientTest {
 
 	private static final RequestContext CONTEXT = RequestContext.latency(Duration.ofSeconds(5));

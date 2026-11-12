@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.distributed;
 
+import org.junit.jupiter.api.Tag;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -20,6 +21,7 @@ import org.junit.jupiter.api.io.TempDir;
  * leader from raising the version to it.
  */
 @Timeout(120)
+@Tag("slow")
 class PollPeersTest {
 
 	private static final Duration TIMEOUT = Duration.ofSeconds(30);

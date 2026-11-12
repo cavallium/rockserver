@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.distributed;
 
+import org.junit.jupiter.api.Tag;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
@@ -48,6 +49,7 @@ import org.junit.jupiter.api.io.TempDir;
  * The guard turns what it lets through into a compare-and-set against the configuration it checked.
  */
 @Timeout(180)
+@Tag("slow")
 class MembershipGuardTest {
 
 	private static final Duration TIMEOUT = Duration.ofSeconds(30);

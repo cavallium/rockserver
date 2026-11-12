@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.distributed;
 
+import org.junit.jupiter.api.Tag;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -28,6 +29,7 @@ import org.junit.jupiter.api.io.TempDir;
  * exit code 3, and the client's retry carried it to the next node.
  */
 @Timeout(240)
+@Tag("slow")
 class DirectMemoryProcessTest {
 
 	private static final Duration READY = Duration.ofSeconds(60);

@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.core.impl.test;
 
+import org.junit.jupiter.api.Tag;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -42,6 +43,7 @@ import reactor.core.publisher.Flux;
  * budget is taken ({@code GrpcServer.numberedMultiCollectBytes}).
  */
 @Timeout(60)
+@Tag("slow")
 class NumberedCollectIdleTest {
 
 	private static final String IDLE_PROPERTY = "rockserver.grpc.numbered-multi-collect-idle-ms";

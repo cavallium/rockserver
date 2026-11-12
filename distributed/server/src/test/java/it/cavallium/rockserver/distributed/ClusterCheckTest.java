@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.distributed;
 
+import org.junit.jupiter.api.Tag;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
 import it.cavallium.rockserver.core.common.Utils.HostAndPort;
@@ -24,6 +25,7 @@ import org.junit.jupiter.api.Test;
  * once per term, a follower that does not answer is asked again only after the retry pause, and a new term asks
  * every follower again.
  */
+@Tag("slow")
 class ClusterCheckTest {
 
 	private static final RaftGroupId GROUP = RaftGroupId.valueOf(UUID.randomUUID());

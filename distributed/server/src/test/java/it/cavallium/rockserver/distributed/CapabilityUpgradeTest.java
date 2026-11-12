@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.distributed;
 
+import org.junit.jupiter.api.Tag;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -31,6 +32,7 @@ import org.junit.jupiter.api.io.TempDir;
  * starts with the next term, not in the current one.
  */
 @Timeout(300)
+@Tag("slow")
 class CapabilityUpgradeTest {
 
 	private static final Duration TIMEOUT = Duration.ofSeconds(60);

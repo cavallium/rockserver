@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.core.impl.test;
 
+import org.junit.jupiter.api.Tag;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -53,6 +54,7 @@ import reactor.core.publisher.Mono;
 import reactor.test.StepVerifier;
 
 @Timeout(30)
+@Tag("slow")
 class GrpcConnectionStreamingTest {
 
 	private static final int BATCH_SIZE = 1_001;

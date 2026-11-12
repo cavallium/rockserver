@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.core.impl.test;
 
+import org.junit.jupiter.api.Tag;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -22,6 +23,7 @@ import java.util.function.IntConsumer;
 import org.junit.jupiter.api.Test;
 
 /** Exhaustive bisimulation over the bounded two-pool pressure-controller state graph. */
+@Tag("slow")
 class WorkloadPressureControllerExhaustiveTest {
 
 	private static final int MAX_DEPTH = 20;

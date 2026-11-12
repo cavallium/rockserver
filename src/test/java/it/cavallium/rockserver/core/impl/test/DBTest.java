@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.core.impl.test;
 
+import org.junit.jupiter.api.Tag;
 import static it.cavallium.rockserver.core.common.Utils.emptyBuf;
 import static it.cavallium.rockserver.core.common.Utils.toBufSimple;
 
@@ -39,6 +40,7 @@ import it.cavallium.rockserver.core.impl.ColumnInstance;
 import it.cavallium.rockserver.core.impl.EmbeddedDB;
 
 @TestMethodOrder(MethodOrderer.MethodName.class)
+@Tag("slow")
 abstract class DBTest {
 
 	protected EmbeddedConnection db;

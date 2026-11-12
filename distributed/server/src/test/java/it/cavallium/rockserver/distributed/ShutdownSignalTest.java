@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.distributed;
 
+import org.junit.jupiter.api.Tag;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -34,6 +35,7 @@ import org.junit.jupiter.params.provider.ValueSource;
  * (R61-13). {@link StartExitProcessTest} and {@link PortInUseProcessTest} run the start's cases with a real SIGTERM and
  * a real {@code System.exit}.
  */
+@Tag("slow")
 class ShutdownSignalTest {
 
 	private static final Duration TIMEOUT = Duration.ofSeconds(30);

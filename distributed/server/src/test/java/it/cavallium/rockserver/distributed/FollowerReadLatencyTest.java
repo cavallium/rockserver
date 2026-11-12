@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.distributed;
 
+import org.junit.jupiter.api.Tag;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -27,6 +28,7 @@ import org.junit.jupiter.api.io.TempDir;
  * on a quiet cluster and with a writer in the background. It prints the percentiles (see "Follower reads" in the design
  * document) and checks that with the heartbeats the follower serves nearly every read itself.
  */
+@Tag("slow")
 class FollowerReadLatencyTest {
 
 	private static final Duration TIMEOUT = Duration.ofSeconds(30);

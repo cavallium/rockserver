@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.distributed;
 
+import org.junit.jupiter.api.Tag;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -70,6 +71,7 @@ import org.junit.jupiter.api.io.TempDir;
  * down; then every replica's database must hold exactly the acknowledged puts.</p>
  */
 @Timeout(300)
+@Tag("slow")
 class RollingRestartTest {
 
 	private static final int NODES = 3;

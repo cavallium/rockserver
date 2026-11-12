@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.distributed;
 
+import org.junit.jupiter.api.Tag;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -41,6 +42,7 @@ import org.rocksdb.WriteBatch;
  * The partitioned apply gives the results and the database of the serial apply, byte for byte: two replicas apply the
  * same randomized log, one serially and one in lanes, and are compared after every group.
  */
+@Tag("slow")
 class ParallelApplyTest {
 
 	private static final ColumnSchema FIXED = ColumnSchema.of(IntList.of(Long.BYTES), ObjectList.of(), true);

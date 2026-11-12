@@ -14,6 +14,7 @@ on:
   workflow_dispatch:
 
 env:
+  # -Pslow-tests (in the mvn commands below): the default build skips the tests tagged @Tag("slow"); CI runs them all.
   MAVEN_ARGS: -B -ntp
   # Test directories on the runner's disk, not on a tmpfs /tmp: fsync must cost what it costs (design.md, "Tests").
   TEST_TMPDIR: ${{ github.workspace }}/../rockserver-test-tmp
@@ -41,12 +42,12 @@ jobs:
       - name: gcc for the fault-injecting storage shim (FaultFsTest, DiskFaultTest)
         run: apt-get update && apt-get install -y --no-install-recommends gcc libc6-dev
       - name: Core tests
-        run: mvn $MAVEN_ARGS test
+        run: mvn $MAVEN_ARGS -Pslow-tests test
       - name: Distributed fast tests
         run: |
           mkdir -p "$TEST_TMPDIR"
           excluded=$(echo "$PROCESS_SUITES" | tr -d ' \n' | sed 's/\([^,]*\)/!\1/g')
-          mvn $MAVEN_ARGS -f distributed/pom.xml -pl server -am test \
+          mvn $MAVEN_ARGS -Pslow-tests -f distributed/pom.xml -pl server -am test \
             -Dsurefire.failIfNoSpecifiedTests=false \
             -Dtest="it.cavallium.rockserver.distributed.**,$excluded" \
             -Drockserver.test.tmpdir="$TEST_TMPDIR" \
@@ -80,7 +81,7 @@ jobs:
       - name: Whole distributed suite, multi-process scenarios included
         run: |
           mkdir -p "$TEST_TMPDIR"
-          mvn $MAVEN_ARGS -f distributed/pom.xml -pl server -am test \
+          mvn $MAVEN_ARGS -Pslow-tests -f distributed/pom.xml -pl server -am test \
             -Dsurefire.failIfNoSpecifiedTests=false \
             -Dtest='it.cavallium.rockserver.distributed.**' \
             -Drockserver.test.tmpdir="$TEST_TMPDIR" \

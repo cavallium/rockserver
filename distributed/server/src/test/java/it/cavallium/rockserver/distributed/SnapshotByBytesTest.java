@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.distributed;
 
+import org.junit.jupiter.api.Tag;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -25,6 +26,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 /** Snapshots are taken by applied log bytes too, not only every {@code snapshotEveryEntries} entries. */
+@Tag("slow")
 class SnapshotByBytesTest {
 
 	private static final Duration TIMEOUT = Duration.ofSeconds(30);

@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.distributed;
 
+import org.junit.jupiter.api.Tag;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
@@ -42,6 +43,7 @@ import org.junit.jupiter.api.io.TempDir;
  * that id keeps such a node out.
  */
 @Timeout(120)
+@Tag("slow")
 class ClusterIdentityTest {
 
 	private static final Duration TIMEOUT = Duration.ofSeconds(30);

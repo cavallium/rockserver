@@ -16,6 +16,8 @@
     <native.maven.plugin.version>0.10.6</native.maven.plugin.version>
     <gestalt.version>0.37.2</gestalt.version>
     <jazzer.version>0.30.0</jazzer.version>
+    <!-- JUnit tag groups the tests skip by default: the slow ones. -Pslow-tests empties it (runs everything). -->
+    <rockserver.excludedGroups>slow</rockserver.excludedGroups>
     <junit.version>5.14.3</junit.version>
     <rocksdb.version>11.8.1.14</rocksdb.version>
     <slf4j.version>2.0.17</slf4j.version>
@@ -450,6 +452,7 @@
         <artifactId>maven-surefire-plugin</artifactId>
         <version>3.2.5</version>
         <configuration>
+          <excludedGroups>${rockserver.excludedGroups}</excludedGroups>
           <argLine>-XX:+EnableDynamicAgentLoading --enable-native-access=ALL-UNNAMED --add-modules jdk.incubator.vector -Dsun.net.inetaddr.ttl=0</argLine>
           <systemPropertyVariables>
             <jazzer.instrument>it.cavallium.rockserver.**</jazzer.instrument>
@@ -869,6 +872,38 @@
       </build>
     </profile>
 
+    <!-- Runs the whole test suite: the fast tests and the ones tagged @Tag("slow") (skipped by default).
+         Activating any profile switches off the activeByDefault `library` profile, so its source root is repeated
+         here (same execution id: Maven merges it when both are active). -->
+    <profile>
+      <id>slow-tests</id>
+      <properties>
+        <rockserver.excludedGroups></rockserver.excludedGroups>
+      </properties>
+      <build>
+        <plugins>
+          <plugin>
+            <groupId>org.codehaus.mojo</groupId>
+            <artifactId>build-helper-maven-plugin</artifactId>
+            <version>3.6.0</version>
+            <executions>
+              <execution>
+                <id>add-source</id>
+                <phase>generate-sources</phase>
+                <goals>
+                  <goal>add-source</goal>
+                </goals>
+                <configuration>
+                  <sources>
+                    <source>src/library/java/</source>
+                  </sources>
+                </configuration>
+              </execution>
+            </executions>
+          </plugin>
+        </plugins>
+      </build>
+    </profile>
     <profile>
       <id>library</id>
       <activation>

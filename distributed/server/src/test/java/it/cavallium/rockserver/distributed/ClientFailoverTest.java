@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.distributed;
 
+import org.junit.jupiter.api.Tag;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -54,6 +55,7 @@ import reactor.core.publisher.Flux;
  * (SIGKILL): the client only sees errors it may retry, and keeps working on another node without a new connection.
  */
 @Timeout(180)
+@Tag("slow")
 class ClientFailoverTest {
 
 	private static final Duration READY_TIMEOUT = Duration.ofSeconds(60);

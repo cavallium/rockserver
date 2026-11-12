@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.core.impl.test;
 
+import org.junit.jupiter.api.Tag;
 import com.sun.management.ThreadMXBean;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import it.cavallium.rockserver.core.common.OperationFamily;
@@ -28,6 +29,7 @@ import static java.util.concurrent.TimeUnit.MILLISECONDS;
 import static java.util.concurrent.TimeUnit.SECONDS;
 import static org.junit.jupiter.api.Assertions.*;
 
+@Tag("slow")
 class RWSchedulerCooperativeTest {
 
 	private static final long RANGE_QUANTUM_NANOS = Duration.ofMillis(8).toNanos();

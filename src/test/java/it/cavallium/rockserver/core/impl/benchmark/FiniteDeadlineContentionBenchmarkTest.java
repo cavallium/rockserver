@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.core.impl.benchmark;
 
+import org.junit.jupiter.api.Tag;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -13,6 +14,7 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+@Tag("slow")
 class FiniteDeadlineContentionBenchmarkTest {
 
 	private static final int OPERATIONS = 16_384;

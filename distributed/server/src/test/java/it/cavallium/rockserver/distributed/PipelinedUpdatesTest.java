@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.distributed;
 
+import org.junit.jupiter.api.Tag;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -54,6 +55,7 @@ import org.junit.jupiter.api.io.TempDir;
  * Updates of one key with {@link NodeConfig#pipelinedUpdates()} on, on real Ratis servers in one JVM. Most tests stop
  * the leader's apply with {@code testHooks().applyGate}, which keeps chain links unsettled for as long as a test needs.
  */
+@Tag("slow")
 class PipelinedUpdatesTest {
 
 	private static final Duration TIMEOUT = Duration.ofSeconds(30);

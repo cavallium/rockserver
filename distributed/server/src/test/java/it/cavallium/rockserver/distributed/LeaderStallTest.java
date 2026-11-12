@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.distributed;
 
+import org.junit.jupiter.api.Tag;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -50,6 +51,7 @@ import org.junit.jupiter.api.io.TempDir;
  * links of a {@link Network}, so that a test can lose exactly one reply.
  */
 @Timeout(120)
+@Tag("slow")
 class LeaderStallTest {
 
 	private static final Duration ELECTION_TIMEOUT_MAX = Duration.ofSeconds(2);

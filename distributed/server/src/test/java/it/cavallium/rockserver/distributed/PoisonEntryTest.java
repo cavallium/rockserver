@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.distributed;
 
+import org.junit.jupiter.api.Tag;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
@@ -47,6 +48,7 @@ import org.rocksdb.Status;
  * code) is a result, not a local failure: every replica records the same failure and the log moves on. Only a failure
  * of the local storage stops a replica.
  */
+@Tag("slow")
 class PoisonEntryTest {
 
 	private static final Duration TIMEOUT = Duration.ofSeconds(30);

@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.distributed;
 
+import org.junit.jupiter.api.Tag;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -25,6 +26,7 @@ import org.junit.jupiter.api.io.TempDir;
  * configuration confirm it (see {@link RemovalRule}); otherwise it starts, outside the cluster if its log leaves it out.
  */
 @Timeout(300)
+@Tag("slow")
 class JointRemovalStartTest {
 
 	/** Long enough that the leader keeps its leadership (Ratis' step-down wait is the election timeout) while it writes. */

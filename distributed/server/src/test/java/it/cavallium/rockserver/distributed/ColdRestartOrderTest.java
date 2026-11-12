@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.distributed;
 
+import org.junit.jupiter.api.Tag;
 import static it.cavallium.rockserver.distributed.RemovalScenarios.TIMEOUT;
 import static it.cavallium.rockserver.distributed.RemovalScenarios.awaitReadyLeader;
 import static it.cavallium.rockserver.distributed.RemovalScenarios.setConfiguration;
@@ -22,6 +23,7 @@ import org.junit.jupiter.api.io.TempDir;
  * starts among them exits with 4 once a majority of the members are up, whether it starts before them or after.
  */
 @Timeout(600)
+@Tag("slow")
 class ColdRestartOrderTest {
 
 	/** Kept when a test fails, for the node logs. */

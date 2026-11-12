@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.distributed;
 
+import org.junit.jupiter.api.Tag;
 import static it.cavallium.rockserver.distributed.ClientFailoverTest.awaitLeader;
 import static it.cavallium.rockserver.distributed.ClientFailoverTest.remotePort;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -42,6 +43,7 @@ import org.junit.jupiter.api.io.TempDir;
  * API, so that a client given every node's address moves to the majority, and it serves again after the heal.
  */
 @Timeout(180)
+@Tag("slow")
 class IsolatedNodeTest {
 
 	private static final Duration READY_TIMEOUT = Duration.ofSeconds(60);

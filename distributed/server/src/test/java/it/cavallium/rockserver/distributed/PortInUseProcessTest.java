@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.distributed;
 
+import org.junit.jupiter.api.Tag;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -22,6 +23,7 @@ import org.junit.jupiter.api.io.TempDir;
  * exit with 1 and print the cause, not wait for itself in its shutdown hook; with a taken API port the start fails
  * with an exception, which must give the same exit status.
  */
+@Tag("slow")
 class PortInUseProcessTest {
 
 	/** Far more than a JVM, an empty database and a Raft server that fails to bind take (a few seconds). */

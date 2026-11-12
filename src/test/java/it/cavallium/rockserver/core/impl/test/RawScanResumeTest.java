@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.core.impl.test;
 
+import org.junit.jupiter.api.Tag;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
@@ -55,6 +56,7 @@ import reactor.core.publisher.BaseSubscriber;
 import reactor.test.StepVerifier;
 
 @Timeout(90)
+@Tag("slow")
 class RawScanResumeTest {
 
 	private static final String COLUMN_NAME = "events";

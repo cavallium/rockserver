@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.distributed;
 
+import org.junit.jupiter.api.Tag;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -25,6 +26,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 /** Cross-replica checksums on a real 3-node cluster: a divergence is reported, schemas count, the schedule survives a leader change. */
+@Tag("slow")
 class ChecksumTest {
 
 	private static final Duration TIMEOUT = Duration.ofSeconds(60);

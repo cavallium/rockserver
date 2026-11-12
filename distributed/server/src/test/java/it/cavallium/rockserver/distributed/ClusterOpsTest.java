@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.distributed;
 
+import org.junit.jupiter.api.Tag;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -30,6 +31,7 @@ import org.junit.jupiter.api.io.TempDir;
  * every replica computes alike, a backup that every replica writes at the same position, the restore of that backup
  * into a new cluster, and the gauges of {@link NodeMonitor} exported to each node's registry.
  */
+@Tag("slow")
 class ClusterOpsTest {
 
 	private static final Duration TIMEOUT = Duration.ofSeconds(60);

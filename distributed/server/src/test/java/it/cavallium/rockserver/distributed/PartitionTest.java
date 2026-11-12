@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.distributed;
 
+import org.junit.jupiter.api.Tag;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -66,6 +67,7 @@ import org.junit.jupiter.api.io.TempDir;
  * traffic crosses the {@link Network}.</p>
  */
 @Timeout(300)
+@Tag("slow")
 class PartitionTest {
 
 	private static final Duration READY_TIMEOUT = Duration.ofSeconds(60);

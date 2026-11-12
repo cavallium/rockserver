@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.core.impl.test;
 
+import org.junit.jupiter.api.Tag;
 import it.cavallium.rockserver.core.impl.AdaptiveBatcher;
 import java.time.Duration;
 import java.util.List;
@@ -12,6 +13,7 @@ import org.junit.jupiter.api.Timeout;
 import reactor.core.publisher.Flux;
 import reactor.core.scheduler.Schedulers;
 
+@Tag("slow")
 public class ReproduceStallTest {
 
     @Timeout(30)

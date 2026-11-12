@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.distributed;
 
+import org.junit.jupiter.api.Tag;
 import static it.cavallium.rockserver.distributed.RemovalScenarios.TIMEOUT;
 import static it.cavallium.rockserver.distributed.RemovalScenarios.awaitConfigurationOnDisk;
 import static it.cavallium.rockserver.distributed.RemovalScenarios.awaitReadyLeader;
@@ -26,6 +27,7 @@ import org.junit.jupiter.api.io.TempDir;
  * committed removal: X is still a member and must start.
  */
 @Timeout(300)
+@Tag("slow")
 class FlattenedConfigurationStartTest {
 
 	private static final Duration ELECTION_MIN = Duration.ofSeconds(2);

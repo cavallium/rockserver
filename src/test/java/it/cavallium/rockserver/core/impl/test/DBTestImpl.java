@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.core.impl.test;
 
+import org.junit.jupiter.api.Tag;
 import static it.cavallium.rockserver.core.common.Utils.emptyBuf;
 import static it.cavallium.rockserver.core.common.Utils.toBufSimple;
 
@@ -9,6 +10,7 @@ import it.cavallium.rockserver.core.common.Keys;
 import it.unimi.dsi.fastutil.ints.IntList;
 import it.unimi.dsi.fastutil.objects.ObjectList;
 
+@Tag("slow")
 public class DBTestImpl {
 
 	public static class DBFixedAndVarKeysWithoutValueTest extends DBTest {

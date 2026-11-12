@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.distributed;
 
+import org.junit.jupiter.api.Tag;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
@@ -52,6 +53,7 @@ import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
 /** Replication through real Ratis servers in one JVM: writes, reads, transactions, restarts, catch-up. */
+@Tag("slow")
 class ReplicationTest {
 
 	private static final Duration TIMEOUT = Duration.ofSeconds(30);

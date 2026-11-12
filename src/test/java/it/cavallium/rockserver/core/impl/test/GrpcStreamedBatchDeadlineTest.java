@@ -1,5 +1,6 @@
 package it.cavallium.rockserver.core.impl.test;
 
+import org.junit.jupiter.api.Tag;
 import static it.cavallium.rockserver.core.common.Utils.toBuf;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
@@ -60,6 +61,7 @@ import reactor.core.scheduler.Schedulers;
  * outcome. One whose timeout passes between two batches ends before writing the next one.
  */
 @Timeout(60)
+@Tag("slow")
 class GrpcStreamedBatchDeadlineTest {
 
 	private static final long CONTEXT_TIMEOUT_NANOS = TimeUnit.SECONDS.toNanos(1);
