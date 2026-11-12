@@ -20,7 +20,11 @@ Terms. *Seed*: the rate the limiter is built with, write buffer / 5 (one memtabl
 the budget (the limiter was the bottleneck). *Baseline*: the reference point-read mean (bulk reads have their own, per
 key). *Slow*: a window with background I/O whose point mean is over 1.2x its baseline, or whose bulk mean per key is
 over 1.2x its baseline. *Debt*: 0..1, the worst column's max(pending compaction bytes / soft pending limit,
-L0 files / L0 slowdown trigger); 1 is where RocksDB starts to delay writes.
+L0 files / L0 slowdown trigger); 1 is where RocksDB starts to delay writes. *Write stall*: RocksDB stops writes
+(`rocksdb.is-write-stopped`) or delays them (`rocksdb.actual-delayed-write-rate` != 0); `Sample.stopped`,
+`Sample.writeDelayed`. *Urgent pressure* (`Sample.urgentPressure`): a write stall, or a column with L0 files at its
+slowdown trigger, or (max write buffers <= 3) a column one immutable memtable short of a stop, which with the default
+of 2 write buffers is every flush in progress.
 
 ## The control law
 
@@ -40,11 +44,43 @@ in use, whatever the budget: slow reads lower the budget from the *achieved* rat
 | | no background I/O | baseline moves 20% towards the window's mean |
 | PROBE (2) | 1 settle window, then 2 windows both with reads 10% faster and achieved 10% lower | reduction kept; *c* = the rate before it; baseline only falls. Still slow: next reduction at once |
 | | a measured window without that | budget restored; baseline moves halfway to the current mean; after slow reads, 12 windows before the next reduction; calibration ends |
-| any | poll with writes delayed/stopped, L0 at its slowdown trigger, or flush headroom gone | -> RECOVERY (3): budget = max(seed, last known service, budget); x2 per saturated window while it lasts; never lowered |
+| any | poll under urgent pressure | -> RECOVERY (3): budget = max(seed, last known service, budget); x2 per saturated window while it lasts; never lowered |
+| any | poll with a write stall | the budget as in the row above, then -> UNLIMITED (4): the limiter is set to 9,223,372,036,854 B/s in that poll; the budget is kept |
+| UNLIMITED (4) | every poll | dropped: no window is formed from it, nothing is learned, the budget does not move (only the debt floor can raise it) |
+| | 10 s between two polls without a write stall | limiter = the kept budget; -> RECOVERY, whose two windows start here |
 | RECOVERY | 2 windows without pressure | -> BOOTSTRAP (baseline and *c* forgotten) |
 | any | every valid poll | floor = seed for debt <= 0.5, linear to the last known service at debt 1; budget raised to the floor |
 
-The controller writes the limiter only when the budget differs from its rate by 5% or more (always in RECOVERY).
+The controller writes the limiter only when the budget differs from its rate by 5% or more (always in RECOVERY and
+UNLIMITED). `CompactionIoBudget.sample` returns the rate for the limiter; `budget()` and the `.budget` gauge are the
+budget of the law, which in UNLIMITED is the rate the limiter returns to.
+
+### Write stalls
+
+Why unlimited and not a larger budget (reasoned from the RocksDB sources, not observed): a flush takes its limiter
+priority once, when it starts (`db/flush_job.cc`): `IO_HIGH` unless writes are already stopped or delayed.
+Compaction output files opened while writes are stopped or delayed get `IO_USER` (`db/compaction/compaction_job.cc`),
+which the limiter always serves first. So a flush that started just before the stall gets no tokens for as long as
+compaction asks for the whole budget, and the stall it has to clear does not clear. RECOVERY alone doubled the
+budget once per saturated 5 s window: several windows with writes stopped. At the unlimited rate nothing waits.
+
+- **When**: in the poll that sees the stall (polls are 1 s apart), from every state, also when the rest of the
+  sample is unusable. Not for the other urgent pressure: there no priority is inverted, and with 2 write buffers
+  it would switch the limiter off during every flush and the 10 s after it. That keeps the law of RECOVERY.
+- **How long**: until 10 s lie between two polls that both saw no stall. A stall seen again in between starts the
+  10 s again, so a flag that comes and goes changes the limiter twice per episode, not twice per poll.
+- **Afterwards**: the budget RECOVERY set when the pressure began, which is the larger of the budget in force
+  before the stall (from PROBE: the one before the reduction), the seed and the last background service measured
+  under the limiter. Not the floor. Not the rate reached without a limit: that is the device with reads starved,
+  and no window of it saturated a limiter.
+- **Learning**: polls over an unlimited interval are dropped before any window is formed (the poll that ends the
+  hold too: the second it closes was still unlimited). Capacity, known service, shutdown budget, point and bulk
+  baselines and references, tail envelopes, the readahead service rate and the harmful rate *c* see none of it.
+- **Harm detection around it**: none while unlimited (reads are expected to be slow). After the hold RECOVERY
+  compares nothing and lowers nothing for at least two windows; BOOTSTRAP then takes a new baseline from the first
+  window with background I/O, 10 s or more after the limiter came back. The baseline from before the stall is
+  never used again, so the slow reads of the backlog draining are not harm; if they enter the new baseline, the
+  calibration trials after BOOTSTRAP and the baseline's free fall correct it as after any RECOVERY.
 
 ### Constants and why
 
@@ -62,6 +98,9 @@ The controller writes the limiter only when the budget differs from its rate by 
 | healthy tolerance | 1.2 x baseline; the baseline may rise to 1.2 x its lowest level | Existing (aeede04). Effective tolerance while probing: up to 1.44x. |
 | debt floor | from debt 0.5, linear to the last known service at 1.0 | Proportional opening before the stall instead of only at it; 0.5 leaves the lower half of the debt range to latency. |
 | dead band | 5% | Every decrease of the law is >= 10%; only slow upward movement is batched. |
+| unlimited rate | 9,223,372,036,854 B/s (`Long.MAX_VALUE / 1,000,000`) | The native limiter computes rate x refill period in microseconds / 1,000,000 in 64 bits: no overflow for any period up to 1 s without relying on its guard (here 100 ms: 859 GiB per refill). Never 0: the native setter only asserts it and then divides by it. `budget()` and `sample` are never under 40,960. |
+| what opens the limiter | writes stopped or delayed, nothing else | The two write-controller states in which RocksDB raises compaction to `IO_USER`. |
+| hold after a stall | 10 s between two polls without one | Two windows, what RECOVERY asks before it ends. RocksDB re-evaluates the stall at every flush or compaction that completes, so near the trigger it flickers within seconds; closing on the first clear poll throttles the jobs that are clearing it. |
 
 ## Invariants and the tests that pin them
 
@@ -78,7 +117,12 @@ The controller writes the limiter only when the budget differs from its rate by 
 | Slow reads that do not answer to the rate lower nothing for good and are accepted (2 reductions, both undone, about 20 windows) | T `aWorksetShiftIsAcceptedAfterDecreasesThatDidNotHelp`, `mediaShiftWithForegroundProgressDoesNotBackOffPermanently`, `highLatencyWithoutProbeBenefit...` |
 | No back-and-forth: constant load, reads 12-18% over the first window: at most 2 changes of direction in 400 windows; with isolated 1.6x windows and limited demand the budget rests within 60 windows | I `aConstantLoadWithReadsJustUnderTheThreshold...` |
 | Fixed capacity, unlimited demand: at most 1 window in 8 slow, 1 in 8 changes direction, mean rate >= 90% of capacity | I `aDeviceWithAFixedCapacityIsProbedRarely` |
-| Urgent pressure always wins: every poll under pressure ends in RECOVERY with a budget not under the one before | T `urgentPressureAlwaysWins` |
+| Urgent pressure always wins: every poll under pressure ends in RECOVERY, or in UNLIMITED for a write stall, with a budget not under the one before | T `urgentPressureAlwaysWins` |
+| A poll with writes stopped or delayed returns the unlimited rate: at any poll of a window, from every state, with an unusable sample. The dead band does not hold it back and a real limiter takes the value (single burst = rate / 10) | T `aStopOrADelayAtAnyPollOfAWindowOpensTheLimiterInThatPoll`; R `aWriteStallOpensTheRealLimiterInThePollThatSeesIt...`, `limiterIsNotRewritten...` |
+| The limiter stays unlimited while the stall lasts and for 10 clear polls after it; a stall every other poll, or back within the hold, never closes it; 2 changes of the limiter per stall that ends | T `theLimiterStaysOpenWhileTheStallLasts...`, `aStallThatComesAndGoes...`, `anUnusablePollDoesNotCloseAnOpenLimiterBeforeTheHold`; I `aWriteStallOpensTheLimiterAtOnceAndTeachesNothing` |
+| After the hold the limiter is at the budget in force before the stall (from PROBE: before the reduction; from RECOVERY: what it had reached; from a new database: the seed) | T `afterAStallTheLimiterReturnsToTheBudgetInForceBeforeIt` |
+| Unlimited windows (60 MB/s under a 16 MB/s budget, reads 20x slower) leave budget, known service, shutdown budget, baseline and *c* unchanged; reads 3x slower in the windows after lower nothing; the budget never exceeds 2 x the demand of limited windows | T `nothingIsLearnedWhileTheLimiterIsUnlimitedNorFromTheReadsRightAfter`; I same (over 2000 stalls) |
+| What goes to the limiter is the budget or the unlimited rate: never under the seed, never 0 | T `noTraceTakesTheBudgetUnderTheSeed`; I (every poll) |
 | The baseline does not follow a slow degradation, and noise is not degradation | T `aRampOfPointLatencyIsNotFollowedAsHealthy`, `noisyPointMeansAreNotTakenForDegradation` |
 | Rising debt raises the floor monotonically; slow reads cannot go under it; falling debt returns it to the seed | T `risingCompactionDebt...` (2), `slowReadsCannotLowerTheBudgetUnderTheDebtFloor`, `fallingCompactionDebt...`, `unsampledOrInvalidDebtIsNoDebt` |
 | The sampled debt of a real database is L0 files / trigger (0 when empty) | G `healthyNativeSamplerReadsL0FilesAndPollsWithoutFailures` |
@@ -102,6 +146,7 @@ The controller writes the limiter only when the budget differs from its rate by 
 | 64dc4db | (tests) | The invariants above as randomized properties. |
 | a80abf9 | The floor was the constant seed; debt acted only as a stall. | Floor proportional to compaction debt; `Sample.compactionDebt`. |
 | 6c9e3d0 | The limiter was rewritten every second for any change. | 5% dead band in the controller. |
+| 6c25b18 | Review of the native side (reasoned, not observed): during a write stall compaction output is `IO_USER`, a flush that started before it stays `IO_HIGH` and gets no tokens while compaction asks for the budget; RECOVERY doubled the budget only once per saturated window. | Writes stopped or delayed: limiter unlimited in that poll, for the stall and 10 s after it; nothing learned from those polls; the budget from before returns. New state UNLIMITED (4), `Sample.writeDelayed`. |
 
 ## Literature (from the survey requested by the owner; the sources were not re-read for this file)
 
@@ -138,10 +183,19 @@ Considered, not done:
 - The debt floor cannot exceed the service once measured: a budget that never left the seed opens only at the stall.
   Debt 1 depends on each column's soft pending compaction limit and L0 slowdown trigger; those values were not reviewed.
 - The limiter can be up to 5% under the budget gauge.
+- Write stalls: the starvation of a flush behind `IO_USER` compaction was not reproduced, and no test stalls a
+  real database to watch the limiter open (the controller test drives a real limiter with scripted samples). The
+  stall is seen by a 1 s poll plus up to one 100 ms refill; a stall shorter than a poll can be missed.
+- Unlimited means unprotected: for the stall and 10 s after it compaction and flush take what the device gives, and
+  reads are as slow as that makes them. The compaction readahead size is not changed by this (a stop still sets it to 0).
+- The limiter returns to the budget that preceded the stall. If that budget is what let the debt grow, the stall
+  comes back; between stalls only the debt floor and the doubling of saturated windows raise it. A budget learned
+  from the burst would end that loop and is deliberately not taken (it is not a rate at which reads were healthy).
+- A poll whose sampling failed reports no stall; 10 s of such polls close the limiter at the kept budget (>= seed).
 
 ## What to watch when deploying
 
-Gauges (tag `db`): `rockserver.compaction.io.budget`, `.state` (0 BOOTSTRAP, 1 TRACKING, 2 PROBE, 3 RECOVERY),
+Gauges (tag `db`): `rockserver.compaction.io.budget`, `.state` (0 BOOTSTRAP, 1 TRACKING, 2 PROBE, 3 RECOVERY, 4 UNLIMITED),
 `.floor`, `.debt`, `.harm.ceiling`, `.point.read.micros`, `.baseline.read.micros`, `.adjustment.failures`; plus
 pending compaction bytes, L0 file counts and write stalls / delayed write rate.
 
@@ -149,7 +203,10 @@ pending compaction bytes, L0 file counts and write stalls / delayed write rate.
   with `.floor` still at the seed means no service above the seed was ever measured.
 - `.state` at 2 more than about a fifth of the time, or alternating 1/2 with a budget that returns to the same value:
   reads are slow and do not answer to the rate (see the baseline moving up in steps).
-- `.state` = 3 at all: a stall happened; check what `.debt` and `.floor` did in the minute before it.
+- `.state` = 3 at all: urgent pressure (with 2 write buffers a flush in progress is enough); check `.debt` and `.floor`.
+- `.state` = 4: writes were stopped or delayed within the last 10 s and the limiter is open; `.budget` is the rate it
+  returns to, not the rate in force. Check what `.debt` and `.floor` did in the minute before. Returning to 4 every
+  20-60 s with the same `.budget` in between: that budget is too low for the write load (see the limits above).
 - `.point.read.micros` over 1.4 x `.baseline.read.micros` for more than 3 windows without a decrease: a reduction is
   blocked (readahead settling, cooldown) or the budget is at the floor.
 - `.harm.ceiling` set and never 0 for hours with a budget well under it: harm keeps recurring at that rate.
