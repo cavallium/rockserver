@@ -33,7 +33,18 @@ public class Main {
 
 	@VisibleForTesting
 	static void run(String[] args, Runnable shutdownCompleteCallback) throws IOException, URISyntaxException {
+		run(args, shutdownCompleteCallback, () -> {});
+	}
+
+	/**
+	 * {@code connectedCallback} runs on the calling thread during the start, once the database is open and before the
+	 * servers are built: a test's way to make the start slow, fail or exit.
+	 */
+	@VisibleForTesting
+	static void run(String[] args, Runnable shutdownCompleteCallback, Runnable connectedCallback)
+			throws IOException, URISyntaxException {
 		requireNonNull(shutdownCompleteCallback, "shutdownCompleteCallback");
+		requireNonNull(connectedCallback, "connectedCallback");
 		ArgumentParser parser = ArgumentParsers.newFor("rockserver-core").build()
 				.defaultHelp(true)
 				.description("RocksDB server core");
@@ -138,6 +149,7 @@ public class Main {
 			try (var connection = clientBuilder.build()) {
 				try {
 					LOG.info("Connected to {}", connection);
+					connectedCallback.run();
 
 					thriftServerBuilder.setClient(connection);
 					grpcServerBuilder.setClient(connection);
