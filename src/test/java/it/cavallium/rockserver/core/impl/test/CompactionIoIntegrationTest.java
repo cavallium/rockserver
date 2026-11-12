@@ -634,7 +634,8 @@ class CompactionIoIntegrationTest {
     @Test void failedSamplerRestoresNativeProbeBudget(@TempDir Path root) throws Exception {
         RocksDBLoader.loadLibrary();
         var registry = new SimpleMeterRegistry();
-        try (var limiter = new RateLimiter(1_000_000, 100_000,
+        // Seed (flush floor) 500,000 B/s under a background of 1,000,000 B/s: the trial at 750,000 is above the floor.
+        try (var limiter = new RateLimiter(500_000, 100_000,
                 RateLimiter.DEFAULT_FAIRNESS, RateLimiterMode.ALL_IO, false)) {
             var calls = new AtomicInteger();
             var reduced = new AtomicLong();
@@ -670,7 +671,8 @@ class CompactionIoIntegrationTest {
         var restored = new CountDownLatch(1);
         var lateThrottle = new CountDownLatch(1);
         var restoreSeen = new AtomicBoolean();
-        try (var limiter = new RateLimiter(1_000_000, 100_000,
+        // Seed (flush floor) 500,000 B/s under a background of 1,000,000 B/s: the trial at 750,000 is above the floor.
+        try (var limiter = new RateLimiter(500_000, 100_000,
                 RateLimiter.DEFAULT_FAIRNESS, RateLimiterMode.ALL_IO, false) {
             @Override public void setBytesPerSecond(long bytes) {
                 super.setBytesPerSecond(bytes);

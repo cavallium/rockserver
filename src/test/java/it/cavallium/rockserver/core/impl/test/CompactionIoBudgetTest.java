@@ -6,12 +6,18 @@ import static org.junit.jupiter.api.Assertions.*;
 
 class CompactionIoBudgetTest {
     private static final long SEED = 1_000_000;
+    /**
+     * The limiter's own seed (the flush-safe floor) of the default trace. No trial and no kept reduction goes under
+     * it, so a trace that exercises rate trials starts under its working rate: its first saturated window lifts the
+     * budget from FLOOR to SEED, and the trials run between the two. {@code new Trace(SEED)} is a server at its floor.
+     */
+    private static final long FLOOR = SEED / 4;
     private static final class Trace {
         final CompactionIoBudget policy;
         long nanos, reads, micros, bytes, completions, nativePoints, nativeNanos;
         boolean point = true, timed = true;
         long pointMax;
-        Trace() { this(SEED); }
+        Trace() { this(FLOOR); }
         Trace(long seed) { policy = new CompactionIoBudget(seed); poll(0, 0, 0, false, false); }
         long poll(long count, long latency, long transferred, boolean pressure, boolean pending) {
             nanos += 1_000_000_000L; reads += count; micros += count * latency; bytes += transferred;
@@ -147,14 +153,100 @@ class CompactionIoBudgetTest {
         assertEquals(CompactionIoBudget.State.BOOTSTRAP, p.state(),
                 "soft hysteresis alone must not retain urgent recovery");
     }
-    @Test void probeTestsServiceWhenBudgetExceedsActualConsumption() {
+    @Test void aDemandLimitedWindowNeverStartsATrial() {
+        // It was probeTestsServiceWhenBudgetExceedsActualConsumption: 100 KB/s of background I/O under a 1 MB/s budget
+        // started a trial at 75 KB/s, the rate the next memtable flush was then throttled to.
         var t = new Trace(); t.window(10, 100, SEED);
         t.window(10, 100, SEED); t.window(10, 100, SEED); // restore prior budget
-        for (int i = 0; i < 13; i++) t.window(10, 100, 100_000);
-        assertEquals(CompactionIoBudget.State.PROBE, t.policy.state());
-        assertEquals(75_000, t.policy.budget());
-        t.window(10, 100, 75_000); t.window(10, 100, 75_000);
         assertEquals(SEED, t.policy.budget());
+        for (int i = 0; i < 40; i++) {
+            // Faster, equal and much slower point reads: none says anything about a limiter that limits nothing.
+            t.window(10, i % 3 == 0 ? 80 : i % 3 == 1 ? 100 : 300, 100_000);
+            assertEquals(CompactionIoBudget.State.TRACKING, t.policy.state(), "window " + i);
+            assertEquals(SEED, t.policy.budget(), "window " + i);
+        }
+        t.window(10, 100, SEED);
+        assertEquals(CompactionIoBudget.State.PROBE, t.policy.state(), "the limiter is the bottleneck again");
+        assertEquals(750_000, t.policy.budget());
+    }
+    @Test void aTrialNeverGoesUnderTheSeed() {
+        var t = new Trace(800_000);
+        t.window(10, 100, SEED);
+        assertEquals(CompactionIoBudget.State.PROBE, t.policy.state());
+        assertEquals(800_000, t.policy.budget(), "75% of the measured rate is under the flush floor: the trial stops at it");
+        t.window(10, 80, 800_000); t.window(10, 80, 800_000); t.window(10, 80, 800_000);
+        assertEquals(CompactionIoBudget.State.TRACKING, t.policy.state());
+        assertEquals(800_000, t.policy.budget(), "the reduction that helped point reads is kept, at the floor");
+        // At the floor no trial can start, however slow the point reads are and whatever the background does.
+        for (int i = 0; i < 40; i++) {
+            t.window(10, 500, i % 2 == 0 ? 800_000 : 100_000);
+            assertEquals(CompactionIoBudget.State.TRACKING, t.policy.state(), "window " + i);
+            assertTrue(t.policy.budget() >= 800_000, "window " + i + " budget " + t.policy.budget());
+        }
+    }
+    @Test void foregroundHarmReducesTheBudgetToTheSeedAndNoFurther() {
+        var t = new Trace(SEED);
+        t.window(10, 100, SEED);
+        assertEquals(CompactionIoBudget.State.TRACKING, t.policy.state(), "no trial at the flush floor");
+        assertEquals(SEED, t.policy.budget());
+        t.window(10, 100, SEED); t.window(10, 100, 2 * SEED); t.window(10, 100, 4 * SEED);
+        assertEquals(8 * SEED, t.policy.budget());
+        // Background I/O always moves the whole budget, and every trial makes point reads 20% faster: each one is kept.
+        long lowest = Long.MAX_VALUE;
+        int kept = 0;
+        for (int i = 0; i < 150; i++) {
+            boolean trial = t.policy.state() == CompactionIoBudget.State.PROBE;
+            long before = t.policy.budget();
+            t.window(10, trial ? 160 : 200, before);
+            if (trial && t.policy.state() == CompactionIoBudget.State.TRACKING && t.policy.budget() == before) kept++;
+            lowest = Math.min(lowest, t.policy.budget());
+            assertTrue(t.policy.budget() >= SEED, "window " + i + " budget " + t.policy.budget());
+            assertTrue(t.policy.shutdownBudget() >= SEED);
+        }
+        assertTrue(kept >= 2, "kept trials: " + kept);
+        assertEquals(SEED, lowest, "measured harm takes the budget down to the flush floor");
+    }
+    @Test void aSlowWindowAfterAGrowthStepIsTakenBackEvenWhenATrialIsDue() {
+        var t = new Trace(SEED);
+        t.window(10, 100, SEED); // BOOTSTRAP at the floor: no trial, 12 windows until the next one is due
+        for (int i = 0; i < 11; i++) t.window(10, 100, 100_000);
+        assertEquals(SEED, t.policy.budget());
+        t.window(10, 100, SEED);
+        assertEquals(2 * SEED, t.policy.budget());
+        t.window(10, 200, 2 * SEED); // a trial is due in this window; it would start from the harmful budget
+        assertEquals(CompactionIoBudget.State.TRACKING, t.policy.state());
+        assertEquals(SEED, t.policy.budget());
+        assertEquals(100, t.policy.baselineReadMicros(), 1, "the slow reads of the undone step are not the new baseline");
+    }
+    @Test void noTraceTakesTheBudgetUnderTheSeed() {
+        for (long seed : new long[]{CompactionIoBudget.MIN_BYTES_PER_SECOND, 300_000, SEED, 64 * SEED}) {
+            var random = new java.util.Random(seed);
+            var t = new Trace(seed);
+            long rate = seed, latency = 100;
+            boolean pressure = false;
+            for (int second = 0; second < 20_000; second++) {
+                if (random.nextInt(5) == 0) {
+                    rate = switch (random.nextInt(6)) {
+                        case 0 -> 0;
+                        case 1 -> 100;
+                        case 2 -> t.policy.budget() / 4;
+                        case 3 -> t.policy.budget() * 3 / 4;
+                        case 4 -> t.policy.budget();
+                        default -> t.policy.budget() * 2;
+                    };
+                    latency = 50L << random.nextInt(6);
+                    pressure = random.nextInt(40) == 0;
+                }
+                long count = random.nextInt(4) == 0 ? 0 : 10;
+                t.completions += count;
+                if (random.nextInt(200) == 0) {
+                    t.policy.sample(new CompactionIoBudget.Sample(t.nanos + 1, 0, 0, 0, false, pressure, pressure, false));
+                } else t.poll(count, latency, rate, pressure, random.nextBoolean());
+                assertTrue(t.policy.budget() >= seed, "seed " + seed + " second " + second + " budget "
+                        + t.policy.budget() + " in " + t.policy.state());
+                assertTrue(t.policy.shutdownBudget() >= seed);
+            }
+        }
     }
     @Test void insufficientResetAndStaleCountersHoldAndAbortProbeSafely() {
         var t = new Trace(); t.window(0, 0, SEED);
@@ -177,6 +269,18 @@ class CompactionIoBudgetTest {
         for (int i = 0; i < 60; i++) assertEquals(restored, t.poll(0, 0, SEED, false, true));
         assertEquals(CompactionIoBudget.State.TRACKING, t.policy.state());
     }
+    @Test void aDemandLimitedWindowDoesNotUseUpTheNoProgressTrial() {
+        var t = new Trace(); t.window(10, 100, SEED);
+        t.window(10, 100, SEED); t.window(10, 100, SEED); // restore failed probe
+        for (int i = 0; i < 20; i++) {
+            t.poll(0, 0, 100_000, false, true);
+            assertEquals(CompactionIoBudget.State.TRACKING, t.policy.state());
+            assertEquals(SEED, t.policy.budget());
+        }
+        for (int i = 0; i < 5; i++) t.poll(0, 0, SEED, false, true);
+        assertEquals(CompactionIoBudget.State.PROBE, t.policy.state(), "the first window that saturated the limiter");
+        assertEquals(750_000, t.policy.budget());
+    }
     @Test void completedCacheHitsOrMutationsPermitDemandGrowthWithoutBlockMisses() {
         var t = new Trace(); t.window(0, 0, SEED);
         long initial = t.policy.budget();
@@ -188,7 +292,7 @@ class CompactionIoBudgetTest {
     }
     @Test void tinyFirstActiveWindowDoesNotCollapseTheBudget() {
         // Production 2026-11-12: a few-KB flush right after start set the budget to the 40,960 B/s floor for 12 minutes.
-        var t = new Trace();
+        var t = new Trace(SEED);
         t.window(10, 100, 100);
         assertEquals(SEED, t.policy.budget(), "100 B/s of demand says nothing about the device");
         assertEquals(CompactionIoBudget.State.TRACKING, t.policy.state(), "a trial at the floor cannot slow 100 B/s");
@@ -337,9 +441,10 @@ class CompactionIoBudgetTest {
                     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, false,
                     6000, 0, second * 100, 0, 0, second * 600_000_000L));
         }
-        assertEquals(CompactionIoBudget.State.PROBE, p.state(),
+        assertEquals(CompactionIoBudget.State.TRACKING, p.state(),
                 "soft debt hysteresis alone must not bypass foreground calibration indefinitely");
-        assertEquals(SEED / 4 * .75, p.budget());
+        assertEquals(6000, p.baselineReadMicros(), "recovery ended and the point lane is calibrated");
+        assertEquals(SEED, p.budget(), "a quarter of the seed is demand, not service: no trial starts under it");
         for (int second = 16; second <= 25; second++) {
             p.sample(new CompactionIoBudget.Sample(second * 1_000_000_000L,
                     second * 100, second * 600_000, 15 * (SEED / 4) + (second - 15) * 187_500,
@@ -347,17 +452,16 @@ class CompactionIoBudgetTest {
                     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, false,
                     6000, 0, second * 100, 0, 0, second * 600_000_000L));
         }
-        assertEquals(SEED, p.budget(), "an ineffective latency probe must restore the budget it lowered"
-                + " (a quarter-seed window did not saturate the limiter, so it never lowered the budget)");
+        assertEquals(SEED, p.budget(), "slow point reads over a background the limiter does not limit lower nothing");
         assertEquals(CompactionIoBudget.State.TRACKING, p.state());
     }
     @Test void urgentEntryRestoresKnownServiceInsteadOfAnUnrelatedStartupSeed() {
         var t = new Trace();
-        t.window(10, 100, SEED / 4);
+        t.window(10, 100, SEED);
         assertEquals(CompactionIoBudget.State.PROBE, t.policy.state());
-        assertEquals(SEED / 4 * 3 / 4, t.policy.budget());
+        assertEquals(SEED * 3 / 4, t.policy.budget());
         t.policy.sample(new CompactionIoBudget.Sample(t.nanos + 1, 0, 0, 0, false, true, true, false));
-        assertEquals(SEED, t.policy.budget(), "the budget in force before the probe, not the demand of one window");
+        assertEquals(SEED, t.policy.budget(), "the budget in force before the trial: not the trial rate, not the limiter's seed");
         assertEquals(CompactionIoBudget.State.RECOVERY, t.policy.state());
     }
 
@@ -374,7 +478,7 @@ class CompactionIoBudgetTest {
         assertEquals(CompactionIoBudget.State.PROBE, t.policy.state());
     }
     @Test void knownUrgencyOverridesAnIncompleteSnapshotAndInvalidWindowsRestartClearance() {
-        var t = new Trace();
+        var t = new Trace(SEED);
         t.window(10, 100, SEED / 4);
         t.policy.sample(new CompactionIoBudget.Sample(t.nanos + 1, 0, 0, 0,
                 false, false, false, false, true, 0, false, true));
@@ -394,7 +498,7 @@ class CompactionIoBudgetTest {
         assertEquals(CompactionIoBudget.State.BOOTSTRAP, p.state());
     }
 
-    @Test void urgentReentryBeforeCalibrationDoesNotReuseAStaleStartupSeed() {
+    @Test void urgentReentryBeforeCalibrationStaysAtTheFlushFloor() {
         var p = new CompactionIoBudget(SEED);
         p.sample(new CompactionIoBudget.Sample(0, 0, 0, 0, false, true, true, true));
         for (int second = 1; second <= 15; second++) {
@@ -404,7 +508,8 @@ class CompactionIoBudgetTest {
         assertEquals(CompactionIoBudget.State.BOOTSTRAP, p.state());
         assertEquals(SEED, p.budget());
         p.sample(new CompactionIoBudget.Sample(16_000_000_000L, 0, 0, 4 * SEED, true, true, true, true));
-        assertEquals(SEED / 4, p.budget(), "known service must replace the startup seed before recalibration");
+        assertEquals(SEED, p.budget(), "a quarter of the seed was what the background asked for while writes were"
+                + " stopped; a stop must not put the limiter under the rate that flushes a memtable in 5 s");
     }
 
 }

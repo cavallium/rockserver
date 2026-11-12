@@ -55,8 +55,11 @@ class CompactionReadaheadTest {
         final CompactionIoBudget policy;
         int changes;
         long changedAt;
+        /** Background I/O moves the whole budget: a rate trial starts only from a window that saturated the limiter. */
+        boolean limiterBound;
         Trace(long ceiling) { policy = new CompactionIoBudget(in.rate, ceiling); step(); }
         void step() {
+            if (limiterBound) in.rate = policy.budget();
             policy.sample(in.next());
             long next = policy.readaheadBytes();
             if (next != in.applied) {
@@ -111,6 +114,7 @@ class CompactionReadaheadTest {
     @Test void delayedUnconfirmedReadersFreezeGrowthButCannotDisableRateProbesForever() {
         var t = new Trace(16 * MIB); t.in.readerDelay = Long.MAX_VALUE / 4;
         t.until(65536); long change = t.changedAt;
+        t.limiterBound = true;
         boolean probe = false;
         for (int i = 0; i < 200; i++) {
             t.step();
@@ -124,6 +128,7 @@ class CompactionReadaheadTest {
         for (boolean urgency : new boolean[]{false, true}) {
             var t = new Trace(16 * MIB); t.in.readerDelay = Long.MAX_VALUE / 4; t.until(65536);
             t.in.progress = false; t.in.pressure = urgency;
+            t.limiterBound = true; // The no-progress escape is a rate trial: the limiter must be the bottleneck.
             t.seconds(5);
             assertEquals(urgency ? CompactionIoBudget.State.RECOVERY : CompactionIoBudget.State.PROBE, t.policy.state());
             assertEquals(0, t.in.applied, "native pressure or foreground no-progress disables readahead immediately");
@@ -152,7 +157,8 @@ class CompactionReadaheadTest {
     }
     @Test void recoveryDisablesReadSizeDespiteRestoringUsefulByteBudget() throws Exception {
         for (long service : new long[]{2 * MIB, CompactionIoBudget.MIN_BYTES_PER_SECOND}) {
-            var p = new CompactionIoBudget(256 * MIB, 16 * MIB);
+            // The limiter's seed is the flush floor that recovery never goes under, so it is the reduced rate itself.
+            var p = new CompactionIoBudget(service, 16 * MIB);
             p.sample(new CompactionIoBudget.Sample(1, 0, 0, 0, true, false, false, true));
             acknowledge(p, MIB);
             for (var entry : java.util.Map.of("budget", service, "preThrottle", service, "probeBudget", 0L).entrySet()) {
@@ -325,6 +331,7 @@ class CompactionReadaheadTest {
     }
     @Test void healthyProbeBoundaryCannotCauseRepeatedCapShrinkRegrowthWobble() {
         var t = new Trace(16 * MIB); t.in.rate = 200 * MIB; t.until(16 * MIB);
+        t.limiterBound = true;
         int changes = t.changes; boolean probed = false;
         for (int i = 0; i < 500; i++) {
             t.step(); probed |= t.policy.state() == CompactionIoBudget.State.PROBE;

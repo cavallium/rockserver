@@ -147,7 +147,12 @@ public final class CompactionIoBudget {
             this(nanos, readCount, readMicros, bytes, background, pressure, stopped, valid, false, 0, !pressure && !stopped);
         }
     }
-    private final long seed, readaheadCeiling;
+    /**
+     * The rate the limiter was constructed with (write buffer / 5: one memtable flushes in about 5 s). It is the
+     * flush-safe floor: no state lowers, trials or keeps the budget under it, whatever foreground latency does.
+     */
+    private final long seed;
+    private final long readaheadCeiling;
     private volatile long readaheadBytes;
     private long appliedReadahead, readWindowNanos, compactionBytes, compactionMicros, compactionReads,
             prefetchEvents, prefetchedBytes, settleUntil, probeHoldUntil, lastReadServiceNanos,
@@ -288,7 +293,7 @@ public final class CompactionIoBudget {
             queueReferenceWindows = 0; probeQueueProtected = false;
             double usefulService = Math.max(preThrottle, Math.max(recentAchieved, probeBudget));
             if (usefulService > 0 && tracking) usefulService = Math.max(usefulService, budget);
-            budget = bound(usefulService > 0 ? usefulService : seed);
+            budget = bound(Math.max(seed, usefulService)); // Writes are delayed or stopped: never under the flush floor.
             probeBudget = 0;
             clearWindow();
         }
@@ -518,14 +523,15 @@ public final class CompactionIoBudget {
         recentAchieved = recentAchieved == 0 ? achieved : recentAchieved * .5 + achieved * .5;
         if (state == State.BOOTSTRAP) {
             // A window the limiter did not saturate measured demand, not service: it must not lower the budget.
-            if (achieved >= budget * .8) budget = bound(achieved);
+            if (achieved >= budget * .8) budget = bound(Math.max(seed, achieved));
             preThrottle = budget;
             state = State.TRACKING;
             if (pointReliable) baseline = latency;
             if ((pointReliable || bulkComparable) && bulkSafe) beginProbe(latency, foregroundRate, pointCallRate);
             return publishBudget();
         }
-        if (bulkNoProgress && !bulkNoProgressProbeUsed && bulkBaseline > 0) {
+        // The once-only no-progress trials wait for a window that saturated the limiter instead of being used up.
+        if (bulkNoProgress && !bulkNoProgressProbeUsed && bulkBaseline > 0 && limiterBound()) {
             bulkNoProgressProbeUsed = true;
             beginProbe(latency, foregroundRate, pointCallRate);
             return publishBudget();
@@ -534,26 +540,29 @@ public final class CompactionIoBudget {
         if (!pointReliable && !bulkComparable) {
             if (growthAllowed && (completedInWindow >= 32 || foregroundIdle) && achieved >= budget * .8) {
                 budget = grown(achieved);
-            } else if (noForegroundProgress && !noProgressProbeUsed && baseline > 0) {
+            } else if (noForegroundProgress && !noProgressProbeUsed && baseline > 0 && limiterBound()) {
                 noProgressProbeUsed = true;
                 beginProbe(baseline, foregroundRate, pointCallRate);
             }
             return publishBudget();
         }
         if (pointReliable && baseline == 0) baseline = latency;
-        if (cooldown == 0 && !rateProbeBlocked() && (bulkIdle || bulkComparable)) {
-            beginProbe(latency, foregroundRate, pointCallRate);
-        } else {
+        long undo = beforeGrowth;
+        beforeGrowth = 0;
+        if (unhealthyMean && undo > 0 && undo < budget) {
+            // The window after a growth step had slow reads: take the step back. This comes before a rate trial,
+            // which would start from the harmful budget or, at the flush floor, accept the slow reads as the baseline.
+            budget = undo;
             if (cooldown > 0) cooldown--;
-            long undo = beforeGrowth;
-            beforeGrowth = 0;
+        } else if (cooldown > 0 || rateProbeBlocked() || !(bulkIdle || bulkComparable)
+                || !beginProbe(latency, foregroundRate, pointCallRate)) {
+            // No trial started (a skipped one costs no window): cooldown, baseline tracking and growth go on.
+            if (cooldown > 0) cooldown--;
             if (pointHealthy && growthAllowed) {
                 if (pointReliable) baseline = baseline * .9 + latency * .1;
                 if (achieved >= budget * .8) {
                     budget = grown(achieved);
                 }
-            } else if (unhealthyMean && undo > 0 && undo < budget) {
-                budget = undo; // The window after a growth step had slow reads: take the step back.
             }
         }
         return publishBudget();
@@ -942,6 +951,8 @@ public final class CompactionIoBudget {
                 Math.max(Math.max(preThrottle, probeBudget), recentAchieved)));
         return budget;
     }
+    /** Whether the last window's background I/O used at least 80% of the budget: the limiter was its bottleneck. */
+    private boolean limiterBound() { return lastAchieved >= budget * .8; }
     private void finishProbe(boolean improved, double latency) {
         if (improved) {
             cautiousGrowth = 12;
@@ -961,21 +972,32 @@ public final class CompactionIoBudget {
         cooldown = 12;
         clearReadWindow();
     }
-    private void beginProbe(double latency, double foregroundRate, double pointCallRate) {
+    /**
+     * Starts a downward rate trial if one can be informative. A trial says something only while the limiter is the
+     * bottleneck of background I/O, and it must never starve a memtable flush:
+     * <ul>
+     * <li>a window that did not saturate the limiter (under 80% of the budget) starts none: the budget is not what
+     * background I/O ran at, and a rate under the measured demand would only throttle the next flush;</li>
+     * <li>the trial rate is never under the flush floor (the seed);</li>
+     * <li>a trial rate that is not at least 10% under the measured rate is not tried: it could never be kept (a kept
+     * trial needs the background rate to fall by 10%), so the limiter is as low as it can usefully go and the
+     * current latency becomes the reference.</li>
+     * </ul>
+     * @return whether a trial started
+     */
+    private boolean beginProbe(double latency, double foregroundRate, double pointCallRate) {
+        if (!limiterBound()) return false;
         pointReferenceWindows = 0; pointReferenceMax = 0;
         bulkReferenceWindows = 0;
         tailOffProbeHoldUntil = 0;
         resetTailBlocks();
-        long candidate = bound(Math.min(budget * .75, lastAchieved > 0 ? lastAchieved * .75 : budget));
-        // Clamped up to the floor at or above the measured background rate: the trial cannot slow anything, it would
-        // only starve the next flush.
-        boolean floorNoOp = lastAchieved > 0 && candidate >= lastAchieved;
+        long candidate = Math.max(seed, bound(Math.min(budget, lastAchieved) * .75));
         // A healthy rate trial must fit the acknowledged reader cap. Safety cuts run first and remove this floor.
         if (foregroundHealthy) candidate = Math.max(candidate, bound(Math.ceil(readaheadBytes * 12.5)));
-        if (candidate >= budget || floorNoOp) {
-            baseline = latency;
+        if (candidate >= budget || candidate > lastAchieved * .9) {
+            if (Double.isFinite(latency) && latency > 0) baseline = latency;
             cooldown = 12;
-            return;
+            return false;
         }
         beforeGrowth = 0;
         probeQueueRemovals = 0;
@@ -1004,5 +1026,6 @@ public final class CompactionIoBudget {
         settle = 2;
         probeBenefits = 0;
         clearReadWindow();
+        return true;
     }
 }

@@ -21,7 +21,9 @@ class CompactionBulkFeedbackTest {
         int calls = 120, shape = 72, workers = 8, active = 0, latencyActive = 0, queued = 0, extraPointCalls;
         boolean point = true, pointNative = true, bulkStats = true, sampleValid = true, pressure, stopped, bulkPending;
         Trace() { this(16L << 20); }
-        Trace(long ceiling) { p = new CompactionIoBudget(RATE, ceiling); step(); }
+        // The limiter's seed is the flush-safe floor: rate trials exist only above it, so these traces work at RATE
+        // over a floor of RATE / 4 (the first saturated window lifts the budget to RATE).
+        Trace(long ceiling) { p = new CompactionIoBudget(RATE / 4, ceiling); step(); }
         void step() {
             nanos += 1_000_000_000L;
             if (point) { pointReads += 100; pointTime += 100 * pointLatency; }
@@ -60,13 +62,19 @@ class CompactionBulkFeedbackTest {
         void saturated() { active = latencyActive = workers; queued = 200; }
         void prime() { seconds(20); assertEquals(CompactionIoBudget.State.TRACKING, p.state()); }
         void probe() {
-            for (int i = 0; i < 220 && p.state() != CompactionIoBudget.State.PROBE; i++) step();
+            // A trial starts only from a window that saturated the limiter: the trace moves the whole budget.
+            for (int i = 0; i < 220 && p.state() != CompactionIoBudget.State.PROBE; i++) { transferred = p.budget(); step(); }
             assertEquals(CompactionIoBudget.State.PROBE, p.state());
         }
         boolean veto() {
             try { var f = CompactionIoBudget.class.getDeclaredField("readGrowthVeto"); f.setAccessible(true); return f.getBoolean(p); }
             catch (ReflectiveOperationException failure) { throw new AssertionError(failure); }
         }
+    }
+    /** States that the last window moved the whole budget: only then does beginProbe start a trial. */
+    private static void saturate(CompactionIoBudget p) throws ReflectiveOperationException {
+        var last = CompactionIoBudget.class.getDeclaredField("lastAchieved"); last.setAccessible(true);
+        last.setDouble(p, p.budget());
     }
     @Test void healthyPointAndWritesCannotHideSaturatedModeratelySlowerBulk() {
         var t = new Trace(); t.prime(); long rate = t.p.budget();
@@ -180,9 +188,10 @@ class CompactionBulkFeedbackTest {
         var t = new Trace(); t.prime(); t.calls = 0; t.seconds(10);
         assertEquals(CompactionIoBudget.State.TRACKING, t.p.state());
         t.active = t.latencyActive = 1; t.bulkPending = true; // New long read: no completed bulk histogram point and no queue yet.
+        t.transferred = t.p.budget(); // The escape is a rate trial: it needs the limiter to be the bottleneck.
         t.seconds(5);
         assertEquals(CompactionIoBudget.State.PROBE, t.p.state(), "read no-progress escape must protect the renewed unknown lane");
-        long reduced = t.p.budget(); t.transferred = RATE * 3 / 4; t.pointLatency = 17000;
+        long reduced = t.p.budget(); t.transferred = reduced; t.pointLatency = 17000;
         t.seconds(10);
         assertEquals(CompactionIoBudget.State.TRACKING, t.p.state());
         assertTrue(t.p.budget() > reduced, "point improvement cannot accept while renewed bulk remains unobserved");
@@ -855,7 +864,7 @@ class CompactionBulkFeedbackTest {
                 }
                 case "probe" -> {
                     var probe = CompactionIoBudget.class.getDeclaredMethod("beginProbe", double.class, double.class, double.class);
-                    probe.setAccessible(true); probe.invoke(t.p, 1466d, 10000d, 100d);
+                    probe.setAccessible(true); saturate(t.p); probe.invoke(t.p, 1466d, 10000d, 100d);
                 }
                 default -> throw new AssertionError(interrupt);
             }
@@ -981,7 +990,7 @@ class CompactionBulkFeedbackTest {
                 }
                 case "probe" -> {
                     var probe = CompactionIoBudget.class.getDeclaredMethod("beginProbe", double.class, double.class, double.class);
-                    probe.setAccessible(true); probe.invoke(t.p, 22000d, 10000d, 100d);
+                    probe.setAccessible(true); saturate(t.p); probe.invoke(t.p, 22000d, 10000d, 100d);
                 }
                 default -> throw new AssertionError(interrupt);
             }
