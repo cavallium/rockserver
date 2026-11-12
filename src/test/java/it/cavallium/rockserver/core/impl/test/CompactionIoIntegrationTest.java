@@ -290,6 +290,7 @@ class CompactionIoIntegrationTest {
             assertTrue(empty.valid());
             assertFalse(empty.pressure());
             assertTrue(empty.recoveryClear());
+            assertEquals(0, empty.compactionDebt(), "no L0 file and no pending compaction bytes");
 
             api.put(0, column, new Keys(Buf.wrap(new byte[]{1})), Buf.wrap(new byte[]{2}), RequestType.none());
             api.flush();
@@ -354,6 +355,9 @@ class CompactionIoIntegrationTest {
                     pressureColumnsField.set(internal, snapshot);
                     var classified = (CompactionIoBudget.Sample) sampleMethod.invoke(part(internal, "storageMetrics"), limiter);
                     assertEquals(trigger >= 0 && levelZeroFiles >= trigger, classified.urgentPressure());
+                    // Debt is the real L0 count over this column's slowdown trigger (pending bytes are far from
+                    // their limit here), capped at the trigger; no trigger, no L0 part.
+                    assertEquals(trigger > 0 ? Math.min(1d, (double) levelZeroFiles / trigger) : 0, classified.compactionDebt(), 1e-3);
                     assertEquals(classified.urgentPressure(), classified.pressure());
                     assertEquals(!classified.urgentPressure(), classified.recoveryClear());
                 }

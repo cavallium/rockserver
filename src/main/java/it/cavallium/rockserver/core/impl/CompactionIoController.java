@@ -52,6 +52,14 @@ final class CompactionIoController implements AutoCloseable {
                         .register(registry),
                 Gauge.builder("rockserver.compaction.io.state", budget, b -> b.state().ordinal())
                         .tag("db", name).register(registry),
+                Gauge.builder("rockserver.compaction.io.floor", budget, CompactionIoBudget::floorBytesPerSecond)
+                        .tag("db", name).baseUnit("bytes/second")
+                        .description("Rate under which slow reads do not lower the budget: the limiter's seed, raised with compaction debt")
+                        .register(registry),
+                Gauge.builder("rockserver.compaction.io.debt", budget, CompactionIoBudget::compactionDebt)
+                        .tag("db", name)
+                        .description("Worst column's pending compaction bytes or L0 files relative to its write slowdown trigger, 0 to 1")
+                        .register(registry),
                 Gauge.builder("rockserver.compaction.io.harm.ceiling", budget, CompactionIoBudget::harmCeilingBytesPerSecond)
                         .tag("db", name).baseUnit("bytes/second")
                         .description("Background rate at which slow foreground reads were last measured; 0 when none is remembered")

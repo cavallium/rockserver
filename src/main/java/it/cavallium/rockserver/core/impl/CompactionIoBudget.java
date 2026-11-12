@@ -25,6 +25,13 @@ public final class CompactionIoBudget {
     static final int CEILING_STEP_WINDOWS = 6;
     /** Windows with background I/O and no harm (10 minutes) after which the harmful rate is forgotten. */
     static final int CEILING_MEMORY_WINDOWS = 120;
+    /**
+     * Compaction debt (see {@link Sample#withCompactionDebt}) from which the floor rises above the seed: linearly
+     * from the seed at this value to the last known background service at 1, where RocksDB starts to delay writes
+     * and RECOVERY restores that same service. So the limiter opens in proportion to the debt before the stall,
+     * and slow reads can lower the budget only as far as the debt allows.
+     */
+    static final double DEBT_FLOOR_START = .5;
     /** Windows after a decrease that did not help, or that the floor did not allow, before the next one. */
     static final int COOLDOWN_WINDOWS = 12;
     public record Sample(long nanos, long readCount, long readMicros, long bytes,
@@ -34,7 +41,38 @@ public final class CompactionIoBudget {
                          long compactionReadCount, long prefetchCount, long prefetchBytes,
                          long bulkCount, long bulkMicros, long bulkKeys, int readWorkers, int readActive,
                          int latencyReadActive, int latencyReadQueued, long readCompletions, boolean bulkPending,
+                         long pointTailMicros, long bulkTailMicros, long nativePointCompletions, long nativeBulkCompletions, long nativeBulkKeys, long nativePointReadNanos, long bulkFoundKeys, long bulkReturnedBytes, long readFailures, long readAccepted, long readTerminalOutcomes, long readNonRunOutcomes, int readTopologyWorkers,
+                         double compactionDebt) {
+        /**
+         * {@code compactionDebt}: how close the worst column is to the point where RocksDB starts to delay writes,
+         * 0 (none) to 1 (there): the larger of pending compaction bytes / soft pending compaction bytes limit and
+         * L0 files / L0 slowdown trigger. 0 when not sampled.
+         */
+        public Sample withCompactionDebt(double debt) {
+            return new Sample(nanos, readCount, readMicros, bytes, background, pressure, stopped, valid,
+                    foregroundPending, foregroundCompletions, recoveryClear, urgentPressure,
+                    compactionReadBytes, compactionReadMicros, compactionReadCount, prefetchCount, prefetchBytes,
+                    bulkCount, bulkMicros, bulkKeys, readWorkers, readActive, latencyReadActive, latencyReadQueued,
+                    readCompletions, bulkPending, pointTailMicros, bulkTailMicros, nativePointCompletions,
+                    nativeBulkCompletions, nativeBulkKeys, nativePointReadNanos, bulkFoundKeys, bulkReturnedBytes,
+                    readFailures, readAccepted, readTerminalOutcomes, readNonRunOutcomes, readTopologyWorkers, debt);
+        }
+        public Sample(long nanos, long readCount, long readMicros, long bytes,
+                         boolean background, boolean pressure, boolean stopped, boolean valid,
+                         boolean foregroundPending, long foregroundCompletions, boolean recoveryClear,
+                         boolean urgentPressure, long compactionReadBytes, long compactionReadMicros,
+                         long compactionReadCount, long prefetchCount, long prefetchBytes,
+                         long bulkCount, long bulkMicros, long bulkKeys, int readWorkers, int readActive,
+                         int latencyReadActive, int latencyReadQueued, long readCompletions, boolean bulkPending,
                          long pointTailMicros, long bulkTailMicros, long nativePointCompletions, long nativeBulkCompletions, long nativeBulkKeys, long nativePointReadNanos, long bulkFoundKeys, long bulkReturnedBytes, long readFailures, long readAccepted, long readTerminalOutcomes, long readNonRunOutcomes, int readTopologyWorkers) {
+            this(nanos, readCount, readMicros, bytes, background, pressure, stopped, valid,
+                    foregroundPending, foregroundCompletions, recoveryClear, urgentPressure,
+                    compactionReadBytes, compactionReadMicros, compactionReadCount, prefetchCount, prefetchBytes,
+                    bulkCount, bulkMicros, bulkKeys, readWorkers, readActive, latencyReadActive, latencyReadQueued,
+                    readCompletions, bulkPending, pointTailMicros, bulkTailMicros, nativePointCompletions,
+                    nativeBulkCompletions, nativeBulkKeys, nativePointReadNanos, bulkFoundKeys, bulkReturnedBytes,
+                    readFailures, readAccepted, readTerminalOutcomes, readNonRunOutcomes, readTopologyWorkers, 0);
+        }
         public Sample(long nanos, long readCount, long readMicros, long bytes,
                          boolean background, boolean pressure, boolean stopped, boolean valid,
                          boolean foregroundPending, long foregroundCompletions, boolean recoveryClear,
@@ -173,6 +211,9 @@ public final class CompactionIoBudget {
      * flush-safe floor: no state lowers, trials or keeps the budget under it, whatever foreground latency does.
      */
     private final long seed;
+    /** The floor in force: the seed, raised with compaction debt (see {@link #DEBT_FLOOR_START}). Never under the seed. */
+    private volatile long floor;
+    private volatile double debt;
     private final long readaheadCeiling;
     private volatile long readaheadBytes;
     private long appliedReadahead, readWindowNanos, compactionBytes, compactionMicros, compactionReads,
@@ -268,7 +309,7 @@ public final class CompactionIoBudget {
         }
         this.readaheadCeiling = readaheadCeiling;
         this.seed = bound(seed);
-        budget = shutdownBudget = this.seed;
+        budget = shutdownBudget = floor = this.seed;
     }
     public long budget() { return budget; }
     public long readaheadBytes() { return readaheadBytes; }
@@ -306,6 +347,10 @@ public final class CompactionIoBudget {
     public double pointReadMicros() { double mean = lastPointMean; return mean > 0 ? mean : Double.NaN; }
     public long shutdownBudget() { return shutdownBudget; }
     public State state() { return state; }
+    /** The rate under which nothing but urgent pressure's end lowers the budget now: the seed, raised with compaction debt. */
+    public long floorBytesPerSecond() { return floor; }
+    /** The compaction debt of the last valid sample (0 to 1). */
+    public double compactionDebt() { return debt; }
     /** The background rate at which foreground harm was last measured, or 0 when none is remembered. */
     public double harmCeilingBytesPerSecond() { return ceiling; }
     private static long bound(double value) {
@@ -370,6 +415,7 @@ public final class CompactionIoBudget {
             reduceReadahead(0);
             return publishBudget();
         }
+        observeDebt(sample);
         long elapsed = sample.nanos - old.nanos;
         observeReadService(sample, old, elapsed);
         accumulateBulk(sample, old, elapsed);
@@ -581,7 +627,7 @@ public final class CompactionIoBudget {
         recentAchieved = recentAchieved == 0 ? achieved : recentAchieved * .5 + achieved * .5;
         if (state == State.BOOTSTRAP) {
             // A window the limiter did not saturate measured demand, not service: it must not lower the budget.
-            if (achieved >= budget * .8) budget = bound(Math.max(seed, achieved));
+            if (achieved >= budget * .8) budget = bound(Math.max(floor, achieved));
             preThrottle = budget;
             state = State.TRACKING;
             if (pointReliable) baseline = latency;
@@ -618,7 +664,7 @@ public final class CompactionIoBudget {
                 if (doublingTakenBack) rememberHarm(achieved);
                 doublingTakenBack = true;
             }
-            budget = undo;
+            budget = Math.max(undo, floor);
             hold = HOLD_WINDOWS;
         } else {
             if (undo > 0) doublingTakenBack = false; // The doubling stood its first window.
@@ -638,6 +684,19 @@ public final class CompactionIoBudget {
         if (cooldown > 0) cooldown--;
         if (harmCooldown > 0) harmCooldown--;
         return publishBudget();
+    }
+    /** Every valid poll: the floor follows the debt up and down; the budget follows the floor up at once. */
+    private void observeDebt(Sample sample) {
+        double value = sample.compactionDebt;
+        debt = value > 0 ? Math.min(1, value) : 0; // NaN and negative: not sampled
+        double weight = Math.max(0, (debt - DEBT_FLOOR_START) / (1 - DEBT_FLOOR_START));
+        // The service RECOVERY would restore at a stall: what background I/O was last known to get.
+        double known = Math.max(Math.max(preThrottle, probeBudget), recentAchieved);
+        floor = weight > 0 && known > seed ? Math.max(seed, bound(seed + (known - seed) * weight)) : seed;
+        if (floor == seed || budget >= floor) return; // Without debt nothing here acts: the seed is kept by every law.
+        // A reduction under test is over: its rate is no longer allowed, and what it would show no longer counts.
+        if (state == State.PROBE) finishProbe(false, Double.NaN);
+        budget = Math.max(budget, floor);
     }
     private void observeForegroundSafety(Sample sample, Sample old) {
         if (sample.pointTailMicros < 0 || sample.bulkTailMicros < 0
@@ -1094,7 +1153,7 @@ public final class CompactionIoBudget {
      * limiter is the bottleneck of background I/O: a window that used under 80% of the budget starts none and
      * learns nothing.</li>
      * </ul>
-     * Neither goes under the flush floor (the seed). A rate that is not at least 10% under the achieved one is
+     * Neither goes under the floor (the seed, raised with compaction debt). A rate that is not at least 10% under the achieved one is
      * not tried, because it could never be kept: the limiter is as low as it may go for this background (which
      * includes every background at or under the flush floor). For slow reads the current latency then becomes
      * the reference and the next attempt is {@link #COOLDOWN_WINDOWS} windows later; for healthy reads the
@@ -1102,7 +1161,7 @@ public final class CompactionIoBudget {
      * @return whether the budget was lowered
      */
     private boolean beginProbe(double latency, double foregroundRate, double pointCallRate, boolean harm) {
-        long candidate = Math.max(seed, bound(Math.min(budget, lastAchieved) * (harm ? HARM_DECREASE : .75)));
+        long candidate = Math.max(floor, bound(Math.min(budget, lastAchieved) * (harm ? HARM_DECREASE : .75)));
         // A healthy rate trial must fit the acknowledged reader cap. Safety cuts run first and remove this floor.
         if (foregroundHealthy) candidate = Math.max(candidate, bound(Math.ceil(readaheadBytes * 12.5)));
         boolean lowest = candidate >= budget || candidate > lastAchieved * .9;
@@ -1113,6 +1172,9 @@ public final class CompactionIoBudget {
         tailOffProbeHoldUntil = 0;
         resetTailBlocks();
         if (lowest) {
+            // At the seed this lasts, so the slow reads become the reference. A floor raised by debt does not last:
+            // nothing is accepted, and the decrease is due again as soon as the debt allows it.
+            if (floor > seed) return false;
             if (Double.isFinite(latency) && latency > 0) baseline = latency;
             cooldown = harmCooldown = COOLDOWN_WINDOWS;
             return false;

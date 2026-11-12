@@ -17,6 +17,8 @@ class CompactionIoBudgetTest {
         long nanos, reads, micros, bytes, completions, nativePoints, nativeNanos;
         boolean point = true, timed = true;
         long pointMax;
+        /** Compaction debt of every following poll: 0 (none) to 1 (RocksDB starts to delay writes). */
+        double debt;
         Trace() { this(FLOOR); }
         Trace(long seed) { policy = new CompactionIoBudget(seed); poll(0, 0, 0, false, false); }
         long poll(long count, long latency, long transferred, boolean pressure, boolean pending) {
@@ -25,7 +27,7 @@ class CompactionIoBudgetTest {
             return policy.sample(new CompactionIoBudget.Sample(nanos, reads, micros, bytes,
                     transferred > 0, pressure, pressure, true, pending, completions, !pressure, pressure,
                     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, false,
-                    point ? Math.max(latency, pointMax) : 0, 0, nativePoints, 0, 0, nativeNanos));
+                    point ? Math.max(latency, pointMax) : 0, 0, nativePoints, 0, 0, nativeNanos).withCompactionDebt(debt));
         }
         void window(long count, long latency, long transferred) {
             for (int i = 0; i < 5; i++) {
@@ -366,7 +368,7 @@ class CompactionIoBudgetTest {
             var random = new java.util.Random(seed);
             var t = new Trace(seed);
             long rate = seed, latency = 100;
-            boolean pressure = false;
+            boolean pressure = false, raised = false;
             for (int second = 0; second < 20_000; second++) {
                 if (random.nextInt(5) == 0) {
                     rate = switch (random.nextInt(6)) {
@@ -379,6 +381,7 @@ class CompactionIoBudgetTest {
                     };
                     latency = 50L << random.nextInt(6);
                     pressure = random.nextInt(40) == 0;
+                    t.debt = random.nextInt(3) == 0 ? random.nextDouble() * 1.2 : 0;
                 }
                 long count = random.nextInt(4) == 0 ? 0 : 10;
                 t.completions += count;
@@ -388,7 +391,13 @@ class CompactionIoBudgetTest {
                 assertTrue(t.policy.budget() >= seed, "seed " + seed + " second " + second + " budget "
                         + t.policy.budget() + " in " + t.policy.state());
                 assertTrue(t.policy.shutdownBudget() >= seed);
+                // The floor that compaction debt raises: never under the seed, and the budget never under it.
+                long floor = t.policy.floorBytesPerSecond();
+                assertTrue(floor >= seed && t.policy.budget() >= floor, "seed " + seed + " second " + second + " budget "
+                        + t.policy.budget() + " under the floor " + floor + " in " + t.policy.state());
+                raised |= floor > seed;
             }
+            assertTrue(raised, "the trace must raise the floor above the seed");
         }
     }
     @Test void urgentPressureAlwaysWins() {
@@ -427,6 +436,116 @@ class CompactionIoBudgetTest {
             }
             assertTrue(entries > 50 && fromReduced > 0, "entries " + entries + ", from a reduced budget " + fromReduced);
         }
+    }
+    /**
+     * Background I/O at 8 MB/s under a 16 MB/s budget; reads are slow while it moves over 3 MB/s, and three
+     * decreases (5.6, 3.92, 2.744 MB/s) are kept. Ends in TRACKING with healthy reads.
+     */
+    private static Trace reducedByHarm() {
+        var t = new Trace(SEED);
+        t.window(10, 100, SEED);
+        for (int i = 0; i < 4; i++) t.window(10, 100, t.policy.budget());
+        assertEquals(16 * SEED, t.policy.budget());
+        t.window(10, 100, 8 * SEED);
+        for (int i = 0; i < 13; i++) {
+            long rate = Math.min(8 * SEED, t.policy.budget());
+            t.window(10, rate <= 3 * SEED ? 100 : t.policy.state() == CompactionIoBudget.State.PROBE ? 150 : 200, rate);
+        }
+        assertEquals(CompactionIoBudget.State.TRACKING, t.policy.state());
+        assertEquals(2_744_000, t.policy.budget(), 2); // 8 MB/s x 0.7^3, in whole bytes
+        return t;
+    }
+    @Test void risingCompactionDebtRaisesTheFloorTowardsTheLastKnownService() {
+        var t = reducedByHarm();
+        long reduced = t.policy.budget(), last = reduced, known = 0;
+        assertEquals(SEED, t.policy.floorBytesPerSecond());
+        for (int percent = 0; percent <= 100; percent += 5) {
+            t.debt = percent / 100d;
+            t.poll(10, 100, SEED, false, true);
+            long floor = t.policy.floorBytesPerSecond(), budget = t.policy.budget();
+            if (percent <= 50) {
+                assertEquals(SEED, floor, "debt " + percent + "%");
+                assertEquals(reduced, budget, "half of the way to a write slowdown changes nothing");
+            } else {
+                assertTrue(floor > SEED && budget >= floor && budget >= last, "debt " + percent + "%: floor " + floor + ", budget " + budget);
+                if (percent == 100) known = floor;
+                else assertTrue(floor < 8 * SEED);
+            }
+            assertEquals(percent / 100d, t.policy.compactionDebt(), 1e-9);
+            last = budget;
+        }
+        assertEquals(KNOWN, known, "floor at full debt");
+        assertEquals(known, t.policy.budget());
+    }
+    /**
+     * What background I/O was known to get before slow reads took it away in {@link #reducedByHarm}: the 50% moving
+     * average of its rate at the first decrease (1, 1, 2, 4, 8, 8, 8, 8 MB/s), which RECOVERY would restore too.
+     */
+    private static final long KNOWN = 7_671_875;
+    @Test void risingCompactionDebtEndsAReductionUnderTest() {
+        var t = reducedByHarm();
+        t.window(10, 200, t.policy.budget()); t.window(10, 200, t.policy.budget());
+        assertEquals(CompactionIoBudget.State.PROBE, t.policy.state());
+        t.debt = .9;
+        t.poll(10, 200, t.policy.budget(), false, true);
+        assertEquals(CompactionIoBudget.State.TRACKING, t.policy.state());
+        assertEquals(t.policy.floorBytesPerSecond(), t.policy.budget());
+        assertEquals(SEED + (KNOWN - SEED) * 8 / 10, t.policy.budget(), "80% of the way from the seed to the last known service");
+    }
+    @Test void slowReadsCannotLowerTheBudgetUnderTheDebtFloor() {
+        var t = reducedByHarm();
+        t.debt = .75;
+        t.poll(10, 100, SEED, false, true);
+        long floor = t.policy.floorBytesPerSecond();
+        assertEquals((SEED + KNOWN) / 2, floor, "half of the way from the seed to the last known service");
+        assertEquals(floor, t.policy.budget());
+        double baseline = t.policy.baselineReadMicros();
+        for (int i = 0; i < 60; i++) {
+            t.window(10, 300, t.policy.budget());
+            assertTrue(t.policy.budget() >= floor, "window " + i + " budget " + t.policy.budget());
+            assertTrue(t.policy.floorBytesPerSecond() >= floor);
+            assertEquals(CompactionIoBudget.State.TRACKING, t.policy.state());
+        }
+        assertEquals(baseline, t.policy.baselineReadMicros(), "slow reads at a floor that debt raised are not accepted"
+                + " as the reference: the floor does not last");
+    }
+    @Test void fallingCompactionDebtLetsTheFloorReturnToTheSeed() {
+        var t = reducedByHarm();
+        t.debt = 1;
+        t.poll(10, 100, SEED, false, true);
+        long opened = t.policy.budget();
+        assertEquals(KNOWN, opened);
+        long floor = opened;
+        for (int percent = 95; percent >= 0; percent -= 5) {
+            t.debt = percent / 100d;
+            t.poll(10, 100, SEED, false, true);
+            assertTrue(t.policy.floorBytesPerSecond() <= floor, "debt " + percent + "%");
+            floor = t.policy.floorBytesPerSecond();
+        }
+        assertEquals(SEED, floor);
+        assertEquals(opened, t.policy.budget(), "the floor going down lowers nothing by itself");
+        long lowest = opened;
+        for (int i = 0; i < 80; i++) {
+            t.window(10, t.policy.state() == CompactionIoBudget.State.PROBE ? 150 : 200, t.policy.budget());
+            lowest = Math.min(lowest, t.policy.budget());
+        }
+        assertEquals(SEED, lowest, "slow reads that answer to the rate take the budget down to the seed again");
+    }
+    @Test void unsampledOrInvalidDebtIsNoDebt() {
+        for (double debt : new double[]{Double.NaN, -1, 0}) {
+            var t = reducedByHarm();
+            long reduced = t.policy.budget();
+            t.debt = debt;
+            t.poll(10, 100, SEED, false, true);
+            assertEquals(SEED, t.policy.floorBytesPerSecond());
+            assertEquals(0, t.policy.compactionDebt());
+            assertEquals(reduced, t.policy.budget());
+        }
+        var t = reducedByHarm();
+        t.debt = 7; // over the trigger: as at the trigger
+        t.poll(10, 100, SEED, false, true);
+        assertEquals(1, t.policy.compactionDebt());
+        assertEquals(KNOWN, t.policy.budget());
     }
     @Test void insufficientResetAndStaleCountersHoldAndAbortProbeSafely() {
         var t = new Trace(); t.window(0, 0, SEED);

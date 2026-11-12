@@ -333,6 +333,8 @@ final class EmbeddedDBStorageMetrics {
 		boolean stopped = false;
 		boolean pressure = false;
 		boolean urgentPressure = false;
+		// Worst column's distance to the write slowdown triggers, 0 to 1: the limiter's floor rises with it.
+		double compactionDebt = 0;
 		try {
 			var observer = edb.compactionIoSampleObserver;
 			if (observer != null) observer.run();
@@ -350,10 +352,16 @@ final class EmbeddedDBStorageMetrics {
 					long debt = nativeDb.getLongProperty(column.handle(), EmbeddedDB.ROCKSDB_ESTIMATE_PENDING_COMPACTION_BYTES_PROPERTY);
 					long limit = column.effectiveSoftPendingCompactionBytesLimit();
 					pressure |= limit > 0 && limit < Long.MAX_VALUE && Long.compareUnsigned(debt, limit) >= 0;
+					if (limit > 0 && limit < Long.MAX_VALUE) {
+						compactionDebt = Math.max(compactionDebt, debt < 0 ? 1 : (double) debt / limit);
+					}
 					recoveryClear &= !(limit > 0 && limit < Long.MAX_VALUE && Long.compareUnsigned(debt, limit - limit / 5) >= 0);
 					long levelZeroFiles = Long.parseUnsignedLong(nativeDb.getProperty(column.handle(), "rocksdb.num-files-at-level0"));
 					int slowdownTrigger = column.effectiveLevel0SlowdownWritesTrigger();
 					urgentPressure |= slowdownTrigger >= 0 && Long.compareUnsigned(levelZeroFiles, slowdownTrigger) >= 0;
+					if (slowdownTrigger > 0) {
+						compactionDebt = Math.max(compactionDebt, levelZeroFiles < 0 ? 1 : (double) levelZeroFiles / slowdownTrigger);
+					}
 					int maxWriteBuffers = column.effectiveMaxWriteBufferNumber();
 					// Native delay cannot precede stop for small maxima or large merge batches.
 					// NumNotFlushed includes in-flight flushes even when flush-pending is false.
@@ -404,7 +412,8 @@ final class EmbeddedDBStorageMetrics {
 						edb.workloadGroups.isEmpty() ? readPoolTelemetry[RWScheduler.POOL_TELEMETRY_FAILED_TASKS] : -1,
 						readPoolTelemetry[RWScheduler.POOL_TELEMETRY_ACCEPTED_TASKS],
 						readPoolTelemetry[RWScheduler.POOL_TELEMETRY_TERMINAL_OUTCOMES],
-						readPoolTelemetry[RWScheduler.POOL_TELEMETRY_NON_RUN_OUTCOMES], readTopologyWorkers);
+						readPoolTelemetry[RWScheduler.POOL_TELEMETRY_NON_RUN_OUTCOMES], readTopologyWorkers,
+						Math.min(1, compactionDebt));
 			}
 		} catch (org.rocksdb.RocksDBException failure) {
 			if (pressure || urgentPressure) {
