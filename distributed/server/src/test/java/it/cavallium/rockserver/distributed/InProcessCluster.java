@@ -34,9 +34,16 @@ final class InProcessCluster implements AutoCloseable {
 	private final Map<String, NodeConfig> configs = new LinkedHashMap<>();
 	private final Map<String, ReplicatedNode> running = new LinkedHashMap<>();
 	private final UnaryOperator<NodeConfig> customize;
+	private final String host;
 
 	InProcessCluster(Path root, int size, UnaryOperator<NodeConfig> customize) throws IOException {
+		this(root, size, "127.0.0.1", customize);
+	}
+
+	/** {@code host}: the address every node binds and is named by, as written in the peer list ({@code [::1]}). */
+	InProcessCluster(Path root, int size, String host, UnaryOperator<NodeConfig> customize) throws IOException {
 		this.root = root;
+		this.host = host;
 		this.customize = customize;
 		var rockserverConfig = root.resolve("rockserver.conf");
 		Files.writeString(rockserverConfig, MERGE_CONFIG);
@@ -45,7 +52,7 @@ final class InProcessCluster implements AutoCloseable {
 		// another process between here and the bind. Ratis then ends the JVM, with every test of the run.
 		var ports = ProcessCluster.freePorts(2 * size, List.of());
 		for (int i = 0; i < size; i++) {
-			peers.add(new PeerConfig("n" + i, "127.0.0.1", ports.get(2 * i), "127.0.0.1", ports.get(2 * i + 1)));
+			peers.add(new PeerConfig("n" + i, host, ports.get(2 * i), host, ports.get(2 * i + 1)));
 		}
 		for (PeerConfig peer : peers) {
 			configs.put(peer.id(), customize.apply(baseConfig(peer.id(), peers)));
@@ -55,7 +62,7 @@ final class InProcessCluster implements AutoCloseable {
 	private NodeConfig baseConfig(String id, List<PeerConfig> peers) {
 		return NodeConfig.defaults(id, peers, root.resolve(id))
 				.withRockserverConfig(root.resolve("rockserver.conf"))
-				.withBindHosts("127.0.0.1", "127.0.0.1")
+				.withBindHosts(host, host)
 				.withElectionTimeouts(Duration.ofMillis(400), Duration.ofMillis(800))
 				.withRequestTimeout(Duration.ofSeconds(10))
 				.withPipelinedUpdates(ProcessCluster.PIPELINED_UPDATES);
@@ -90,7 +97,7 @@ final class InProcessCluster implements AutoCloseable {
 		// Free now, but possibly a stopped node's: asked for enough that two are left without those.
 		var ports = ProcessCluster.freePorts(2 + taken.size(), List.of()).stream().filter(port -> !taken.contains(port))
 				.limit(2).toList();
-		peers.add(new PeerConfig(id, "127.0.0.1", ports.get(0), "127.0.0.1", ports.get(1)));
+		peers.add(new PeerConfig(id, host, ports.get(0), host, ports.get(1)));
 		var config = customize.apply(baseConfig(id, peers)).withJoin(true);
 		configs.put(id, config);
 		return config;
