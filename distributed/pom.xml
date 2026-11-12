@@ -5,7 +5,7 @@
   <!-- Reactor that builds rockserver-core and the replicated server together, without installing core. -->
   <groupId>it.cavallium.rockserver</groupId>
   <artifactId>rockserver-distributed-reactor</artifactId>
-  <version>3.0.0</version>
+  <version>3.0.1</version>
   <packaging>pom</packaging>
   <properties>
     <!-- Only builds the two modules together: nothing of it is published. -->
