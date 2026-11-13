@@ -382,6 +382,9 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	private final Object asyncExistsMultiAdmissionLock = new Object();
 	private final SafeShutdown ops;
 	private final AtomicLong resourceLeases = new AtomicLong();
+	private final ResourceCleanupTelemetry transactionCleanupTelemetry = new ResourceCleanupTelemetry();
+	private final ResourceCleanupTelemetry iteratorCleanupTelemetry = new ResourceCleanupTelemetry();
+	private final ResourceCleanupTelemetry rangeCleanupTelemetry = new ResourceCleanupTelemetry();
 	private final Object columnEditLock = new Object();
 	private final DatabaseConfig config;
 	private final Map<String, RWScheduler> workloadGroups = new java.util.LinkedHashMap<>();
@@ -596,6 +599,15 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					.builder("rockserver.pending.ops", this, db -> (double) db.getPendingOpsCount())
 					.tag("db", name)
 					.register(registry));
+			meters.add(Gauge.builder("rockserver.active.native.ops", ops, state -> (double) state.getPendingOpsCount())
+					.description("Admitted active operations, excluding retained resource leases")
+					.tag("db", name).register(registry));
+			meters.add(Gauge.builder("rockserver.resource.leases", resourceLeases, AtomicLong::get)
+					.description("Retained resource leases; a nonzero value alone does not establish a leak")
+					.tag("db", name).register(registry));
+			transactionCleanupTelemetry.register(registry, meters, name, "transaction");
+			iteratorCleanupTelemetry.register(registry, meters, name, "iterator");
+			rangeCleanupTelemetry.register(registry, meters, name, "range");
 		} catch (Throwable ex) {
 			logger.error("Failed to load metrics", ex);
 		}
@@ -1861,9 +1873,13 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				try {
 					closeTransactionInternal(id, false);
 				} catch (Throwable ex) {
+					transactionCleanupTelemetry.closeFailed();
 					logger.error("Failed to close an expired transaction", ex);
 				}
 			});
+			var remaining = new ResourceCleanupTelemetry.Scan(System.currentTimeMillis());
+			txs.forEach((id, tx) -> remaining.deadline(tx.expirationTimestamp()));
+			transactionCleanupTelemetry.record(remaining);
 		} finally {
 			ops.endOp();
 		}
@@ -1914,9 +1930,17 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				try {
 					closeIteratorInternal(id);
 				} catch (Throwable ex) {
+					iteratorCleanupTelemetry.closeFailed();
 					logger.error("Failed to close an iteration", ex);
 				}
 			});
+			var remaining = new ResourceCleanupTelemetry.Scan(System.currentTimeMillis());
+			its.forEach((id, entry) -> {
+				if (entry.expirationTimestamp() != null) {
+					remaining.deadline(entry.expirationTimestamp());
+				}
+			});
+			iteratorCleanupTelemetry.record(remaining);
 		} finally {
 			ops.endOp();
 		}
@@ -1956,6 +1980,11 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					logger.warn("Failed to clean an expired range cursor", error);
 				}
 			}
+			var remaining = new ResourceCleanupTelemetry.Scan(0L);
+			for (var range : activeRangeResources) {
+				remaining.overdueNanos(scheduler.monotonicDeadlineOverdueNanos(range.cleanupDeadlineNanos()));
+			}
+			rangeCleanupTelemetry.record(remaining);
 		} finally {
 			ops.endOp();
 		}
@@ -7981,6 +8010,11 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			cancelAndFinish(failure, !deliveryCancelled, RWScheduler.TerminalOutcome.DEADLINE);
 		}
 
+		@Override
+		public final long cleanupDeadlineNanos() {
+			return deadline.monotonicNanos();
+		}
+
 		private void cancelAndFinish(@Nullable RuntimeException failure,
 				boolean signalTerminal,
 				@Nullable RWScheduler.TerminalOutcome outcome) {
@@ -8097,6 +8131,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					try {
 						retainedPermit.close();
 					} catch (Throwable closeError) {
+						rangeCleanupTelemetry.closeFailed();
 						currentCleanupFailure = appendFailure(currentCleanupFailure, closeError);
 					}
 					activeRangeResources.remove(this);
@@ -8691,6 +8726,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 		void close();
 
 		void expireIfDeadlinePassed();
+
+		long cleanupDeadlineNanos();
 	}
 
 	private record RangeCountChunk(long count, boolean exhausted) {
@@ -9122,12 +9159,26 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			close();
 		}
 
+		@Override
+		public long cleanupDeadlineNanos() {
+			return monotonicDeadlineNanos;
+		}
+
 		private RocksDBException rangeDeadlineExceeded() {
 			return RocksDBException.of(RocksDBErrorType.READ_DEADLINE_EXCEEDED, "Deadline exceeded");
 		}
 
 		@Override
 		public void close() {
+			try {
+				closeOwnedResources();
+			} catch (Throwable closeError) {
+				rangeCleanupTelemetry.closeFailed();
+				throw closeError;
+			}
+		}
+
+		private void closeOwnedResources() {
 			try {
 				synchronized (this) {
 					if (closed) {
