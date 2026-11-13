@@ -1,6 +1,7 @@
 package it.cavallium.rockserver.core.impl.test;
 
 import static java.util.concurrent.TimeUnit.SECONDS;
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
@@ -55,9 +56,16 @@ class RWSchedulerTest {
 			assertEventually(() -> scheduler.poolSnapshot(RWScheduler.Pool.READ).queuedTasks() == 1);
 
 			assertPoolTelemetryMatchesSnapshot(scheduler, RWScheduler.Pool.READ);
+			// Legacy buffers without the trailing non-run outcomes slot stay accepted; shorter ones do not.
+			var current = new long[RWScheduler.POOL_TELEMETRY_LENGTH];
+			var legacy = new long[RWScheduler.POOL_TELEMETRY_NON_RUN_OUTCOMES];
+			scheduler.copyPoolTelemetry(RWScheduler.Pool.READ, current);
+			scheduler.copyPoolTelemetry(RWScheduler.Pool.READ, legacy);
+			assertArrayEquals(java.util.Arrays.copyOf(current, legacy.length), legacy,
+					"legacy buffers retain every pre-existing telemetry field");
 			assertThrows(IllegalArgumentException.class,
 					() -> scheduler.copyPoolTelemetry(RWScheduler.Pool.READ,
-							new long[RWScheduler.POOL_TELEMETRY_LENGTH - 1]));
+							new long[RWScheduler.POOL_TELEMETRY_NON_RUN_OUTCOMES - 1]));
 
 			release.countDown();
 			assertTrue(queuedCompleted.await(5, SECONDS));
@@ -78,7 +86,8 @@ class RWSchedulerTest {
 		assertEquals(RWScheduler.POOL_TELEMETRY_QUEUED_BY_PROFILE + WorkloadProfile.values().length,
 				RWScheduler.POOL_TELEMETRY_ACTIVE_BY_PROFILE);
 		assertEquals(RWScheduler.POOL_TELEMETRY_ACTIVE_BY_PROFILE + WorkloadProfile.values().length,
-				RWScheduler.POOL_TELEMETRY_LENGTH);
+				RWScheduler.POOL_TELEMETRY_NON_RUN_OUTCOMES);
+		assertEquals(RWScheduler.POOL_TELEMETRY_NON_RUN_OUTCOMES + 1, RWScheduler.POOL_TELEMETRY_LENGTH);
 		var scheduler = scheduler(1, "primitive-telemetry-allocation");
 		var telemetry = new long[RWScheduler.POOL_TELEMETRY_LENGTH + 1];
 		try {
