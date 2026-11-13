@@ -1252,7 +1252,9 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					logger.error("Failed to close an expired transaction", ex);
 				}
 			});
-			var remaining = new ResourceCleanupTelemetry.Scan(System.currentTimeMillis());
+			// Against the instant this pass expired entries at: an entry whose deadline passed during the pass was not
+			// attempted, so it is not "retained after cleanup" (it would read as overdue until the next pass).
+			var remaining = new ResourceCleanupTelemetry.Scan(startTime);
 			txs.forEach((id, tx) -> remaining.deadline(tx.expirationTimestamp()));
 			transactionCleanupTelemetry.record(remaining);
 		} finally {
@@ -1309,7 +1311,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					logger.error("Failed to close an iteration", ex);
 				}
 			});
-			var remaining = new ResourceCleanupTelemetry.Scan(System.currentTimeMillis());
+			// Against the instant this pass expired entries at, as for the transactions.
+			var remaining = new ResourceCleanupTelemetry.Scan(startTime);
 			its.forEach((id, entry) -> {
 				if (entry.expirationTimestamp() != null) {
 					remaining.deadline(entry.expirationTimestamp());
@@ -1346,6 +1349,9 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			return;
 		}
 		try {
+			// Read before the pass: whatever is overdue at this instant is also expired for the pass below, which
+			// reads the clock later, so the observation counts only entries the pass attempted.
+			long scanNanos = scheduler.monotonicNanos();
 			for (var range : activeRangeResources) {
 				try {
 					range.expireIfDeadlinePassed();
@@ -1357,7 +1363,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 			}
 			var remaining = new ResourceCleanupTelemetry.Scan(0L);
 			for (var range : activeRangeResources) {
-				remaining.overdueNanos(scheduler.monotonicDeadlineOverdueNanos(range.cleanupDeadlineNanos()));
+				remaining.overdueNanos(RWScheduler.monotonicDeadlineOverdueNanos(range.cleanupDeadlineNanos(), scanNanos));
 			}
 			rangeCleanupTelemetry.record(remaining);
 		} finally {
