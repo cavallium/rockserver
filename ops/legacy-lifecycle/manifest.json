@@ -1,0 +1,149 @@
+{
+  "original_sha256": "ce384b26791b9575b6e5498c8232a2d4009c96ca7ee2d02c11347fb9db290e18",
+  "qualified_overlay_sha256": "59b885e1cfc930030b32987dc7b2e07cffb5e7df9109042888accc4776591896",
+  "original_entry_count": 33159,
+  "source_commits": {
+    "legacy_base": "a771fcd6737620c39ba0547a0713d927c2010b78",
+    "instrumented": "15b504c8d56df62846154fb0d2478191aceafe8b",
+    "cutoff": "6ee13f98a579dbe256288795ece3646f86d05a73"
+  },
+  "java_release": 25,
+  "compiler_plugin": "3.15.0",
+  "native_artifact": "11.8.1.12-master.f91f41decfd775bc96d5da3edd09cddf6cbc1188-SNAPSHOT",
+  "preserved_native_sha256": "c19d8b08a871870ce286cd00ab92cb62d22c2fc836d41afca8a436d191a0fb37",
+  "preserved_client_builder_sha256": "74c6ba77748d18cbb3fa82115ca88feb28403e3ab660c2efb6aa3293f706c3dd",
+  "zip_toolchain": {
+    "python": "3.14.10",
+    "zlib": "1.3.1.zlib-ng",
+    "compression": "ZIP_DEFLATED default level; original ZipInfo reused; added metadata pinned below"
+  },
+  "entries": [
+    {
+      "name": "it/cavallium/rockserver/core/impl/EmbeddedDB$RetainedRangeCooperativeTask.class",
+      "kind": "replace",
+      "source": "instrumented",
+      "sha256": "9923913761ddf298f61658665930cd38c8d08ced931756b21fd9cb60d382e7fe",
+      "original_sha256": "7835548f384bc16c7002fe5936e017018040f3e5b6ecb98cff8e57398d3a14fb"
+    },
+    {
+      "name": "it/cavallium/rockserver/core/impl/EmbeddedDB$ActiveRangeResource.class",
+      "kind": "replace",
+      "source": "instrumented",
+      "sha256": "baf76c02359b5b7fbf63f55ced4cf7c3af89b0b15b7d326a153e1b16d3a32f28",
+      "original_sha256": "50fc35538b1060d1e0c7cab24e881b635560cc5a5d68071924cad9b4ba713f3e"
+    },
+    {
+      "name": "it/cavallium/rockserver/core/impl/EmbeddedDB$RangeCursor.class",
+      "kind": "replace",
+      "source": "instrumented",
+      "sha256": "05a52a34bf04a730866ac2c71ca4335414ef1cc142718f169bbcf588967c9ead",
+      "original_sha256": "5c9dc37b2b586ccac918216e0471e660d9ce375f94bbe6e86b651661af004002"
+    },
+    {
+      "name": "it/cavallium/rockserver/core/impl/EmbeddedDB.class",
+      "kind": "replace",
+      "source": "cutoff",
+      "sha256": "56279b65eb782405a9396bba5702b046681c57ec54129c529c0974ece880d596",
+      "original_sha256": "c2065e6c2584cc350486cdab12529f779411e8fc2778034506ba7a5c332f62d3"
+    },
+    {
+      "name": "it/cavallium/rockserver/core/impl/RWScheduler.class",
+      "kind": "replace",
+      "source": "cutoff",
+      "sha256": "f34f08d972fdaa8fe03a44d66332e715061a00a926351773a547c41ce14fbe6a",
+      "original_sha256": "090b5cfaffc9f02ed1568126c33e6523f04d2062458ea84b1454c6bfa34a7fbc"
+    },
+    {
+      "name": "it/cavallium/rockserver/core/impl/ResourceCleanupTelemetry.class",
+      "kind": "add",
+      "source": "instrumented",
+      "sha256": "c814455135dfe6fda7d9ed1ea0d5893bb44197cc4a1250edfc7bcabf91bea104",
+      "zip": {
+        "date_time": [
+          2026,
+          11,
+          13,
+          18,
+          0,
+          44
+        ],
+        "compress_type": 8,
+        "create_system": 3,
+        "create_version": 20,
+        "extract_version": 20,
+        "reserved": 0,
+        "flag_bits": 0,
+        "volume": 0,
+        "internal_attr": 0,
+        "external_attr": 25165824,
+        "extra": "",
+        "comment": ""
+      }
+    },
+    {
+      "name": "it/cavallium/rockserver/core/impl/ResourceCleanupTelemetry$Scan.class",
+      "kind": "add",
+      "source": "instrumented",
+      "sha256": "3a8043a8c2926f3e6779fca90d460e6c62cb88daf2e6e650caba36f9d589714d",
+      "zip": {
+        "date_time": [
+          2026,
+          11,
+          13,
+          18,
+          0,
+          44
+        ],
+        "compress_type": 8,
+        "create_system": 3,
+        "create_version": 20,
+        "extract_version": 20,
+        "reserved": 0,
+        "flag_bits": 0,
+        "volume": 0,
+        "internal_attr": 0,
+        "external_attr": 25165824,
+        "extra": "",
+        "comment": ""
+      }
+    },
+    {
+      "name": "it/cavallium/rockserver/core/impl/ResourceCleanupTelemetry$Sample.class",
+      "kind": "add",
+      "source": "instrumented",
+      "sha256": "e2d4fabf2be4615df39822d15f29accaca9bdd4537da9d6ab66951e1465ac230",
+      "zip": {
+        "date_time": [
+          2026,
+          11,
+          13,
+          18,
+          0,
+          44
+        ],
+        "compress_type": 8,
+        "create_system": 3,
+        "create_version": 20,
+        "extract_version": 20,
+        "reserved": 0,
+        "flag_bits": 0,
+        "volume": 0,
+        "internal_attr": 0,
+        "external_attr": 25165824,
+        "extra": "",
+        "comment": ""
+      }
+    }
+  ],
+  "qualification": {
+    "focused": 56,
+    "packaged_original_client_native": 83,
+    "full": 3429,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 1,
+    "skipped_reason": "opt-in benchmark",
+    "restored_original_overlay_open_reopen": "4phases exact metadata/existing-Core-read hashes",
+    "production": "CT136 original ABI read after graceful143 shutdown/overlay startup;14fresh lifecycle series;config/unit/JVM unchanged"
+  }
+}
