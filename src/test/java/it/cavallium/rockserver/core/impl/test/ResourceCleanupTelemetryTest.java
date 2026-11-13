@@ -73,6 +73,28 @@ class ResourceCleanupTelemetryTest {
 		finally { registry.close(); }
 	}
 
+	/**
+	 * The cleaner observes against the instant it expired entries at: a deadline that passes while the pass runs was
+	 * not attempted, so it is not overdue for that scan, however late the scan ends.
+	 */
+	@Test
+	void overdueIsMeasuredAtTheScanInstantNotWhenTheScanEnds() throws Exception {
+		var overdue = RWScheduler.class.getDeclaredMethod("monotonicDeadlineOverdueNanos", long.class, long.class);
+		overdue.setAccessible(true);
+		long scanInstant = 1_000L;
+		assertEquals(-1L, overdue.invoke(null, scanInstant + 1, scanInstant), "expired during the pass");
+		assertEquals(0L, overdue.invoke(null, scanInstant, scanInstant));
+		assertEquals(400L, overdue.invoke(null, 600L, scanInstant));
+		assertEquals(-1L, overdue.invoke(null, Long.MAX_VALUE, scanInstant), "unlimited");
+		assertEquals(Long.MAX_VALUE, overdue.invoke(null, Long.MIN_VALUE + 5, scanInstant), "saturated");
+
+		var scan = new Scan(scanInstant);
+		scan.deadline(scanInstant + 1);
+		var telemetry = new Telemetry(() -> 0L);
+		telemetry.record(scan);
+		assertEquals(0.0, telemetry.overdueCount());
+	}
+
 	@Test
 	void rangeOverdueUsesTheBoundClockAndExcludesUnlimitedDeadlines() throws Exception {
 		var clock = new AtomicLong(0L);
