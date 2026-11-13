@@ -297,6 +297,8 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	final Object asyncExistsMultiAdmissionLock = new Object();
 	final SafeShutdown ops;
 	private final AtomicLong resourceLeases = new AtomicLong();
+	private final ResourceCleanupTelemetry transactionCleanupTelemetry = new ResourceCleanupTelemetry();
+	private final ResourceCleanupTelemetry iteratorCleanupTelemetry = new ResourceCleanupTelemetry();
 	final Object columnEditLock = new Object();
 	final DatabaseConfig config;
 	final Map<String, RWScheduler> workloadGroups = new LinkedHashMap<>();
@@ -501,6 +503,14 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					.builder("rockserver.pending.ops", this, db -> (double) db.getPendingOpsCount())
 					.tag("db", name)
 					.register(registry));
+			meters.add(Gauge.builder("rockserver.active.native.ops", ops, state -> (double) state.getPendingOpsCount())
+					.description("Admitted active operations, excluding retained resource leases")
+					.tag("db", name).register(registry));
+			meters.add(Gauge.builder("rockserver.resource.leases", resourceLeases, AtomicLong::get)
+					.description("Retained resource leases; a nonzero value alone does not establish a leak")
+					.tag("db", name).register(registry));
+			transactionCleanupTelemetry.register(registry, meters, name, "transaction");
+			iteratorCleanupTelemetry.register(registry, meters, name, "iterator");
 		} catch (Throwable ex) {
 			logger.error("Failed to load metrics", ex);
 		}
@@ -1236,9 +1246,13 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				try {
 					closeTransactionInternal(id, false);
 				} catch (Throwable ex) {
+					transactionCleanupTelemetry.closeFailed();
 					logger.error("Failed to close an expired transaction", ex);
 				}
 			});
+			var remaining = new ResourceCleanupTelemetry.Scan(System.currentTimeMillis());
+			txs.forEach((id, tx) -> remaining.deadline(tx.expirationTimestamp()));
+			transactionCleanupTelemetry.record(remaining);
 		} finally {
 			ops.endOp();
 		}
@@ -1289,9 +1303,17 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 				try {
 					iterators.closeIteratorInternal(id);
 				} catch (Throwable ex) {
+					iteratorCleanupTelemetry.closeFailed();
 					logger.error("Failed to close an iteration", ex);
 				}
 			});
+			var remaining = new ResourceCleanupTelemetry.Scan(System.currentTimeMillis());
+			its.forEach((id, entry) -> {
+				if (entry.expirationTimestamp() != null) {
+					remaining.deadline(entry.expirationTimestamp());
+				}
+			});
+			iteratorCleanupTelemetry.record(remaining);
 		} finally {
 			ops.endOp();
 		}
