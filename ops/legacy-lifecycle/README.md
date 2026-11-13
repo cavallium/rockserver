@@ -11,7 +11,15 @@ Obtain the original JAR matching the full manifest SHA. Use two separately retai
 - `instrumented`: Java 25 classes from `15b504c8d56df62846154fb0d2478191aceafe8b`.
 - `cutoff`: classes from `6ee13f98a579dbe256288795ece3646f86d05a73` (cutoff fix plus deterministic regression test).
 
-The qualified builds used Temurin 25.0.5, Maven compiler plugin 3.15.0 and the exact JNI `.12` snapshot in the manifest. `mvn -Pfatjar -DskipTests compile` produces `target/fatjar/classes`; use isolated checkouts/output directories. Compilation is not qualification: every consumed class must match its manifest SHA. No other compiled classes enter the overlay.
+Both pinned source commits already set Maven compiler plugin **3.15.0** in `pom.xml`; the unmodified `a771fcd` base used 3.14.0 and is not a class-input revision for this recipe. The qualified builds used Temurin 25.0.5 and the exact JNI `.12` snapshot in the manifest. Select that JDK explicitly in each isolated checkout (the path below is the qualification machine’s installation):
+
+```sh
+JAVA_HOME=/home/cavallium/.sdkman/candidates/java/25.0.5-tem \
+PATH="/home/cavallium/.sdkman/candidates/java/25.0.5-tem/bin:$PATH" \
+mvn -Pfatjar -DskipTests compile
+```
+
+This produces `target/fatjar/classes`; no compiler override is needed at either pinned revision. Compilation is not qualification: every consumed class must match its manifest SHA. No other compiled classes enter the overlay.
 
 Only EmbeddedDB and RWScheduler are taken from the cutoff build. The other six classes retain the previously qualified bytes, including nested-class debug line metadata. Do not substitute newly compiled nested classes or normalize unexplained bytecode differences.
 
