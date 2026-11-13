@@ -1946,6 +1946,8 @@ public final class ReplicatedServerMain {
 				}
 			}
 			if (pretty) {
+				// Ends the progress line and clears it: the table is not printed through Ui.
+				Ui.stop();
 				System.out.print(statusTable(members, style));
 			}
 		} finally {
