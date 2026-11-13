@@ -21,12 +21,15 @@ import it.unimi.dsi.fastutil.objects.ObjectList;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
+import java.lang.reflect.Proxy;
 import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.BooleanSupplier;
@@ -153,6 +156,57 @@ class RetainedRangeMonotonicDeadlineTest {
 		} finally {
 			releaseCleanup.countDown();
 			db.setRetainedRangeCleanupObserverForTesting(null);
+			db.closeTesting();
+		}
+	}
+
+	@Test
+	@SuppressWarnings("unchecked")
+	void deadlinePassingDuringCleanupIsNotReportedUntilTheNextScan() throws Exception {
+		var clock = new MutableClock(System.currentTimeMillis(), 0L);
+		var scheduler = scheduler(clock, "retained-cleanup-cutoff");
+		EmbeddedDB db = embeddedDb(scheduler, "retained-cleanup-cutoff");
+		Field scheduled = EmbeddedDB.class.getDeclaredField("expiredRangeCleanupTask");
+		scheduled.setAccessible(true);
+		((ScheduledFuture<?>) scheduled.get(db)).cancel(false);
+		Field cleaner = EmbeddedDB.class.getDeclaredField("leakScheduler");
+		cleaner.setAccessible(true);
+		// Drain any already-admitted periodic pass before registering the controlled resource.
+		((ScheduledExecutorService) cleaner.get(db)).submit(() -> {}).get(5, SECONDS);
+		clock.nanoTime.set(MILLISECONDS.toNanos(10));
+		Field active = EmbeddedDB.class.getDeclaredField("activeRangeResources");
+		active.setAccessible(true);
+		var resources = (Set<Object>) active.get(db);
+		var expiryCalls = new AtomicInteger();
+		Class<?> resourceType = Class.forName("it.cavallium.rockserver.core.impl.EmbeddedDB$ActiveRangeResource");
+		Object resource = Proxy.newProxyInstance(resourceType.getClassLoader(), new Class<?>[] {resourceType},
+				(proxy, method, arguments) -> switch (method.getName()) {
+					case "expireIfDeadlinePassed" -> {
+						expiryCalls.incrementAndGet();
+						clock.nanoTime.set(MILLISECONDS.toNanos(30));
+						yield null;
+					}
+					case "cleanupDeadlineNanos" -> MILLISECONDS.toNanos(20);
+					case "close" -> null;
+					case "hashCode" -> System.identityHashCode(proxy);
+					case "equals" -> proxy == arguments[0];
+					case "toString" -> "controlled range cleanup";
+					default -> throw new AssertionError(method.getName());
+				});
+		try {
+			resources.add(resource);
+			db.cleanupExpiredRangesNow();
+			assertEquals(1, expiryCalls.get());
+			assertEquals(1, resources.size(), "observation does not release the owner");
+			assertEquals(0.0, cleanupGauge(db, "rockserver.resource.overdue.count"),
+					"deadline20ms passed during a scan whose cutoff was10ms");
+			assertEquals(0.0, cleanupGauge(db, "rockserver.resource.oldest.overdue.seconds"));
+			db.cleanupExpiredRangesNow();
+			assertEquals(2, expiryCalls.get());
+			assertEquals(1.0, cleanupGauge(db, "rockserver.resource.overdue.count"));
+			assertEquals(0.01, cleanupGauge(db, "rockserver.resource.oldest.overdue.seconds"), 0.000001);
+		} finally {
+			resources.remove(resource);
 			db.closeTesting();
 		}
 	}
