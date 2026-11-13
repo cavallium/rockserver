@@ -409,31 +409,34 @@ final class NodeMetrics {
 	}
 
 	/**
-	 * The line a person reads every {@code seconds}: what the node did (entries applied, client writes, commits, reads,
-	 * each with its average and largest time), how long an entry took from the leader's log to its apply, how far the
-	 * node is behind at worst, the conflicts, and the heap. A part with nothing to say is left out; a node that did
-	 * nothing says "idle". Every series is in the debug line and in the exported metrics.
+	 * The line a person reads: what the node did since the last one, in words and per second (entries applied, client
+	 * writes, commits, reads, each with its average and slowest time), the delay from the leader's log to the apply,
+	 * the backlog, the conflicts and the heap. A part with nothing to say is left out; a node that did nothing says
+	 * "idle" on one line; otherwise a line of work and a line of health under a heading. {@code seconds} is the length
+	 * of the window, to turn counts into rates. Every series is in the debug
+	 * line and in the exported metrics.
 	 */
 	static String summary(String nodeId, long seconds, Map<String, Window> window, Map<String, Long> levels) {
 		var parts = new ArrayList<String>();
-		activity(parts, "applied", window.get("apply"));
-		activity(parts, "writes", window.get("writes.batch"));
-		activity(parts, "commits", window.get("commit"));
-		activity(parts, "reads", window.get("local"));
-		boolean idle = parts.isEmpty();
-		var replication = window.get("raft.appendToApply");
-		if (replication != null) {
-			parts.add(String.format(Locale.ROOT, "log→apply %s ms (max %s)", ms(replication.avg()), ms(replication.max())));
+		activity(parts, "applying %s entries/s", window.get("apply"), seconds);
+		activity(parts, "client writes %s/s", window.get("writes.batch"), seconds);
+		activity(parts, "commits %s/s", window.get("commit"), seconds);
+		activity(parts, "reads %s/s", window.get("local"), seconds);
+		var work = List.copyOf(parts);
+		parts.clear();
+		var delay = window.get("raft.appendToApply");
+		if (delay != null) {
+			parts.add("delay from log to apply avg " + ms(delay.avg()) + ", worst " + ms(delay.max()));
 		}
-		double behind = 0;
+		double backlog = 0;
 		for (var lag : List.of("lag.unapplied", "lag.uncommitted", "lag.unflushed")) {
 			var w = window.get(lag);
 			if (w != null) {
-				behind = Math.max(behind, w.max());
+				backlog = Math.max(backlog, w.max());
 			}
 		}
-		if (behind > 0) {
-			parts.add(String.format(Locale.ROOT, "behind ≤%,d", (long) behind));
+		if (backlog > 0) {
+			parts.add(String.format(Locale.ROOT, "backlog up to %,d entries", (long) backlog));
 		}
 		long conflicts = 0;
 		for (var name : List.of("transaction.conflict", "transaction.chainConflict", "update.chainConflict")) {
@@ -443,28 +446,39 @@ final class NodeMetrics {
 			}
 		}
 		if (conflicts > 0) {
-			parts.add(String.format(Locale.ROOT, "%,d conflicts", conflicts));
+			parts.add(String.format(Locale.ROOT, "%,d transaction conflict%s", conflicts, conflicts == 1 ? "" : "s"));
 		}
 		Long open = levels.get("leader.openTransactions");
 		if (open != null && open > 0) {
-			parts.add(String.format(Locale.ROOT, "open transactions %,d", open));
+			parts.add(String.format(Locale.ROOT, "%,d open transaction%s", open, open == 1 ? "" : "s"));
 		}
 		Long heap = levels.get("heapUsedMiB");
 		if (heap != null) {
-			parts.add(String.format(Locale.ROOT, "heap %,d MiB", heap));
+			parts.add(heap < 1024 ? "heap " + heap + " MB" : String.format(Locale.ROOT, "heap %.1f GB", heap / 1024.0));
 		}
-		return nodeId + " " + seconds + "s │ " + (idle ? "idle │ " : "") + String.join(" │ ", parts);
+		if (work.isEmpty()) {
+			return nodeId + ": idle" + (parts.isEmpty() ? "" : " | " + String.join(" | ", parts));
+		}
+		// Three lines at most: what it did, then how it is doing.
+		return nodeId + ", last " + seconds + " seconds:\n  work:   " + String.join(" | ", work)
+				+ (parts.isEmpty() ? "" : "\n  health: " + String.join(" | ", parts));
 	}
 
-	private static void activity(List<String> parts, String what, @Nullable Window w) {
+	private static void activity(List<String> parts, String what, @Nullable Window w, long seconds) {
 		if (w != null) {
-			parts.add(String.format(Locale.ROOT, "%s %,d × %s ms (max %s)", what, w.count(), ms(w.avg()), ms(w.max())));
+			double rate = w.count() / (double) seconds;
+			String perSecond = rate >= 10 ? String.format(Locale.ROOT, "%,d", Math.round(rate))
+					: String.format(Locale.ROOT, "%.1f", rate);
+			parts.add(String.format(Locale.ROOT, what, perSecond) + " (avg " + ms(w.avg()) + ", slowest " + ms(w.max()) + ")");
 		}
 	}
 
-	/** Milliseconds with the digits that matter: 0.46, 4.4, 73. */
+	/** A duration with the digits that matter and its unit: 0.46 ms, 4.4 ms, 73 ms, 2.5 s. */
 	private static String ms(double value) {
-		return String.format(Locale.ROOT, value < 1 ? "%.2f" : value < 10 ? "%.1f" : "%.0f", value);
+		if (value >= 1000) {
+			return String.format(Locale.ROOT, "%.1f s", value / 1000);
+		}
+		return String.format(Locale.ROOT, value < 1 ? "%.2f ms" : value < 10 ? "%.1f ms" : "%.0f ms", value);
 	}
 
 	synchronized void close() {

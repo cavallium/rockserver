@@ -175,11 +175,17 @@ class NodeMetricsTest {
 		window.put("lag.uncommitted", new NodeMetrics.Window(1000, 2.72, 33));
 		window.put("transaction.conflict", new NodeMetrics.Window(11, 1, 1));
 		var levels = java.util.Map.of("heapUsedMiB", 1740L, "leader.openTransactions", 1L, "leader.trackedKeys", 9L);
-		org.junit.jupiter.api.Assertions.assertEquals("n1 10s │ applied 5,337 × 0.46 ms (max 13) │ writes 7,098 × 4.4 ms (max 29)"
-				+ " │ commits 659 × 4.2 ms (max 21) │ reads 6,785 × 0.07 ms (max 3.6) │ log→apply 3.8 ms (max 29)"
-				+ " │ behind ≤33 │ 11 conflicts │ open transactions 1 │ heap 1,740 MiB",
+		org.junit.jupiter.api.Assertions.assertEquals("""
+				n1, last 10 seconds:
+				  work:   applying 534 entries/s (avg 0.46 ms, slowest 13 ms) | client writes 710/s (avg 4.4 ms, slowest 29 ms) \
+				| commits 66/s (avg 4.2 ms, slowest 21 ms) | reads 679/s (avg 0.07 ms, slowest 3.6 ms)
+				  health: delay from log to apply avg 3.8 ms, worst 29 ms | backlog up to 33 entries \
+				| 11 transaction conflicts | 1 open transaction | heap 1.7 GB""",
 				NodeMetrics.summary("n1", 10, window, levels));
-		org.junit.jupiter.api.Assertions.assertEquals("n3 10s │ idle │ heap 512 MiB", NodeMetrics.summary("n3", 10,
+		org.junit.jupiter.api.Assertions.assertEquals("n3: idle | heap 512 MB", NodeMetrics.summary("n3", 10,
 				java.util.Map.of("lag.unapplied", new NodeMetrics.Window(1000, 0, 0)), java.util.Map.of("heapUsedMiB", 512L)));
+		org.junit.jupiter.api.Assertions.assertEquals("n2, last 10 seconds:\n  work:   client writes 0.2/s (avg 8.9 ms, slowest 2.5 s)",
+				NodeMetrics.summary("n2", 10, java.util.Map.of("writes.batch", new NodeMetrics.Window(2, 8.88, 2500)),
+						java.util.Map.of()));
 	}
 }
