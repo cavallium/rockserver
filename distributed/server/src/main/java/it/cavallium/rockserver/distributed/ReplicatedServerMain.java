@@ -71,7 +71,7 @@ import org.rocksdb.NativeLibraryLoader;
  *       [--max-transaction-lease-ms N] [--log-segment-bytes N] [--pipelined-updates] [--join]
  *       [--jvm-pause-limit-ms N] [--snapshot-every-bytes N] [--parallel-apply-threads N]
  *       [--allow-without-exit-on-oom]
- * admin --peer ... [--group-id UUID] [--timeout-ms N] [--unsafe-multi-voter-change]
+ * admin --peer ... [--group-id UUID] [--timeout-ms N] [--unsafe-multi-voter-change] [--plain | --pretty]
  *       status | transfer-leader ID | add-peer ID=... | remove-peer ID | snapshot ID
  *       | checksum [--allow-skipped] | backup NAME | backup-status NAME INDEX
  * repair-log --data-dir DIR [--group-id UUID] [--dry-run]
@@ -268,6 +268,9 @@ public final class ReplicatedServerMain {
 			usage("missing command");
 		}
 		var rest = List.of(args).subList(1, args.length);
+		if (!args[0].equals("run")) {
+			quietLibraries();
+		}
 		switch (args[0]) {
 			case "run" -> run(new Options(rest));
 			case "admin" -> admin(new Options(rest));
@@ -925,6 +928,8 @@ public final class ReplicatedServerMain {
 		boolean unsafe = options.flag(UNSAFE_MULTI_VOTER_CHANGE);
 		boolean changeAddresses = options.flag(CHANGE_ADDRESSES);
 		boolean allowSkipped = options.flag("--allow-skipped");
+		boolean plain = options.flag("--plain");
+		boolean forcePretty = options.flag("--pretty");
 		// A misspelled option would otherwise be ignored, with the word after it (R28-3). The words are the command,
 		// whose count each command checks (R29-4).
 		options.requireOptionsConsumed();
@@ -932,6 +937,13 @@ public final class ReplicatedServerMain {
 		if (command.isEmpty()) {
 			usage("missing admin command");
 		}
+		if (plain && forcePretty) {
+			usage("--plain and --pretty exclude each other");
+		}
+		boolean terminal = System.console() != null && System.console().isTerminal();
+		boolean pretty = forcePretty || (terminal && !plain);
+		var style = new Style(pretty && terminal && System.getenv("NO_COLOR") == null
+				&& !"dumb".equals(System.getenv("TERM")));
 		if (allowSkipped && !command.getFirst().equals("checksum")) {
 			usage("--allow-skipped is an option of checksum only");
 		}
@@ -965,7 +977,7 @@ public final class ReplicatedServerMain {
 					if (command.size() != 1) {
 						usage("status takes no argument");
 					}
-					printStatus(peers, groupId);
+					printStatus(peers, groupId, pretty, style);
 					yield null;
 				}
 				case "transfer-leader" -> {
@@ -979,7 +991,7 @@ public final class ReplicatedServerMain {
 					// whose answer can look like a log of its own until it applies the genesis or its snapshot.
 					if (isVoter(added, peers, groupId, changeAddresses, deadline)
 							|| !requireFitToJoin(added, peers, groupId, changeAddresses, deadline)) {
-						System.out.println("OK");
+						System.out.println(style.good("OK"));
 						yield null;
 					}
 					requireCapabilities(added, peers, groupId);
@@ -998,7 +1010,7 @@ public final class ReplicatedServerMain {
 					// R59-1: not a voter (a re-run of a removal that committed, or a mistyped id): said so, and OK without
 					// proposing anything; an id that differs from a voter only by case fails as a likely typo.
 					if (!isVoterToRemove(removed, peers, groupId, target, changeAddresses, deadline)) {
-						System.out.println("OK");
+						System.out.println(style.good("OK"));
 						yield null;
 					}
 					yield changeVoters(client, peers, groupId, target, unsafe, changeAddresses, timeout, deadline);
@@ -1082,7 +1094,7 @@ public final class ReplicatedServerMain {
 				}
 			};
 			if (reply != null) {
-				System.out.println(reply.isSuccess() ? "OK" : "FAILED: " + reply.getException());
+				System.out.println(reply.isSuccess() ? style.good("OK") : style.bad("FAILED: " + reply.getException()));
 				if (!reply.isSuccess()) {
 					exit(1);
 				}
@@ -1865,30 +1877,44 @@ public final class ReplicatedServerMain {
 	 * that, instead of holding the others for the admin time limit, as the shared client's retries until the deadline
 	 * did (R27-1). Status is what the runbooks tell to look at exactly when members are down.
 	 */
-	private static void printStatus(List<PeerConfig> peers, RaftGroupId groupId) throws InterruptedException {
+	private static void printStatus(List<PeerConfig> peers, RaftGroupId groupId, boolean pretty, Style style)
+			throws InterruptedException {
 		var executor = Executors.newVirtualThreadPerTaskExecutor();
 		var infoClient = infoClient(peers, groupId);
 		try {
 			var asked = peers.stream().map(peer -> CompletableFuture.supplyAsync(() -> {
 				try {
 					var info = infoClient.getGroupManagementApi(RaftPeerId.valueOf(peer.id())).info(groupId);
-					return peer.id() + ": " + info.getRoleInfoProto().getRole() + logInfo(info) + ", commit infos "
-							+ info.getCommitInfos();
+					var log = info.getLogInfoProto();
+					boolean applied = log != null && log.hasApplied();
+					return new MemberStatus(peer, info.getRoleInfoProto().getRole().toString(),
+							applied ? log.getApplied().getIndex() : -1,
+							applied && log.hasCommitted() ? log.getCommitted().getIndex() : -1,
+							peer.id() + ": " + info.getRoleInfoProto().getRole() + logInfo(info) + ", commit infos "
+									+ info.getCommitInfos(), null);
 				} catch (IOException | RuntimeException ex) {
-					return peer.id() + ": unreachable (" + ex.getMessage() + ")";
+					return MemberStatus.unreachable(peer, String.valueOf(ex.getMessage()));
 				}
 			}, executor)).toList();
 			long deadline = System.nanoTime() + PEER_ANSWER_TIMEOUT.toNanos();
+			var members = new ArrayList<MemberStatus>();
 			for (int i = 0; i < peers.size(); i++) {
-				String line;
+				MemberStatus member;
 				try {
-					line = asked.get(i).get(Math.max(0, deadline - System.nanoTime()), TimeUnit.NANOSECONDS);
+					member = asked.get(i).get(Math.max(0, deadline - System.nanoTime()), TimeUnit.NANOSECONDS);
 				} catch (TimeoutException late) {
-					line = peers.get(i).id() + ": unreachable (no answer within " + PEER_ANSWER_TIMEOUT.toMillis() + " ms)";
+					member = MemberStatus.unreachable(peers.get(i), "no answer within " + PEER_ANSWER_TIMEOUT.toMillis() + " ms");
 				} catch (ExecutionException failed) {
-					line = peers.get(i).id() + ": unreachable (" + failed.getCause() + ")";
+					member = MemberStatus.unreachable(peers.get(i), String.valueOf(failed.getCause()));
 				}
-				System.out.println(line);
+				if (pretty) {
+					members.add(member);
+				} else {
+					System.out.println(member.plainLine());
+				}
+			}
+			if (pretty) {
+				System.out.print(statusTable(members, style));
 			}
 		} finally {
 			// Not awaited: a request still hanging on a dead member is dropped with the client.
@@ -1900,6 +1926,139 @@ public final class ReplicatedServerMain {
 			}
 		}
 	}
+
+	/**
+	 * One member's answer to {@code status}: {@code plainLine} is the line of the plain output, which scripts and the
+	 * tests read; the other fields feed the table. An index is -1 when the answer carries none, {@code error} is null
+	 * for a member that answered.
+	 */
+	record MemberStatus(PeerConfig peer, String role, long applied, long commit, String plainLine,
+			@Nullable String error) {
+
+		static MemberStatus unreachable(PeerConfig peer, String why) {
+			return new MemberStatus(peer, "unreachable", -1, -1, peer.id() + ": unreachable (" + why + ")", why);
+		}
+	}
+
+	/** ANSI colors for a terminal, or nothing: {@code NO_COLOR}, {@code TERM=dumb} and a pipe print plain text. */
+	record Style(boolean color) {
+
+		private String paint(String code, String text) {
+			return color ? "\u001b[" + code + "m" + text + "\u001b[0m" : text;
+		}
+
+		String good(String text) {
+			return paint("32", text);
+		}
+
+		String warn(String text) {
+			return paint("33", text);
+		}
+
+		String bad(String text) {
+			return paint("1;31", text);
+		}
+
+		String strong(String text) {
+			return paint("1", text);
+		}
+
+		String dim(String text) {
+			return paint("2", text);
+		}
+	}
+
+	/**
+	 * The table of {@code status} for a person: a verdict (leader, members that answered, whether a majority did), then
+	 * one row per member with its role, applied and commit index, how far its applied index is behind the highest
+	 * commit index seen ("behind"), and its Raft address. The plain output keeps one line per member.
+	 */
+	static String statusTable(List<MemberStatus> members, Style style) {
+		long top = members.stream().mapToLong(MemberStatus::commit).max().orElse(-1);
+		var leaders = members.stream().filter(m -> m.role().equals("LEADER")).map(m -> m.peer().id()).toList();
+		long answered = members.stream().filter(m -> m.error() == null).count();
+		boolean majority = answered > members.size() / 2;
+		var out = new StringBuilder();
+		String verdict;
+		if (leaders.size() == 1 && answered == members.size()) {
+			verdict = style.good("HEALTHY") + "  leader " + style.strong(leaders.getFirst()) + ", " + answered + " of "
+					+ members.size() + " members answer";
+		} else if (leaders.size() == 1 && majority) {
+			verdict = style.warn("DEGRADED") + "  leader " + style.strong(leaders.getFirst()) + ", only " + answered + " of "
+					+ members.size() + " members answer";
+		} else if (leaders.size() > 1) {
+			verdict = style.warn("ELECTION") + "  " + leaders.size() + " members say they lead (" + String.join(", ", leaders)
+					+ "): ask again in a few seconds";
+		} else if (majority) {
+			verdict = style.warn("NO LEADER") + "  " + answered + " of " + members.size()
+					+ " members answer, none leads: an election is running, ask again in a few seconds";
+		} else {
+			verdict = style.bad("NO QUORUM") + "  only " + answered + " of " + members.size()
+					+ " members answer: the cluster accepts no write";
+		}
+		out.append(verdict).append('\n').append('\n');
+		var rows = new ArrayList<String[]>();
+		rows.add(new String[] {"NODE", "ROLE", "APPLIED", "COMMIT", "BEHIND", "RAFT ADDRESS"});
+		for (var m : members) {
+			String behind = m.applied() < 0 || top < 0 ? "-" : String.valueOf(Math.max(0, top - m.applied()));
+			rows.add(new String[] {m.peer().id(), m.error() == null ? m.role().toLowerCase(java.util.Locale.ROOT) : "unreachable",
+					m.applied() < 0 ? "-" : String.format("%,d", m.applied()),
+					m.commit() < 0 ? "-" : String.format("%,d", m.commit()), behind,
+					m.peer().raftHost() + ":" + m.peer().raftPort()});
+		}
+		int[] width = new int[6];
+		for (var row : rows) {
+			for (int i = 0; i < row.length; i++) {
+				width[i] = Math.max(width[i], row[i].length());
+			}
+		}
+		for (int r = 0; r < rows.size(); r++) {
+			var row = rows.get(r);
+			var line = new StringBuilder();
+			for (int i = 0; i < row.length; i++) {
+				boolean number = i >= 2 && i <= 4;
+				boolean last = i + 1 == row.length;
+				String cell = number ? " ".repeat(width[i] - row[i].length()) + row[i]
+						: last ? row[i] : row[i] + " ".repeat(width[i] - row[i].length());
+				if (r == 0) {
+					cell = style.dim(cell);
+				} else if (i == 1) {
+					cell = switch (row[1]) {
+						case "leader" -> style.good(cell);
+						case "follower" -> cell;
+						case "unreachable" -> style.bad(cell);
+						default -> style.warn(cell);
+					};
+				} else if (i == 0) {
+					cell = style.strong(cell);
+				}
+				line.append(cell).append(i + 1 < row.length ? "  " : "");
+			}
+			out.append(line.toString().stripTrailing()).append('\n');
+		}
+		for (var m : members) {
+			if (m.error() != null) {
+				out.append(style.bad(m.peer().id() + ": " + m.error())).append('\n');
+			}
+		}
+		return out.toString();
+	}
+
+	/**
+	 * The one-shot commands print their answer, not the libraries' start-up lines: slf4j-simple at "warn" unless the
+	 * operator set a level, and the shaded gRPC's java.util.logging lines (an "Epoll available" at every start) at
+	 * WARNING. Called before the first logger exists. {@code run} keeps the full log.
+	 */
+	private static void quietLibraries() {
+		if (System.getProperty("org.slf4j.simpleLogger.defaultLogLevel") == null) {
+			System.setProperty("org.slf4j.simpleLogger.defaultLogLevel", "warn");
+		}
+		QUIET_GRPC.setLevel(java.util.logging.Level.WARNING);
+	}
+
+	/** Held strongly: java.util.logging keeps its loggers weakly, and a collected one comes back at its default level. */
+	private static final java.util.logging.Logger QUIET_GRPC =
+			java.util.logging.Logger.getLogger("org.apache.ratis.thirdparty.io.grpc");
 
 	/**
 	 * Asks every one of {@code peers} at once ({@code ask}, which may block for its request timeout), and returns the
@@ -2438,7 +2597,7 @@ public final class ReplicatedServerMain {
 				        [--jvm-pause-limit-ms N] [--snapshot-every-bytes N] [--parallel-apply-threads N]
 				        [--allow-without-exit-on-oom]
 				  admin --peer ... [--group-id UUID] [--timeout-ms N] [--unsafe-multi-voter-change]
-				        [--change-addresses]
+				        [--change-addresses] [--plain | --pretty]
 				        status | transfer-leader ID | add-peer ID=... | remove-peer ID | snapshot ID
 				        | checksum [--allow-skipped] | backup NAME | backup-status NAME INDEX
 				  repair-log --data-dir DIR [--group-id UUID] [--dry-run]
@@ -2464,7 +2623,8 @@ public final class ReplicatedServerMain {
 	/** Minimal "--name value" parser; {@code --peer} may repeat, and a {@link #FLAGS flag} takes no value. */
 	private static final class Options {
 		private static final List<String> FLAGS = List.of("--pipelined-updates", "--join", "--dry-run",
-				"--allow-without-exit-on-oom", "--allow-skipped", UNSAFE_MULTI_VOTER_CHANGE, CHANGE_ADDRESSES,
+				"--allow-without-exit-on-oom", "--allow-skipped", "--plain", "--pretty", UNSAFE_MULTI_VOTER_CHANGE,
+				CHANGE_ADDRESSES,
 				"--without-damaged-snapshot", "--verify", "--allow-non-empty");
 
 		private final List<String[]> pairs = new ArrayList<>();

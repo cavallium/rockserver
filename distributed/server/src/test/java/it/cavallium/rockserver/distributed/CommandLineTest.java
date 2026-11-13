@@ -2,6 +2,7 @@ package it.cavallium.rockserver.distributed;
 
 import org.junit.jupiter.api.Tag;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -364,7 +365,11 @@ class CommandLineTest {
 		var status = run(admin(List.of(id), "status"));
 		assertEquals(0, status.code(), status.toString());
 		assertTrue(status.out().contains(id + ": LEADER, applied index " + stateMachine.appliedIndex().get()),
-				status.out());
+				status.out());		// Not a terminal: the plain lines, for scripts. --pretty asks for the table.
+		var table = run(with(List.of(admin(List.of(id), "status")), "--pretty"));
+		assertEquals(0, table.code(), table.toString());
+		assertTrue(table.out().startsWith("HEALTHY  leader " + id + ", 1 of 1 members answer"), table.out());
+		assertFalse(table.out().contains("\u001b"), table.out());
 	}
 
 	/** R55-3: admin snapshot waits for the member's snapshot at most its own wait, and at most the time left. */
