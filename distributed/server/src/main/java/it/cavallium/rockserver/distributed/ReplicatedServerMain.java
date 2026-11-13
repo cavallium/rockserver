@@ -932,6 +932,7 @@ public final class ReplicatedServerMain {
 	}
 
 	private static void admin(Options options) throws IOException, InterruptedException {
+		inAdmin = true;
 		NOTED_LEADERS.get().clear();
 		var peers = options.peers();
 		var groupId = RaftGroupId.valueOf(options.uuid("--group-id", NodeConfig.DEFAULT_GROUP_ID));
@@ -2622,14 +2623,18 @@ public final class ReplicatedServerMain {
 		boolean terminal = System.console() != null && System.console().isTerminal();
 		if (terminal) {
 			// On a terminal the reason comes last, where the eye is, not above forty lines of usage.
-			System.err.println(USAGE);
-			System.err.println(new Style(System.getenv("NO_COLOR") == null).bad("Error: " + problem));
+			var style = new Style(System.getenv("NO_COLOR") == null && !"dumb".equals(System.getenv("TERM")));
+			System.err.println(inAdmin ? adminHelp(style) : USAGE);
+			System.err.println(style.bad("Error: " + problem));
 			exit(2);
 		}
 		System.err.println("Error: " + problem);
 		System.err.println(USAGE);
 		exit(2);
 	}
+
+	/** Whether {@code admin} runs: a wrong call then shows, on a terminal, the admin commands and not every command's usage. */
+	private static volatile boolean inAdmin;
 
 	private static final String USAGE = """
 				Usage:
