@@ -1,0 +1,36 @@
+#!/bin/sh
+# Cluster administration for a node that runs Rockserver as a systemd service.
+#
+# Nothing is configured here: the Java, the installation (classpath), the group id and the cluster's members are
+# read from the service's own command line, so the unit stays the one place that describes the node.
+# Usage: rs-admin help | rs-admin status | ... (ROCKSERVER_UNIT names another unit, default rockserver.service)
+set -eu
+set -f # the classpath ends with lib/*: never expanded by this shell
+
+unit="${ROCKSERVER_UNIT:-rockserver.service}"
+start=$(systemctl show "$unit" -p ExecStart --value 2>/dev/null) || start=""
+argv=${start#*argv\[\]=}
+argv=${argv%% ; *}
+if [ -z "$start" ] || [ "$argv" = "$start" ]; then
+	echo "rs-admin: cannot read the command line of $unit (systemctl show $unit -p ExecStart)" >&2
+	exit 2
+fi
+
+java="" classpath="" main="" peers="" previous=""
+for word in $argv; do
+	[ -n "$java" ] || java=$word
+	case "$previous" in
+		-cp|-classpath|--class-path) classpath=$word ;;
+		--peer|--group-id) peers="$peers $previous $word" ;;
+	esac
+	case "$word" in *.ReplicatedServerMain) main=$word ;; esac
+	previous=$word
+done
+if [ -z "$classpath" ] || [ -z "$main" ] || [ -z "$peers" ]; then
+	echo "rs-admin: $unit does not run a replicated Rockserver node (no classpath, main class or --peer in: $argv)" >&2
+	exit 2
+fi
+
+# The JDK warns about sun.misc.Unsafe in a library at every start: not something an operator can act on.
+# shellcheck disable=SC2086
+exec "$java" --enable-native-access=ALL-UNNAMED --sun-misc-unsafe-memory-access=allow -cp "$classpath" "$main" admin $peers "$@"

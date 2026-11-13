@@ -114,7 +114,10 @@ PEERS="--peer n1=10.0.0.1:9001/10.0.0.1:5333 --peer n2=10.0.0.2:9001/10.0.0.2:53
    `--plain` and `--pretty` force one or the other. The same holds for every `admin` command: on a terminal each
    line is marked (`·` progress, `!` a warning or a retry, `✓ OK` with the elapsed time, `✗ FAILED`), the members'
    results of `checksum` and `backup` are a table, a line shows that the command is still working and for how long,
-   a wrong call prints its reason last (after the usage), and `admin help` (or no command) lists the commands. The one-shot commands print the libraries' messages only from
+   a wrong call prints its reason last (after the usage), and `admin help` (or no command) lists the commands.
+   On a node that runs as a systemd service, `distributed/deploy/rs-admin` (install it as `/usr/local/bin/rs-admin`)
+   is `rs admin $PEERS`: it holds no setting and reads the Java, the classpath, the group id and the members from the
+   unit's command line (`ROCKSERVER_UNIT` names a unit other than `rockserver.service`). The one-shot commands print the libraries' messages only from
    "warn" up; start their JVM with `--sun-misc-unsafe-memory-access=allow` to drop the JDK's own `sun.misc.Unsafe`
    warning.
 
