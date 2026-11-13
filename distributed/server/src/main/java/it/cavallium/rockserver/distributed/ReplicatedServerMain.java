@@ -200,6 +200,16 @@ import org.rocksdb.NativeLibraryLoader;
  */
 public final class ReplicatedServerMain {
 
+	static {
+		// Before any other static of this class: the first Ratis class it touches creates a logger, and slf4j-simple
+		// reads its level once. main() is too late for the one-shot commands' quiet output (see quietLibraries).
+		var launched = System.getProperty("sun.java.command", "").split(" ");
+		if (launched.length > 1 && launched[0].equals(ReplicatedServerMain.class.getName()) && !launched[1].equals("run")
+				&& System.getProperty("org.slf4j.simpleLogger.defaultLogLevel") == null) {
+			System.setProperty("org.slf4j.simpleLogger.defaultLogLevel", "warn");
+		}
+	}
+
 	private static final Duration DEFAULT_ADMIN_TIMEOUT = Duration.ofMinutes(10);
 	/** The longest {@code admin --timeout-ms}: a deadline in nanoseconds still comparable with {@link System#nanoTime}. */
 	private static final Duration MAX_ADMIN_TIMEOUT = Duration.ofNanos(Long.MAX_VALUE / 2);
