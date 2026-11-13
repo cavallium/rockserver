@@ -616,5 +616,5 @@ below come from the code and the logs, without a new run.
   and position puts and one `closeTransaction` per applied group, and never with the client's latency. Reads,
   staged transactional writes, transaction opens, rollbacks and range calls are counted only on the leader,
   with their local database time only (no read barrier, forwarding or replication). The replication timers
-  (`NodeMetrics`) are logged every 10 s and exported with the core metrics (JMX, InfluxDB) as
+  (`NodeMetrics`) are logged every 10 s (a short line: entries applied, writes, commits and reads with their average and largest time, the time from the log to the apply, how far the node is behind, conflicts, heap; every series at debug level, `-Dorg.slf4j.simpleLogger.log.it.cavallium.rockserver.distributed.NodeMetrics=debug`) and exported with the core metrics (JMX, InfluxDB) as
   `rockserver.replication.*`, tagged `node` and `kind` (see design.md, "Metrics and alerts").

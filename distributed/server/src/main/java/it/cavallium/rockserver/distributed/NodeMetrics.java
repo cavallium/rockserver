@@ -24,7 +24,7 @@ import org.slf4j.LoggerFactory;
 
 /**
  * Cheap counters of where replicated requests spend their time (proposer queue, Raft round trip, apply, read
- * barrier...), logged as one line every {@link #INTERVAL_SECONDS} seconds when there was activity. Each series keeps
+ * barrier...), logged every {@link #INTERVAL_SECONDS} seconds as one short line for a person ({@link #summary}) and, at debug level, as one line with every series. Each series keeps
  * the count, the sum and the maximum of its values over the interval.
  *
  * <p>Once {@link #bind bound} to the registry of the node's database (the core server's metrics pipeline: JMX, and
@@ -357,23 +357,41 @@ final class NodeMetrics {
 		return "client";
 	}
 
+	/** What a series recorded since the last line: how many, their average and their largest (durations in ms). */
+	record Window(long count, double avg, double max) {}
+
 	private void log() {
-		var line = new StringBuilder();
-		append(line, durations, 1e6, "ms");
-		append(line, amounts, 1, "");
-		if (!line.isEmpty()) {
-			for (var gauge : new TreeMap<>(gauges).entrySet()) {
-				try {
-					line.append(' ').append(gauge.getKey()).append('=').append(gauge.getValue().getAsLong()).append(';');
-				} catch (RuntimeException ignored) {
-					// Not available right now.
-				}
+		var window = new TreeMap<String, Window>();
+		collect(window, durations, 1e6);
+		var durationNames = List.copyOf(window.keySet());
+		collect(window, amounts, 1);
+		if (window.isEmpty()) {
+			return;
+		}
+		var levels = new TreeMap<String, Long>();
+		for (var gauge : new TreeMap<>(gauges).entrySet()) {
+			try {
+				levels.put(gauge.getKey(), gauge.getValue().getAsLong());
+			} catch (RuntimeException ignored) {
+				// Not available right now.
 			}
-			LOG.info("{}: last {}s:{}", nodeId, INTERVAL_SECONDS, line);
+		}
+		LOG.info("{}", summary(nodeId, INTERVAL_SECONDS, window, levels));
+		if (LOG.isDebugEnabled()) {
+			// Every series, as one line: for a search in the journal, not for reading. The same numbers are exported
+			// to the metrics registry.
+			var line = new StringBuilder();
+			window.forEach((name, w) -> {
+				String unit = durationNames.contains(name) ? "ms" : "";
+				line.append(String.format(Locale.ROOT, " %s=%d×avg %.2f%s max %.2f%s;", name, w.count(), w.avg(), unit,
+						w.max(), unit));
+			});
+			levels.forEach((name, value) -> line.append(' ').append(name).append('=').append(value).append(';'));
+			LOG.debug("{}: last {}s:{}", nodeId, INTERVAL_SECONDS, line);
 		}
 	}
 
-	private static void append(StringBuilder line, Map<String, Series> series, double scale, String unit) {
+	private static void collect(Map<String, Window> window, Map<String, Series> series, double scale) {
 		for (var entry : new TreeMap<>(series).entrySet()) {
 			var s = entry.getValue();
 			long total = s.count.sum();
@@ -386,9 +404,67 @@ final class NodeMetrics {
 			if (count == 0) {
 				continue;
 			}
-			line.append(String.format(Locale.ROOT, " %s=%d×avg %.2f%s max %.2f%s;", entry.getKey(), count,
-					sum / (double) count / scale, unit, max / scale, unit));
+			window.put(entry.getKey(), new Window(count, sum / (double) count / scale, max / scale));
 		}
+	}
+
+	/**
+	 * The line a person reads every {@code seconds}: what the node did (entries applied, client writes, commits, reads,
+	 * each with its average and largest time), how long an entry took from the leader's log to its apply, how far the
+	 * node is behind at worst, the conflicts, and the heap. A part with nothing to say is left out; a node that did
+	 * nothing says "idle". Every series is in the debug line and in the exported metrics.
+	 */
+	static String summary(String nodeId, long seconds, Map<String, Window> window, Map<String, Long> levels) {
+		var parts = new ArrayList<String>();
+		activity(parts, "applied", window.get("apply"));
+		activity(parts, "writes", window.get("writes.batch"));
+		activity(parts, "commits", window.get("commit"));
+		activity(parts, "reads", window.get("local"));
+		boolean idle = parts.isEmpty();
+		var replication = window.get("raft.appendToApply");
+		if (replication != null) {
+			parts.add(String.format(Locale.ROOT, "log→apply %s ms (max %s)", ms(replication.avg()), ms(replication.max())));
+		}
+		double behind = 0;
+		for (var lag : List.of("lag.unapplied", "lag.uncommitted", "lag.unflushed")) {
+			var w = window.get(lag);
+			if (w != null) {
+				behind = Math.max(behind, w.max());
+			}
+		}
+		if (behind > 0) {
+			parts.add(String.format(Locale.ROOT, "behind ≤%,d", (long) behind));
+		}
+		long conflicts = 0;
+		for (var name : List.of("transaction.conflict", "transaction.chainConflict", "update.chainConflict")) {
+			var w = window.get(name);
+			if (w != null) {
+				conflicts += w.count();
+			}
+		}
+		if (conflicts > 0) {
+			parts.add(String.format(Locale.ROOT, "%,d conflicts", conflicts));
+		}
+		Long open = levels.get("leader.openTransactions");
+		if (open != null && open > 0) {
+			parts.add(String.format(Locale.ROOT, "open transactions %,d", open));
+		}
+		Long heap = levels.get("heapUsedMiB");
+		if (heap != null) {
+			parts.add(String.format(Locale.ROOT, "heap %,d MiB", heap));
+		}
+		return nodeId + " " + seconds + "s │ " + (idle ? "idle │ " : "") + String.join(" │ ", parts);
+	}
+
+	private static void activity(List<String> parts, String what, @Nullable Window w) {
+		if (w != null) {
+			parts.add(String.format(Locale.ROOT, "%s %,d × %s ms (max %s)", what, w.count(), ms(w.avg()), ms(w.max())));
+		}
+	}
+
+	/** Milliseconds with the digits that matter: 0.46, 4.4, 73. */
+	private static String ms(double value) {
+		return String.format(Locale.ROOT, value < 1 ? "%.2f" : value < 10 ? "%.1f" : "%.0f", value);
 	}
 
 	synchronized void close() {

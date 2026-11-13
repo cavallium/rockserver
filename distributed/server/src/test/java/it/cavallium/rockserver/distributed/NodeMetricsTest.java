@@ -161,4 +161,25 @@ class NodeMetricsTest {
 			metrics.close();
 		}
 	}
+
+	@org.junit.jupiter.api.Test
+	void theLineOfEveryTenSecondsIsShortAndSaysWhatTheNodeDid() {
+		var window = new java.util.TreeMap<String, NodeMetrics.Window>();
+		window.put("apply", new NodeMetrics.Window(5337, 0.46, 12.82));
+		window.put("apply.commit", new NodeMetrics.Window(5337, 0.05, 0.37));
+		window.put("writes.batch", new NodeMetrics.Window(7098, 4.35, 29.49));
+		window.put("commit", new NodeMetrics.Window(659, 4.24, 20.97));
+		window.put("local", new NodeMetrics.Window(6785, 0.07, 3.63));
+		window.put("raft.appendToApply", new NodeMetrics.Window(7745, 3.83, 29.16));
+		window.put("lag.unapplied", new NodeMetrics.Window(1000, 0.54, 9));
+		window.put("lag.uncommitted", new NodeMetrics.Window(1000, 2.72, 33));
+		window.put("transaction.conflict", new NodeMetrics.Window(11, 1, 1));
+		var levels = java.util.Map.of("heapUsedMiB", 1740L, "leader.openTransactions", 1L, "leader.trackedKeys", 9L);
+		org.junit.jupiter.api.Assertions.assertEquals("n1 10s │ applied 5,337 × 0.46 ms (max 13) │ writes 7,098 × 4.4 ms (max 29)"
+				+ " │ commits 659 × 4.2 ms (max 21) │ reads 6,785 × 0.07 ms (max 3.6) │ log→apply 3.8 ms (max 29)"
+				+ " │ behind ≤33 │ 11 conflicts │ open transactions 1 │ heap 1,740 MiB",
+				NodeMetrics.summary("n1", 10, window, levels));
+		org.junit.jupiter.api.Assertions.assertEquals("n3 10s │ idle │ heap 512 MiB", NodeMetrics.summary("n3", 10,
+				java.util.Map.of("lag.unapplied", new NodeMetrics.Window(1000, 0, 0)), java.util.Map.of("heapUsedMiB", 512L)));
+	}
 }

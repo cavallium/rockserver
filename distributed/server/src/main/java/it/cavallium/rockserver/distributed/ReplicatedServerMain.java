@@ -209,6 +209,15 @@ public final class ReplicatedServerMain {
 				&& System.getProperty("org.slf4j.simpleLogger.defaultLogLevel") == null) {
 			System.setProperty("org.slf4j.simpleLogger.defaultLogLevel", "warn");
 		}
+		// A log line starts with what a person looks for: "INFO NodeMetrics - ...", not the thread's name and the
+		// package. The journal (or whatever collects the output) already gives the time.
+		if (System.getProperty("org.slf4j.simpleLogger.showThreadName") == null) {
+			System.setProperty("org.slf4j.simpleLogger.showThreadName", "false");
+		}
+		if (System.getProperty("org.slf4j.simpleLogger.showShortLogName") == null
+				&& System.getProperty("org.slf4j.simpleLogger.showLogName") == null) {
+			System.setProperty("org.slf4j.simpleLogger.showShortLogName", "true");
+		}
 	}
 
 	private static final Duration DEFAULT_ADMIN_TIMEOUT = Duration.ofMinutes(10);
