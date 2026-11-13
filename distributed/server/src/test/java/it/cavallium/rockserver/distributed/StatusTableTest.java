@@ -58,4 +58,35 @@ class StatusTableTest {
 		assertFalse(plain.contains("\u001b"), plain);
 		assertEquals(plain, colored.replaceAll("\u001b\\[[0-9;]*m", ""));
 	}
+
+	@Test
+	void theHelpNamesEveryAdminCommand() {
+		var help = ReplicatedServerMain.adminHelp(new Style(false));
+		for (var command : List.of("status", "transfer-leader ID", "snapshot ID", "checksum", "backup NAME",
+				"backup-status NAME INDEX", "add-peer ID=RAFT/API", "remove-peer ID", "help")) {
+			assertTrue(help.contains("\n  " + command + " "), command + " in\n" + help);
+		}
+		assertFalse(help.contains("\u001b"), help);
+	}
+
+	@Test
+	void theOutcomeOfALineIsMarkedOnATerminal() {
+		ReplicatedServerMain.Ui.start(true, false, new Style(false));
+		try {
+			assertTrue(ReplicatedServerMain.Ui.decorate("OK").startsWith("✓ OK  ("), ReplicatedServerMain.Ui.decorate("OK"));
+			assertEquals("✗ FAILED: n2 differs", ReplicatedServerMain.Ui.decorate("FAILED: n2 differs"));
+			assertEquals("! WARNING: two voters change", ReplicatedServerMain.Ui.decorate("WARNING: two voters change"));
+			assertEquals("· checksum at log index 7", ReplicatedServerMain.Ui.decorate("checksum at log index 7"));
+		} finally {
+			ReplicatedServerMain.Ui.start(false, false, new Style(false));
+		}
+	}
+
+	@Test
+	void elapsedTimeReadsLikeAClock() {
+		assertEquals("250 ms", ReplicatedServerMain.Ui.elapsed(250_000_000L));
+		assertEquals("42 s", ReplicatedServerMain.Ui.elapsed(42_000_000_000L));
+		assertEquals("49 min 12 s", ReplicatedServerMain.Ui.elapsed(2_952_000_000_000L));
+		assertEquals("2 h 5 min", ReplicatedServerMain.Ui.elapsed(7_500_000_000_000L));
+	}
 }

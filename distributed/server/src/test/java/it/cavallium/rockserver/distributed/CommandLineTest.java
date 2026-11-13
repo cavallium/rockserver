@@ -370,6 +370,17 @@ class CommandLineTest {
 		assertEquals(0, table.code(), table.toString());
 		assertTrue(table.out().startsWith("HEALTHY  leader " + id + ", 1 of 1 members answer"), table.out());
 		assertFalse(table.out().contains("\u001b"), table.out());
+		// The other commands: marked lines and the elapsed time with --pretty, the plain lines without.
+		var prettySnapshot = run(with(List.of(admin(List.of(id), "snapshot", id)), "--pretty"));
+		assertEquals(0, prettySnapshot.code(), prettySnapshot.toString());
+		assertTrue(prettySnapshot.out().contains("· " + id + " took a snapshot at log index "), prettySnapshot.out());
+		assertTrue(prettySnapshot.out().contains("✓ OK  ("), prettySnapshot.out());
+		var plainSnapshot = run(admin(List.of(id), "snapshot", id));
+		assertTrue(plainSnapshot.out().strip().endsWith("OK"), plainSnapshot.out());
+		assertFalse(plainSnapshot.out().contains("✓"), plainSnapshot.out());
+		var help = run(admin(List.of(id), "help"));
+		assertEquals(0, help.code(), help.toString());
+		assertTrue(help.out().contains("transfer-leader ID"), help.out());
 	}
 
 	/** R55-3: admin snapshot waits for the member's snapshot at most its own wait, and at most the time left. */

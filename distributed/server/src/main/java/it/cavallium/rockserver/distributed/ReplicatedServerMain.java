@@ -13,6 +13,7 @@ import java.util.Collection;
 import java.util.HashSet;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
@@ -944,9 +945,6 @@ public final class ReplicatedServerMain {
 		// whose count each command checks (R29-4).
 		options.requireOptionsConsumed();
 		var command = options.positional();
-		if (command.isEmpty()) {
-			usage("missing admin command");
-		}
 		if (plain && forcePretty) {
 			usage("--plain and --pretty exclude each other");
 		}
@@ -954,6 +952,17 @@ public final class ReplicatedServerMain {
 		boolean pretty = forcePretty || (terminal && !plain);
 		var style = new Style(pretty && terminal && System.getenv("NO_COLOR") == null
 				&& !"dumb".equals(System.getenv("TERM")));
+		Ui.start(pretty, terminal, style);
+		if (command.equals(List.of("help")) || (command.isEmpty() && pretty)) {
+			System.out.print(adminHelp(style));
+			if (command.isEmpty()) {
+				exit(2);
+			}
+			return;
+		}
+		if (command.isEmpty()) {
+			usage("missing admin command");
+		}
 		if (allowSkipped && !command.getFirst().equals("checksum")) {
 			usage("--allow-skipped is an option of checksum only");
 		}
@@ -981,7 +990,8 @@ public final class ReplicatedServerMain {
 				.setRaftGroup(group)
 				.setProperties(RaftSettings.client(anyConfig))
 				.setRetryPolicy(retryUntil(() -> deadline))
-				.build()) {
+				.build();
+				var working = Ui.working(String.join(" ", command))) {
 			RaftClientReply reply = switch (command.getFirst()) {
 				case "status" -> {
 					if (command.size() != 1) {
@@ -1001,7 +1011,7 @@ public final class ReplicatedServerMain {
 					// whose answer can look like a log of its own until it applies the genesis or its snapshot.
 					if (isVoter(added, peers, groupId, changeAddresses, deadline)
 							|| !requireFitToJoin(added, peers, groupId, changeAddresses, deadline)) {
-						System.out.println(style.good("OK"));
+						Ui.say("OK");
 						yield null;
 					}
 					requireCapabilities(added, peers, groupId);
@@ -1020,7 +1030,7 @@ public final class ReplicatedServerMain {
 					// R59-1: not a voter (a re-run of a removal that committed, or a mistyped id): said so, and OK without
 					// proposing anything; an id that differs from a voter only by case fails as a likely typo.
 					if (!isVoterToRemove(removed, peers, groupId, target, changeAddresses, deadline)) {
-						System.out.println(style.good("OK"));
+						Ui.say("OK");
 						yield null;
 					}
 					yield changeVoters(client, peers, groupId, target, unsafe, changeAddresses, timeout, deadline);
@@ -1048,7 +1058,7 @@ public final class ReplicatedServerMain {
 							fail(member + " took no snapshot (" + none + "): run it again in a while; see"
 									+ " \"Exit codes\" in docs/distributed/runbooks.md");
 						}
-						System.out.println(member + " took a snapshot at log index " + taken.getLogIndex()
+						Ui.say(member + " took a snapshot at log index " + taken.getLogIndex()
 								+ " (or holds one there already)");
 					}
 					yield taken;
@@ -1059,12 +1069,12 @@ public final class ReplicatedServerMain {
 					}
 					// Not idempotent: proposed again only after an answer that says nothing was proposed.
 					long index = proposeOp(peers, groupId, ReplicaOps.OP_PROPOSE_CHECKSUM, new byte[0], false, null, deadline);
-					System.out.println("checksum at log index " + index);
+					Ui.say("checksum at log index " + index);
 					var answers = awaitResults(peers, groupId, ReplicaOps.OP_CHECKSUM_RESULT,
 							ByteBuffer.allocate(Long.BYTES).putLong(index).array(), deadline);
 					exitOn(unreadableVerdict(checksumVerdict(index, peers.stream().map(PeerConfig::id).toList(),
 							answers.results(), allowSkipped), answers.unreadable()));
-					System.out.println("OK");
+					Ui.say("OK");
 					yield null;
 				}
 				case "backup" -> {
@@ -1082,7 +1092,7 @@ public final class ReplicatedServerMain {
 							+ " one is written";
 					long index = proposeOp(peers, groupId, ReplicaOps.OP_PROPOSE_BACKUP,
 							ReplicaOps.backupPayload(requestId, name), true, ifTaken, deadline);
-					System.out.println("backup " + name + " at log index " + index);
+					Ui.say("backup " + name + " at log index " + index);
 					yield awaitBackup(peers, groupId, name, index, deadline);
 				}
 				case "backup-status" -> {
@@ -1104,7 +1114,7 @@ public final class ReplicatedServerMain {
 				}
 			};
 			if (reply != null) {
-				System.out.println(reply.isSuccess() ? style.good("OK") : style.bad("FAILED: " + reply.getException()));
+				Ui.say(reply.isSuccess() ? "OK" : "FAILED: " + reply.getException());
 				if (!reply.isSuccess()) {
 					exit(1);
 				}
@@ -1187,7 +1197,7 @@ public final class ReplicatedServerMain {
 					if (ReplicaOps.versionRefusal(status)) {
 						// Its own applied view (R32-4): it may lag behind the leader. Nothing was proposed, so asking the
 						// next member is safe also for an operation that is not idempotent.
-						System.out.println(peer.id() + " refused: " + status.getDescription() + "; asking the next member");
+						Ui.say(peer.id() + " refused: " + status.getDescription() + "; asking the next member");
 						versionRefusals.add(peer.id() + " (" + status.getDescription() + ")");
 						last = peer.id() + ": " + status;
 						continue;
@@ -1374,7 +1384,7 @@ public final class ReplicatedServerMain {
 
 	private static void exitOn(@Nullable Verdict verdict) {
 		if (verdict != null) {
-			System.out.println("FAILED: " + verdict.problem());
+			Ui.say("FAILED: " + verdict.problem());
 			exit(verdict.exitCode());
 		}
 	}
@@ -1385,7 +1395,7 @@ public final class ReplicatedServerMain {
 				deadlineNanos);
 		exitOn(unreadableVerdict(backupVerdict(peers.stream().map(PeerConfig::id).toList(), answers.results()),
 				answers.unreadable()));
-		System.out.println("OK");
+		Ui.say("OK");
 		return null;
 	}
 
@@ -1460,15 +1470,26 @@ public final class ReplicatedServerMain {
 			executor.shutdownNow();
 		}
 		var printed = new TreeMap<String, ReplicaOps.Result>();
+		var rows = new ArrayList<String[]>();
 		for (PeerConfig peer : peers) {
 			var result = results.get(peer.id());
 			if (result != null) {
 				printed.put(peer.id(), result);
 			}
 			var error = unreadable.get(peer.id());
-			System.out.println(peer.id() + ": " + (error != null ? "cannot read its answer (" + error + ")"
-					: result == null ? "no result within the time limit"
-					: result.state() + (result.keys() > 0 ? " " + result.keys() + " keys" : "") + " " + result.detail()));
+			if (Ui.pretty()) {
+				rows.add(new String[] {peer.id(),
+						error != null ? "unreadable" : result == null ? "no result" : result.state().toString().toLowerCase(Locale.ROOT),
+						result != null && result.keys() > 0 ? String.format("%,d", result.keys()) : "-",
+						error != null ? error : result == null ? "none within the time limit" : result.detail()});
+			} else {
+				Ui.say(peer.id() + ": " + (error != null ? "cannot read its answer (" + error + ")"
+						: result == null ? "no result within the time limit"
+						: result.state() + (result.keys() > 0 ? " " + result.keys() + " keys" : "") + " " + result.detail()));
+			}
+		}
+		if (Ui.pretty()) {
+			Ui.table(new String[] {"NODE", "RESULT", "KEYS", "DETAIL"}, rows, 2);
 		}
 		return new Answers(printed, peers.stream().map(PeerConfig::id).filter(unreadable::containsKey).toList());
 	}
@@ -1508,13 +1529,13 @@ public final class ReplicatedServerMain {
 				}
 				refusedOn = null;
 				var change = VoterChange.between(current.servers(), target);
-				System.out.println("leader " + current.leader() + ": voters " + VoterChange.ids(current.servers())
+				Ui.say("leader " + current.leader() + ": voters " + VoterChange.ids(current.servers())
 						+ (current.listeners().isEmpty() ? "" : ", listeners " + VoterChange.ids(current.listeners()))
 						+ "; this change adds " + change.added() + " and removes " + change.removed());
 				var moved = VoterChange.addressChanges(current.servers(), target);
 				if (!moved.isEmpty()) {
 					refuseAddressChanges(moved, changeAddresses, change.size() == 0);
-					System.out.println(CHANGE_ADDRESSES + ": this change also moves " + String.join(", ", moved)
+					Ui.say(CHANGE_ADDRESSES + ": this change also moves " + String.join(", ", moved)
 							+ "; this fixes the record only: once it prints OK, restart every running node started with --join,"
 							+ " one at a time (\"One voter per change\" in docs/distributed/runbooks.md); until then they keep"
 							+ " the old address");
@@ -1523,7 +1544,7 @@ public final class ReplicatedServerMain {
 					if (!unsafe) {
 						fail(VoterChange.refusal(change, current.servers()));
 					}
-					System.out.println("WARNING: " + UNSAFE_MULTI_VOTER_CHANGE + ": " + change.size() + " voters change at"
+					Ui.say("WARNING: " + UNSAFE_MULTI_VOTER_CHANGE + ": " + change.size() + " voters change at"
 							+ " once. Committed entries can be lost if the leader changes before it commits, unless every"
 							+ " majority of the old voters that can still vote meets every majority of the new ones");
 				}
@@ -1549,7 +1570,7 @@ public final class ReplicatedServerMain {
 							&& !(reply.getException() instanceof ReconfigurationInProgressException))) {
 						return reply;
 					}
-					System.out.println("not done (" + reply.getException() + "): asking again");
+					Ui.say("not done (" + reply.getException() + "): asking again");
 				} catch (IOException ex) {
 					var refusal = setConfigurationRefusal(ex);
 					if (refusal != null && String.valueOf(refusal.getMessage()).contains(VoterChange.MULTI_VOTER_REFUSAL)) {
@@ -1565,7 +1586,7 @@ public final class ReplicatedServerMain {
 						refusalMessage = refusal.getMessage();
 					}
 					// Another change committed between the read and the request (or, unsafe, no answer yet).
-					System.out.println("not done (" + ex.getMessage() + "): reading the configuration again");
+					Ui.say("not done (" + ex.getMessage() + "): reading the configuration again");
 				}
 				if (System.nanoTime() - deadlineNanos > 0) {
 					fail("no result within the time limit of " + timeout.toMillis() + " ms (--timeout-ms): the configuration"
@@ -1631,7 +1652,7 @@ public final class ReplicatedServerMain {
 			fail("cannot close the client: " + closing);
 			throw new AssertionError(closing);
 		}
-		System.out.println("leader " + current.leader() + ": voters " + VoterChange.ids(current.servers())
+		Ui.say("leader " + current.leader() + ": voters " + VoterChange.ids(current.servers())
 				+ (current.listeners().isEmpty() ? "" : ", listeners " + VoterChange.ids(current.listeners())));
 		var voter = current.servers().stream().filter(peer -> peer.getId().toString().equals(added.id())).findFirst()
 				.orElse(null);
@@ -1652,7 +1673,7 @@ public final class ReplicatedServerMain {
 		if (!moved.isEmpty()) {
 			refuseAddressChanges(moved, changeAddresses, true);
 		}
-		System.out.println("node " + added.id() + " is already a voter at " + voter.getAddress() + ": nothing to do");
+		Ui.say("node " + added.id() + " is already a voter at " + voter.getAddress() + ": nothing to do");
 		return true;
 	}
 
@@ -1682,7 +1703,7 @@ public final class ReplicatedServerMain {
 		if (voters.contains(removed)) {
 			return true;
 		}
-		System.out.println("leader " + current.leader() + ": voters " + voters
+		Ui.say("leader " + current.leader() + ": voters " + voters
 				+ (current.listeners().isEmpty() ? "" : ", listeners " + VoterChange.ids(current.listeners())));
 		var variants = VoterChange.caseVariants(removed, current.servers());
 		if (!variants.isEmpty()) {
@@ -1696,7 +1717,7 @@ public final class ReplicatedServerMain {
 			refuseAddressChanges(moved, changeAddresses, true);
 		}
 		boolean listener = VoterChange.ids(current.listeners()).contains(removed);
-		System.out.println(removed + " is not a voter: nothing to remove (voters " + voters + ")"
+		Ui.say(removed + " is not a voter: nothing to remove (voters " + voters + ")"
 				+ (listener ? "; it is a listener, which remove-peer does not remove" : "")
 				+ ". Nothing was proposed. A re-run of a removal that succeeded prints this; otherwise check the id"
 				+ " against the voters");
@@ -1788,7 +1809,7 @@ public final class ReplicatedServerMain {
 				if (membership != null) {
 					outside.stream().filter(hint -> hint.id().equals(membership.leader())).findFirst()
 							.filter(hint -> NOTED_LEADERS.get().add(hint.id() + "@" + hint.address())).ifPresent(hint ->
-							System.out.println("NOTE: the leader " + hint.id() + " is not in --peer: asked at " + hint.address()
+							Ui.say("NOTE: the leader " + hint.id() + " is not in --peer: asked at " + hint.address()
 									+ ", its Raft address in the configuration of " + hint.namedBy() + ". A change proposed with"
 									+ " this --peer would also remove " + hint.id() + ", like every voter that --peer lacks (a"
 									+ " change of more than one voter is refused)"));
@@ -2011,7 +2032,7 @@ public final class ReplicatedServerMain {
 		rows.add(new String[] {"NODE", "ROLE", "APPLIED", "COMMIT", "BEHIND", "RAFT ADDRESS"});
 		for (var m : members) {
 			String behind = m.applied() < 0 || top < 0 ? "-" : String.valueOf(Math.max(0, top - m.applied()));
-			rows.add(new String[] {m.peer().id(), m.error() == null ? m.role().toLowerCase(java.util.Locale.ROOT) : "unreachable",
+			rows.add(new String[] {m.peer().id(), m.error() == null ? m.role().toLowerCase(Locale.ROOT) : "unreachable",
 					m.applied() < 0 ? "-" : String.format("%,d", m.applied()),
 					m.commit() < 0 ? "-" : String.format("%,d", m.commit()), behind,
 					m.peer().raftHost() + ":" + m.peer().raftPort()});
@@ -2421,13 +2442,13 @@ public final class ReplicatedServerMain {
 	}
 
 	private static void fail(String message) {
-		System.out.println("FAILED: " + message);
+		Ui.say("FAILED: " + message);
 		exit(1);
 	}
 
 	/** Ends a {@code checksum} or {@code backup} that did not happen for sure, with {@link #EXIT_INCOMPLETE}. */
 	private static void failIncomplete(String message) {
-		System.out.println("FAILED: " + message);
+		Ui.say("FAILED: " + message);
 		exit(EXIT_INCOMPLETE);
 	}
 
@@ -2597,8 +2618,20 @@ public final class ReplicatedServerMain {
 	}
 
 	private static void usage(String problem) {
+		Ui.stop();
+		boolean terminal = System.console() != null && System.console().isTerminal();
+		if (terminal) {
+			// On a terminal the reason comes last, where the eye is, not above forty lines of usage.
+			System.err.println(USAGE);
+			System.err.println(new Style(System.getenv("NO_COLOR") == null).bad("Error: " + problem));
+			exit(2);
+		}
 		System.err.println("Error: " + problem);
-		System.err.println("""
+		System.err.println(USAGE);
+		exit(2);
+	}
+
+	private static final String USAGE = """
 				Usage:
 				  run   --node-id ID --peer ID=RAFTHOST:PORT/APIHOST:PORT ... --data-dir DIR
 				        [--rockserver-config FILE] [--raft-bind-host HOST] [--api-bind-host HOST] [--group-id UUID]
@@ -2626,8 +2659,204 @@ public final class ReplicatedServerMain {
 				        user columns) of the stopped single-node database in --source-db, opened read-write with
 				        --source-config: their table files are hard-linked (copied between file systems), not read.
 				        --rockserver-config is the cluster's. --export-dir must be on the file system of the
-				        columns' volumes to link (default: next to each column's volume).""");
-		exit(2);
+				        columns' volumes to link (default: next to each column's volume).""";
+
+	/** What {@code admin} can do, for a person: printed by {@code admin help}, and on a terminal when no command is given. */
+	static String adminHelp(Style style) {
+		String[][] commands = {
+				{"status", "role, applied and commit index of every member"},
+				{"transfer-leader ID", "make member ID the leader (before restarting the current one)"},
+				{"snapshot ID", "make member ID take a snapshot now"},
+				{"checksum", "compare the data of all members at one log index (long: reads everything)"},
+				{"backup NAME", "write backup NAME on every member, under <data-dir>/backups"},
+				{"backup-status NAME INDEX", "ask again for the result of a backup (INDEX is what backup printed)"},
+				{"add-peer ID=RAFT/API", "add a member that already runs with --join"},
+				{"remove-peer ID", "remove a member from the cluster"},
+				{"help", "this text"}};
+		String[][] options = {
+				{"--timeout-ms N", "give up after N ms (default 10 minutes)"},
+				{"--plain | --pretty", "one line per answer for scripts | tables and colors (default on a terminal)"},
+				{"--allow-skipped", "checksum: accept members that skipped it"},
+				{"--change-addresses", "add-peer, remove-peer: also move the members whose --peer address changed"},
+				{"--unsafe-multi-voter-change", "add-peer, remove-peer: change more than one voter at once"}};
+		var out = new StringBuilder(style.strong("Rockserver cluster administration") + "\n\n"
+				+ style.dim("Commands") + "\n");
+		for (var row : commands) {
+			out.append("  ").append(style.good(String.format("%-26s", row[0]))).append("  ").append(row[1]).append('\n');
+		}
+		out.append('\n').append(style.dim("Options")).append('\n');
+		for (var row : options) {
+			out.append("  ").append(String.format("%-28s", row[0])).append(row[1]).append('\n');
+		}
+		out.append('\n').append(style.dim("Restart a node: status, transfer-leader away if it leads, restart it, wait until")).append('\n')
+				.append(style.dim("status shows it caught up, then the next one. Never two at once.")).append('\n');
+		return out.toString();
+	}
+
+	/**
+	 * Where the {@code admin} commands print. Plain (a pipe, {@code --plain}): the lines as they always were, which
+	 * scripts and the tests read. Pretty (a terminal, {@code --pretty}): the same lines with their outcome colored
+	 * ({@code OK}, {@code FAILED}, {@code WARNING}, {@code NOTE}, a retry), the elapsed time after the final {@code OK},
+	 * and, on a terminal, one line that shows the command is still working and for how long.
+	 */
+	static final class Ui {
+
+		private static final Object LOCK = new Object();
+		private static volatile boolean pretty;
+		private static volatile boolean terminal;
+		private static volatile Style style = new Style(false);
+		private static volatile long startedNanos = System.nanoTime();
+		private static volatile @Nullable Thread spinner;
+		private static volatile String label = "";
+
+		private Ui() {}
+
+		static void start(boolean pretty, boolean terminal, Style style) {
+			Ui.pretty = pretty;
+			Ui.terminal = terminal;
+			Ui.style = style;
+			startedNanos = System.nanoTime();
+		}
+
+		static boolean pretty() {
+			return pretty;
+		}
+
+		static String elapsed(long nanos) {
+			long seconds = TimeUnit.NANOSECONDS.toSeconds(nanos);
+			if (seconds < 60) {
+				return seconds < 1 ? TimeUnit.NANOSECONDS.toMillis(nanos) + " ms" : seconds + " s";
+			}
+			return seconds < 3600 ? seconds / 60 + " min " + seconds % 60 + " s"
+					: seconds / 3600 + " h " + seconds % 3600 / 60 + " min";
+		}
+
+		/** One line of a command's output: unchanged when plain. */
+		static void say(String line) {
+			if (!pretty) {
+				System.out.println(line);
+				return;
+			}
+			boolean last = line.equals("OK") || line.startsWith("FAILED");
+			if (last) {
+				stop();
+			}
+			synchronized (LOCK) {
+				clearLine();
+				System.out.println(decorate(line));
+				System.out.flush();
+			}
+		}
+
+		static String decorate(String line) {
+			if (line.equals("OK")) {
+				return style.good("✓ OK") + style.dim("  (" + elapsed(System.nanoTime() - startedNanos) + ")");
+			}
+			if (line.startsWith("FAILED")) {
+				return style.bad("✗ " + line);
+			}
+			if (line.startsWith("WARNING") || line.startsWith("NOTE") || line.startsWith("not done")
+					|| line.contains(" refused: ")) {
+				return style.warn("! " + line);
+			}
+			return style.dim("· ") + line;
+		}
+
+		/** A table with a dimmed header; the columns from {@code numbersFrom} to the one before the last are right-aligned. */
+		static void table(String[] header, List<String[]> rows, int numbersFrom) {
+			int[] width = new int[header.length];
+			var all = new ArrayList<String[]>();
+			all.add(header);
+			all.addAll(rows);
+			for (var row : all) {
+				for (int i = 0; i < row.length; i++) {
+					width[i] = Math.max(width[i], row[i].length());
+				}
+			}
+			var out = new StringBuilder();
+			for (int r = 0; r < all.size(); r++) {
+				var row = all.get(r);
+				for (int i = 0; i < row.length; i++) {
+					boolean lastColumn = i + 1 == row.length;
+					boolean number = i >= numbersFrom && !lastColumn;
+					String cell = number ? " ".repeat(width[i] - row[i].length()) + row[i]
+							: lastColumn ? row[i] : row[i] + " ".repeat(width[i] - row[i].length());
+					if (r == 0) {
+						cell = style.dim(cell);
+					} else if (i == 0) {
+						cell = style.strong(cell);
+					} else if (i == 1) {
+						cell = switch (row[1]) {
+							case "done" -> style.good(cell);
+							case "failed", "unreadable" -> style.bad(cell);
+							default -> style.warn(cell);
+						};
+					}
+					out.append(cell).append(lastColumn ? "\n" : "  ");
+				}
+			}
+			synchronized (LOCK) {
+				clearLine();
+				System.out.print(out);
+				System.out.flush();
+			}
+		}
+
+		/** Shows on a terminal that {@code what} is running, and for how long, until closed or until the last line. */
+		/** {@link #working}'s handle: closing it throws nothing. */
+		interface Working extends AutoCloseable {
+			@Override
+			void close();
+		}
+
+		static Working working(String what) {
+			if (!pretty || !terminal) {
+				return () -> {};
+			}
+			label = what;
+			var thread = Thread.ofPlatform().daemon().name("admin-progress").unstarted(() -> {
+				String frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏";
+				int frame = 0;
+				try {
+					// Nothing for a command that answers at once.
+					Thread.sleep(700);
+					while (true) {
+						synchronized (LOCK) {
+							if (spinner != Thread.currentThread()) {
+								return;
+							}
+							System.out.print("\r\u001b[K" + style.warn(String.valueOf(frames.charAt(frame++ % frames.length())))
+									+ " " + label + style.dim("  " + elapsed(System.nanoTime() - startedNanos)));
+							System.out.flush();
+						}
+						Thread.sleep(120);
+					}
+				} catch (InterruptedException stopped) {
+					// Closed.
+				}
+			});
+			spinner = thread;
+			thread.start();
+			return Ui::stop;
+		}
+
+		static void stop() {
+			var running = spinner;
+			spinner = null;
+			if (running != null) {
+				running.interrupt();
+				synchronized (LOCK) {
+					clearLine();
+					System.out.flush();
+				}
+			}
+		}
+
+		private static void clearLine() {
+			if (pretty && terminal) {
+				System.out.print("\r\u001b[K");
+			}
+		}
 	}
 
 	/** Minimal "--name value" parser; {@code --peer} may repeat, and a {@link #FLAGS flag} takes no value. */
