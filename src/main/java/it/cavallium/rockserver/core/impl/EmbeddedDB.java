@@ -299,6 +299,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 	private final AtomicLong resourceLeases = new AtomicLong();
 	private final ResourceCleanupTelemetry transactionCleanupTelemetry = new ResourceCleanupTelemetry();
 	private final ResourceCleanupTelemetry iteratorCleanupTelemetry = new ResourceCleanupTelemetry();
+	final ResourceCleanupTelemetry rangeCleanupTelemetry = new ResourceCleanupTelemetry();
 	final Object columnEditLock = new Object();
 	final DatabaseConfig config;
 	final Map<String, RWScheduler> workloadGroups = new LinkedHashMap<>();
@@ -511,6 +512,7 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					.tag("db", name).register(registry));
 			transactionCleanupTelemetry.register(registry, meters, name, "transaction");
 			iteratorCleanupTelemetry.register(registry, meters, name, "iterator");
+			rangeCleanupTelemetry.register(registry, meters, name, "range");
 		} catch (Throwable ex) {
 			logger.error("Failed to load metrics", ex);
 		}
@@ -1353,6 +1355,11 @@ public class EmbeddedDB implements RocksDBSyncAPI, InternalConnection, Closeable
 					logger.warn("Failed to clean an expired range cursor", error);
 				}
 			}
+			var remaining = new ResourceCleanupTelemetry.Scan(0L);
+			for (var range : activeRangeResources) {
+				remaining.overdueNanos(scheduler.monotonicDeadlineOverdueNanos(range.cleanupDeadlineNanos()));
+			}
+			rangeCleanupTelemetry.record(remaining);
 		} finally {
 			ops.endOp();
 		}

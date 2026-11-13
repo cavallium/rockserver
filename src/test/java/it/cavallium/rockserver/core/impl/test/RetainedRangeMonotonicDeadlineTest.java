@@ -96,6 +96,8 @@ class RetainedRangeMonotonicDeadlineTest {
 			clock.epochMillis.addAndGet(-3_600_000L);
 			clock.nanoTime.addAndGet(MILLISECONDS.toNanos(30_001L));
 			db.cleanupExpiredRangesNow();
+			assertEquals(0.0, cleanupGauge(db, "rockserver.resource.overdue.count"),
+					"held downstream delivery does not imply retained native ownership");
 			releaseFirstChunk.countDown();
 
 			assertTrue(awaitCondition(() -> db.getActiveRangeCursorCount() == 0
@@ -108,9 +110,49 @@ class RetainedRangeMonotonicDeadlineTest {
 							+ " waiters=" + db.getRetainedRangeWaiterCount());
 			assertDeadlineFailure(first);
 			assertDeadlineFailure(second);
+			db.cleanupExpiredRangesNow();
+			assertEquals(0.0, cleanupGauge(db, "rockserver.resource.overdue.count"));
+			assertEquals(0.0, cleanupGauge(db, "rockserver.resource.oldest.overdue.seconds"));
 		} finally {
 			releaseFirstChunk.countDown();
 			db.setRangeReadChunkSizeObserverForTesting(null);
+			db.closeTesting();
+		}
+	}
+
+	@Test
+	void overduePhysicalCleanupIsVisibleUntilTheOwnerActuallyReleasesIt() throws Exception {
+		var clock = new MutableClock(System.currentTimeMillis(), 0L);
+		var scheduler = scheduler(clock, "retained-overdue-cleanup");
+		EmbeddedDB db = embeddedDb(scheduler, "retained-overdue-cleanup");
+		var cleanupEntered = new CountDownLatch(1);
+		var releaseCleanup = new CountDownLatch(1);
+		try {
+			long columnId = db.createColumn("entries", ColumnSchema.of(IntList.of(Integer.BYTES), ObjectList.of(), true));
+			db.put(0L, columnId, key(1), value(1), RequestType.none());
+			db.setRetainedRangeCleanupObserverForTesting(() -> {
+				cleanupEntered.countDown();
+				awaitUninterruptibly(releaseCleanup);
+			});
+			var result = db.countRangeAsyncInternal(0L, columnId, null, null, false,
+					RequestContext.batch(java.time.Duration.ofSeconds(30L)), WorkloadProfile.BATCH).toFuture();
+			assertTrue(cleanupEntered.await(5, SECONDS));
+			assertEquals(1, db.getRetainedRangeSnapshotCount());
+			clock.nanoTime.addAndGet(MILLISECONDS.toNanos(30_001L));
+			db.cleanupExpiredRangesNow();
+			assertEquals(1.0, cleanupGauge(db, "rockserver.resource.overdue.count"));
+			assertEquals(0.001, cleanupGauge(db, "rockserver.resource.oldest.overdue.seconds"), 0.000001);
+			assertEquals(1, db.getRetainedRangeSnapshotCount(), "telemetry must not release an owner's native resources");
+			assertFalse(result.isDone());
+			releaseCleanup.countDown();
+			assertDeadlineFailure(result);
+			assertTrue(awaitCondition(() -> db.getActiveRangeCursorCount() == 0 && db.getRetainedRangeSnapshotCount() == 0, 5_000L));
+			db.cleanupExpiredRangesNow();
+			assertEquals(0.0, cleanupGauge(db, "rockserver.resource.overdue.count"));
+			assertEquals(0.0, cleanupGauge(db, "rockserver.resource.oldest.overdue.seconds"));
+		} finally {
+			releaseCleanup.countDown();
+			db.setRetainedRangeCleanupObserverForTesting(null);
 			db.closeTesting();
 		}
 	}
@@ -150,6 +192,7 @@ class RetainedRangeMonotonicDeadlineTest {
 
 			assertFalse(range.isDone(), "a forward wall jump must not expire an unelapsed retained deadline");
 			assertEquals(1, db.getActiveRangeCursorCount());
+			assertEquals(0.0, cleanupGauge(db, "rockserver.resource.overdue.count"));
 			releaseFirstChunk.countDown();
 			assertEquals(8, range.get(5, SECONDS).size());
 			assertTrue(awaitCondition(() -> db.getActiveRangeCursorCount() == 0
@@ -207,6 +250,10 @@ class RetainedRangeMonotonicDeadlineTest {
 		} catch (ReflectiveOperationException reflectionFailure) {
 			throw new AssertionError(reflectionFailure);
 		}
+	}
+
+	private static double cleanupGauge(EmbeddedDB db, String name) {
+		return db.getMetricsRegistry().get(name).tag("resource", "range").gauge().value();
 	}
 
 	private static long nativeReadDeadlineMicros(EmbeddedDB db) throws ReflectiveOperationException {

@@ -1,6 +1,7 @@
 package it.cavallium.rockserver.core.impl.test;
 
 import it.cavallium.rockserver.core.impl.EmbeddedDB;
+import it.cavallium.rockserver.core.impl.RWScheduler;
 import java.lang.reflect.Method;
 import java.util.function.LongSupplier;
 
@@ -70,6 +71,25 @@ class ResourceCleanupTelemetryTest {
 			assertEquals(0.0, registry.get("rockserver.resource.overdue.count").gauge().value());
 		}
 		finally { registry.close(); }
+	}
+
+	@Test
+	void rangeOverdueUsesTheBoundClockAndExcludesUnlimitedDeadlines() throws Exception {
+		var clock = new AtomicLong(0L);
+		var factory = RWScheduler.class.getDeclaredMethod("forTesting", int.class, int.class,
+				int.class, int.class, int.class, String.class, LongSupplier.class);
+		factory.setAccessible(true);
+		var scheduler = (RWScheduler) factory.invoke(null, 1, 1, 1, 8, 8, "cleanup-clock", (LongSupplier) clock::get);
+		try {
+			clock.set(100L);
+			assertEquals(-1L, invoke(scheduler, "monotonicDeadlineOverdueNanos", new Class<?>[] {long.class}, 101L));
+			assertEquals(0L, invoke(scheduler, "monotonicDeadlineOverdueNanos", new Class<?>[] {long.class}, 100L));
+			assertEquals(-1L, invoke(scheduler, "monotonicDeadlineOverdueNanos", new Class<?>[] {long.class}, Long.MAX_VALUE));
+			clock.set(2_000_100L);
+			assertEquals(2_000_000L, invoke(scheduler, "monotonicDeadlineOverdueNanos", new Class<?>[] {long.class}, 100L));
+		} finally {
+			scheduler.disposeNow();
+		}
 	}
 
 	@Test
