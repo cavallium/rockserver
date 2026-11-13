@@ -25,7 +25,7 @@ final class ResourceCleanupTelemetry {
 
 	void register(MeterRegistry registry, List<Meter> meters, String database, String resource) {
 		meters.add(Gauge.builder("rockserver.resource.overdue.count", this, ResourceCleanupTelemetry::overdueCount)
-				.description("Expired entries still mapped after the last deadline cleanup; not all native resources")
+				.description("Registered expired resources still retained after deadline cleanup; not all native resources")
 				.tags("db", database, "resource", resource).register(registry));
 		meters.add(Gauge.builder("rockserver.resource.oldest.overdue.seconds", this, ResourceCleanupTelemetry::oldestOverdueSeconds)
 				.description("Largest deadline overrun of entries remaining after cleanup, measured at that scan")
@@ -34,7 +34,7 @@ final class ResourceCleanupTelemetry {
 				.description("Monotonic age of the last completed deadline cleanup scan; NaN before its first scan")
 				.baseUnit("seconds").tags("db", database, "resource", resource).register(registry));
 		meters.add(FunctionCounter.builder("rockserver.resource.cleanup.failures", failures, AtomicLong::get)
-				.description("Expired-resource close attempts that threw, including entries removed before close failed")
+				.description("Resource cleanup failures: expired transaction/iterator closes and physical range cleanup, excluding range observers/timers")
 				.tags("db", database, "resource", resource).register(registry));
 	}
 
@@ -73,10 +73,20 @@ final class ResourceCleanupTelemetry {
 
 		void deadline(long deadlineMillis) {
 			if (deadlineMillis <= nowMillis) {
-				count++;
 				long overdue = nowMillis - deadlineMillis;
-				oldestOverdueMillis = Math.max(oldestOverdueMillis, overdue < 0L ? Long.MAX_VALUE : overdue);
+				overdueMillis(overdue < 0L ? Long.MAX_VALUE : overdue);
 			}
+		}
+
+		void overdueNanos(long overdueNanos) {
+			if (overdueNanos >= 0L) {
+				overdueMillis(overdueNanos / 1_000_000L);
+			}
+		}
+
+		private void overdueMillis(long overdueMillis) {
+			count++;
+			oldestOverdueMillis = Math.max(oldestOverdueMillis, overdueMillis);
 		}
 	}
 

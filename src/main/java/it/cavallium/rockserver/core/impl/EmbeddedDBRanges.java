@@ -993,6 +993,11 @@ final class EmbeddedDBRanges {
 			cancelAndFinish(failure, !deliveryCancelled, RWScheduler.TerminalOutcome.DEADLINE);
 		}
 
+		@Override
+		public final long cleanupDeadlineNanos() {
+			return deadline.monotonicNanos();
+		}
+
 		private void cancelAndFinish(@Nullable RuntimeException failure,
 				boolean signalTerminal,
 				@Nullable RWScheduler.TerminalOutcome outcome) {
@@ -1109,6 +1114,7 @@ final class EmbeddedDBRanges {
 					try {
 						retainedPermit.close();
 					} catch (Throwable closeError) {
+						edb.rangeCleanupTelemetry.closeFailed();
 						currentCleanupFailure = EmbeddedDBExistsMulti.appendFailure(currentCleanupFailure, closeError);
 					}
 					edb.activeRangeResources.remove(this);
@@ -1703,6 +1709,8 @@ final class EmbeddedDBRanges {
 		void close();
 
 		void expireIfDeadlinePassed();
+
+		long cleanupDeadlineNanos();
 	}
 
 	private record RangeCountChunk(long count, boolean exhausted) {
@@ -2134,12 +2142,26 @@ final class EmbeddedDBRanges {
 			close();
 		}
 
+		@Override
+		public long cleanupDeadlineNanos() {
+			return monotonicDeadlineNanos;
+		}
+
 		private RocksDBException rangeDeadlineExceeded() {
 			return RocksDBException.of(RocksDBErrorType.READ_DEADLINE_EXCEEDED, "Deadline exceeded");
 		}
 
 		@Override
 		public void close() {
+			try {
+				closeOwnedResources();
+			} catch (Throwable closeError) {
+				edb.rangeCleanupTelemetry.closeFailed();
+				throw closeError;
+			}
+		}
+
+		private void closeOwnedResources() {
 			try {
 				synchronized (this) {
 					if (closed) {

@@ -4,6 +4,8 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.mock;
 
 import it.cavallium.buffer.Buf;
 import it.cavallium.rockserver.core.client.EmbeddedConnection;
@@ -15,6 +17,7 @@ import it.cavallium.rockserver.core.common.RequestType;
 import it.cavallium.rockserver.core.common.RocksDBException;
 import it.cavallium.rockserver.core.common.WorkloadProfile;
 import it.cavallium.rockserver.core.impl.RWScheduler;
+import it.cavallium.rockserver.core.impl.EmbeddedDB;
 import it.unimi.dsi.fastutil.ints.IntList;
 import it.unimi.dsi.fastutil.objects.ObjectList;
 import java.nio.ByteBuffer;
@@ -24,6 +27,8 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Set;
+import java.lang.reflect.Field;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
@@ -32,6 +37,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.io.TempDir;
+import org.rocksdb.RocksIterator;
 import reactor.core.publisher.Flux;
 import reactor.test.StepVerifier;
 
@@ -263,6 +269,8 @@ class RetainedRangeCooperativeTest {
 				assertTrue(failure.getCause() instanceof IllegalStateException);
 				assertEquals("synthetic retained cleanup failure", failure.getCause().getMessage());
 				assertRetainedResourcesDrained(connection);
+				assertEquals(0.0, db.getMetricsRegistry().get("rockserver.resource.cleanup.failures")
+						.tag("resource", "range").functionCounter().count(), "observer failure is not physical cleanup failure");
 
 				var after = scheduler.poolSnapshot(RWScheduler.Pool.READ);
 				assertEquals(1L, after.acceptedTasks() - before.acceptedTasks());
@@ -297,6 +305,8 @@ class RetainedRangeCooperativeTest {
 				assertTrue(failure.getCause() instanceof IllegalStateException);
 				assertEquals("synthetic retained stream cleanup failure", failure.getCause().getMessage());
 				assertRetainedResourcesDrained(connection);
+				assertEquals(0.0, db.getMetricsRegistry().get("rockserver.resource.cleanup.failures")
+						.tag("resource", "range").functionCounter().count(), "observer failure is not physical cleanup failure");
 
 				var after = scheduler.poolSnapshot(RWScheduler.Pool.READ);
 				assertEquals(1L, after.acceptedTasks() - before.acceptedTasks());
@@ -308,6 +318,64 @@ class RetainedRangeCooperativeTest {
 				db.setRetainedRangeCleanupObserverForTesting(null);
 			}
 		}
+	}
+
+	@Test
+	void cooperativePhysicalCloseFailureIsCountedOnceAfterTheOwnerUnregisters() throws Exception {
+		try (var connection = populatedConnection("retained-physical-close-failure", 33, "")) {
+			var db = connection.getInternalDB();
+			db.setRetainedRangeCleanupObserverForTesting(() -> replaceRetainedIteratorWithFailingClose(db));
+			long columnId = connection.getSyncApi(RequestContext.batch()).getColumnId("entries");
+			try {
+				var result = connection.getAsyncApi(RequestContext.batch()).reduceRangeAsync(
+						0, columnId, null, null, false, RequestType.entriesCount());
+				assertThrows(ExecutionException.class, () -> result.get(5, TimeUnit.SECONDS));
+				assertRetainedResourcesDrained(connection);
+				assertEquals(1.0, db.getMetricsRegistry().get("rockserver.resource.cleanup.failures")
+						.tag("resource", "range").functionCounter().count());
+				db.cleanupExpiredRangesNow();
+				db.cleanupExpiredRangesNow();
+				assertEquals(0.0, db.getMetricsRegistry().get("rockserver.resource.overdue.count")
+						.tag("resource", "range").gauge().value());
+				assertEquals(1.0, db.getMetricsRegistry().get("rockserver.resource.cleanup.failures")
+						.tag("resource", "range").functionCounter().count(), "later scans do not lose or double-count the failed close");
+			} finally {
+				db.setRetainedRangeCleanupObserverForTesting(null);
+			}
+		}
+	}
+
+	private static void replaceRetainedIteratorWithFailingClose(EmbeddedDB db) {
+		try {
+			Field active = EmbeddedDB.class.getDeclaredField("activeRangeResources");
+			active.setAccessible(true);
+			Object owner = ((Set<?>) active.get(db)).iterator().next();
+			Field cursorField = fieldInHierarchy(owner.getClass(), "cursor");
+			Object cursor = cursorField.get(owner);
+			Field iteratorField = fieldInHierarchy(cursor.getClass(), "iterator");
+			RocksIterator original = (RocksIterator) iteratorField.get(cursor);
+			RocksIterator failing = mock(RocksIterator.class);
+			doAnswer(_ -> {
+				original.close();
+				throw new IllegalStateException("synthetic physical iterator close failure");
+			}).when(failing).close();
+			iteratorField.set(cursor, failing);
+		} catch (ReflectiveOperationException error) {
+			throw new AssertionError(error);
+		}
+	}
+
+	private static Field fieldInHierarchy(Class<?> type, String name) throws NoSuchFieldException {
+		for (var current = type; current != null; current = current.getSuperclass()) {
+			try {
+				Field field = current.getDeclaredField(name);
+				field.setAccessible(true);
+				return field;
+			} catch (NoSuchFieldException ignored) {
+				// The cooperative task's immutable fields live on its common owner.
+			}
+		}
+		throw new NoSuchFieldException(name);
 	}
 
 	@Test

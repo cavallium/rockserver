@@ -563,6 +563,16 @@ public final class RWScheduler {
 		return deadlineClock.monotonicNanos() >= localMonotonicDeadlineNanos;
 	}
 
+	/** Internal cleanup observation in the same clock domain as the resource's bound deadline. */
+	long monotonicDeadlineOverdueNanos(long localMonotonicDeadlineNanos) {
+		long now = deadlineClock.monotonicNanos();
+		if (localMonotonicDeadlineNanos == Long.MAX_VALUE || now < localMonotonicDeadlineNanos) {
+			return -1L;
+		}
+		long elapsed = now - localMonotonicDeadlineNanos;
+		return elapsed < 0L ? Long.MAX_VALUE : elapsed;
+	}
+
 	/** Remaining time for an immutable local deadline, saturated at zero. */
 	public long remainingMonotonicDeadlineNanos(long localMonotonicDeadlineNanos) {
 		return deadlineClock.remainingNanos(localMonotonicDeadlineNanos);
